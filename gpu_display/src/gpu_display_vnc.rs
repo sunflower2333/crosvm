@@ -82,8 +82,6 @@ extern "C" {
         cursor_argb: *const u8,
         cw: c_int,
         ch: c_int,
-        hot_x: c_int,
-        hot_y: c_int,
         cx: c_int,
         cy: c_int,
         visible: c_int,
@@ -123,10 +121,11 @@ struct CursorState {
     pixels: Vec<u8>,
     width: u32,
     height: u32,
-    hot_x: u32,
-    hot_y: u32,
-    x: u32,
-    y: u32,
+    /// Top-left corner of the cursor image, as the guest reported it. Signed: it goes negative
+    /// when the pointer is within the hotspot of the left or top edge. No hotspot is kept beside
+    /// it: the bridge draws the image at this corner, and the hotspot is the guest's business.
+    x: i32,
+    y: i32,
     visible: bool,
 }
 
@@ -146,8 +145,6 @@ impl SharedFramebuffer {
                 if has_img { c.pixels.as_ptr() } else { std::ptr::null() },
                 c.width as c_int,
                 c.height as c_int,
-                c.hot_x as c_int,
-                c.hot_y as c_int,
                 c.x as c_int,
                 c.y as c_int,
                 (c.visible && has_img) as c_int,
@@ -211,14 +208,18 @@ impl GpuDisplaySurface for VncSurface {
     }
 }
 
-/// The guest's hardware cursor, published to VNC clients as an RFB cursor.
+/// The guest's hardware cursor, published to VNC clients two ways at once.
 ///
-/// Deliberately NOT drawn into the shared framebuffer. virtio-gpu sends an UPDATE_CURSOR or
-/// MOVE_CURSOR every time the pointer moves, and compositing it ourselves would turn each of
-/// those into a framebuffer update -- a full-rate stream of dirty rectangles for a pointer that
-/// the client can draw itself. rfbSetCursor hands the image over once; a client that speaks the
-/// Cursor pseudo-encoding then costs nothing at all to move the pointer, and LibVNCServer
-/// composites it into the outgoing frame for clients that do not.
+/// It is composited into the outgoing frame by our own bridge, AND handed to LibVNCServer as an
+/// RFB cursor. The composited one is the one that has to be right: the DroidVM app drives the
+/// pointer over its own channel, so a VNC client can be a passive viewer whose idea of where the
+/// pointer is has nothing to do with the guest's. The RFB cursor is what lets a client that
+/// speaks the Cursor pseudo-encoding move the pointer for free, and it doubles as an independent
+/// rendering of the same data -- differencing a frame grabbed with the encoding against one
+/// grabbed without it is how the hotspot bug in the composited path was caught.
+///
+/// The cost of compositing is a framebuffer update per pointer move; `composite(false)` keeps
+/// that to the two rectangles the pointer left and entered rather than a whole frame.
 struct VncCursorSurface {
     width: u32,
     height: u32,
@@ -247,14 +248,12 @@ impl GpuDisplaySurface for VncCursorSurface {
             fb.cursor.pixels.extend_from_slice(&self.pixels);
             fb.cursor.width = self.width;
             fb.cursor.height = self.height;
-            fb.cursor.hot_x = self.hot_x;
-            fb.cursor.hot_y = self.hot_y;
             fb.cursor.visible = true;
             fb.composite(false);
         }
-        // Also hand it to LibVNCServer as an RFB cursor. Redundant for us, and it is what makes a
-        // client draw its own second pointer -- kept deliberately as a side-by-side latency
-        // reference against the composited one.
+        // And as an RFB cursor, which is what a client with the Cursor pseudo-encoding draws
+        // itself. Unlike the composited copy this one carries the hotspot, because LibVNCServer
+        // positions by the pointer and subtracts it.
         // SAFETY: `pixels` is width*height*4 bytes and outlives the call.
         unsafe {
             vnc_server_set_cursor(
@@ -279,7 +278,7 @@ impl GpuDisplaySurface for VncCursorSurface {
     /// its own channel, so a VNC client can be a passive VIEWER that never sends a PointerEvent.
     /// Its cursorX/cursorY would then stay at the origin and the composited pointer would sit in
     /// the top-left corner no matter where the guest actually put it.
-    fn set_position(&mut self, x: u32, y: u32) {
+    fn set_position(&mut self, x: i32, y: i32) {
         if let Ok(mut fb) = self.shared_fb.lock() {
             fb.cursor.x = x;
             fb.cursor.y = y;
@@ -287,8 +286,16 @@ impl GpuDisplaySurface for VncCursorSurface {
             // would only move when the guest happened to send a frame.
             fb.composite(false);
         }
+        // LibVNCServer wants the POINTER, not the image: it draws the cursor at
+        // cursorX - hot_x. (x,y) is the image origin, so the hotspot goes back on here.
         // SAFETY: server handle is valid for this surface's lifetime.
-        unsafe { vnc_server_set_cursor_pos(self.server.ptr, x as c_int, y as c_int) }
+        unsafe {
+            vnc_server_set_cursor_pos(
+                self.server.ptr,
+                x + self.hot_x as c_int,
+                y + self.hot_y as c_int,
+            )
+        }
     }
 
     fn set_cursor_visible(&mut self, visible: bool) {
@@ -571,6 +578,7 @@ impl DisplayT for DisplayVnc {
             return Ok(Box::new(VncCursorSurface {
                 width,
                 height,
+                // Replaced by the first set_cursor_hotspot, which virtio-gpu sends with the image.
                 hot_x: 0,
                 hot_y: 0,
                 server: self.server.clone(),

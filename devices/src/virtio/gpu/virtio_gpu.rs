@@ -306,9 +306,13 @@ struct VirtioGpuScanout {
     parent_scanout_id: Option<u32>,
 
     resource_id: Option<NonZeroU32>,
-    position: Option<(u32, u32)>,
+    position: Option<(i32, i32)>,
     // Reused packed staging buffer for flushes into padded-stride window buffers.
     flush_staging: Vec<u8>,
+    flush_probe_counter: u64,
+    // The pool branch needs its own counter: sharing one with the transfer_read probe means a
+    // low-frequency path can sit on the wrong side of the modulus forever and never report.
+    pool_probe_counter: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -326,7 +330,7 @@ struct VirtioGpuScanoutSnapshot {
     parent_scanout_id: Option<u32>,
 
     resource_id: Option<NonZeroU32>,
-    position: Option<(u32, u32)>,
+    position: Option<(i32, i32)>,
 }
 
 impl VirtioGpuScanout {
@@ -344,6 +348,8 @@ impl VirtioGpuScanout {
             resource_id: None,
             position: None,
             flush_staging: Vec::new(),
+            flush_probe_counter: 0,
+            pool_probe_counter: 0,
         }
     }
 
@@ -361,6 +367,8 @@ impl VirtioGpuScanout {
             parent_scanout_id: None,
             resource_id: None,
             position: None,
+            flush_probe_counter: 0,
+            pool_probe_counter: 0,
             flush_staging: Vec::new(),
         }
     }
@@ -498,8 +506,8 @@ impl VirtioGpuScanout {
     fn set_position(
         &mut self,
         display: &Rc<RefCell<GpuDisplay>>,
-        x: u32,
-        y: u32,
+        x: i32,
+        y: i32,
     ) -> VirtioGpuResult {
         if let Some(surface_id) = self.surface_id {
             display.borrow_mut().set_position(surface_id, x, y)?;
@@ -617,11 +625,16 @@ impl VirtioGpuScanout {
             };
             let mut display = display.borrow_mut();
             if display.next_buffer_in_use(surface_id) {
+                note_flush_route("pool: display buffer busy, frame dropped");
                 return Ok(OkNoData);
             }
-            let fb = display
-                .framebuffer_region(surface_id, 0, 0, self.width, self.height)
-                .ok_or(ErrUnspec)?;
+            let fb = match display.framebuffer_region(surface_id, 0, 0, self.width, self.height) {
+                Some(fb) => fb,
+                None => {
+                    note_flush_route("pool: no framebuffer region for the surface");
+                    return Err(ErrUnspec);
+                }
+            };
             // Gather the (possibly fragmented) pool run segments into a contiguous staging buffer.
             let segs = resource.pool_scanout_iovecs.as_ref().unwrap();
             let total: usize = segs.iter().map(|&(_, l)| l).sum();
@@ -657,6 +670,44 @@ impl VirtioGpuScanout {
             let staging = &self.flush_staging[..total];
             let fb_stride = fb.stride() as usize;
             let fb_slice = fb.as_volatile_slice();
+            // Whether the pool actually holds a frame. `transfer_read` has had this probe for a
+            // while and reports colour, but that is a different branch on a different resource --
+            // nothing has ever looked at the bytes this branch copies, so "the host can read the
+            // guest pool" and "the guest pool contains the composited frame" were never
+            // distinguished. Count colour channels only: XRGB carries 0xff in every fourth byte.
+            self.pool_probe_counter = self.pool_probe_counter.wrapping_add(1);
+            // Behind the switch, and the scan with it: this ran on the display path and put a
+            // line in the log several times a second on an idle desktop, which is where anyone
+            // looking for a real message has to find it. GFXSTREAM_DIAG=1 brings it back.
+            if gpu_diag_enabled()
+                && (self.pool_probe_counter <= 3 || self.pool_probe_counter % 64 == 0)
+            {
+                let probe = &staging[src_offset.min(staging.len())..];
+                let probe = &probe[..4096.min(probe.len())];
+                let rgb_nz = probe
+                    .chunks_exact(4)
+                    .flat_map(|px| &px[..3])
+                    .filter(|b| **b != 0)
+                    .count();
+                let head: Vec<String> = probe[..16.min(probe.len())]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                base::warn!(
+                    "POOL-SCANOUT#{} res={} {}x{} src_stride={} src_off={} fb_stride={} total={} segs={} rgb_nonzero={} head=[{}]",
+                    self.pool_probe_counter,
+                    resource.resource_id,
+                    self.width,
+                    self.height,
+                    src_stride,
+                    src_offset,
+                    fb_stride,
+                    total,
+                    segs.len(),
+                    rgb_nz,
+                    head.join(" "),
+                );
+            }
             for row in 0..self.height as usize {
                 let s = src_offset + row * src_stride;
                 if s + packed_stride > staging.len() {
@@ -805,6 +856,37 @@ impl VirtioGpuScanout {
                 unsafe { std::slice::from_raw_parts_mut(fb_slice.as_mut_ptr(), fb_slice.size()) },
             );
             rutabaga.transfer_read(0, resource.resource_id, transfer, Some(buf))?;
+            // Whether the readback produced anything, every 64th frame: a black display can mean
+            // the copy went to the wrong place or that these bytes were zero to begin with, and
+            // nothing else distinguishes the two.
+            self.flush_probe_counter = self.flush_probe_counter.wrapping_add(1);
+            if self.flush_probe_counter % 64 == 1 {
+                let probe = unsafe {
+                    std::slice::from_raw_parts(fb_slice.as_mut_ptr() as *const u8, 4096.min(fb_slice.size()))
+                };
+                // Count only the color channels: XRGB frames carry 0xff in every fourth byte,
+                // which made an all-black frame read as "25% nonzero" and pass for content.
+                let rgb_nz = probe
+                    .chunks_exact(4)
+                    .flat_map(|px| &px[..3])
+                    .filter(|b| **b != 0)
+                    .count();
+                let head: Vec<String> = probe[..16.min(probe.len())]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                strace!(
+                    "flush.transfer_read.probe res={} rgb_nonzero={} head=[{}]",
+                    resource.resource_id,
+                    rgb_nz,
+                    head.join(" ")
+                );
+                if rgb_nz == 0 {
+                    note_flush_route("transfer_read: readback is black");
+                } else {
+                    note_flush_route("transfer_read: readback has color");
+                }
+            }
         } else {
             // The window buffer rows are padded (gralloc stride alignment), and the readback
             // backend writes tightly-packed rows no matter what Transfer3D::stride says (observed
@@ -1075,6 +1157,15 @@ pub enum ProcessDisplayResult {
     Success,
     CloseRequested,
     Error(GpuDisplayError),
+}
+
+/// One switch for the per-operation gpu traces on this route, shared with gfxstream's host side so
+/// that a single variable turns both halves on. Read once; a site that is off costs a load.
+fn gpu_diag_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("GFXSTREAM_DIAG").map_or(false, |v| !v.is_empty() && v != "0")
+    })
 }
 
 impl VirtioGpu {
@@ -1381,8 +1472,8 @@ impl VirtioGpu {
         &mut self,
         resource_id: u32,
         scanout_id: u32,
-        x: u32,
-        y: u32,
+        x: i32,
+        y: i32,
         hot_x: u32,
         hot_y: u32,
     ) -> VirtioGpuResult {
@@ -1397,6 +1488,18 @@ impl VirtioGpu {
         self.update_scanout_resource(SurfaceType::Cursor, None, scanout_id, None, resource_id)?;
         self.cursor_scanout.set_cursor_visible(&self.display, true)?;
 
+        // What the guest actually asked for. Two cursor complaints need this and neither can be
+        // settled by reading the code: a VNC client's own pointer drifting up-left from the one
+        // crosvm composites, worst on the double-headed resize cursor, and the native path
+        // freezing the position once the pointer nears the left edge. Both would follow from a
+        // hotspot applied on one path and not the other, or a position clamped after subtracting
+        // it -- so print the four numbers and compare them with what lands on screen.
+        if gpu_diag_enabled() {
+            base::warn!(
+                "CURSOR: res={} pos=({},{}) hot=({},{})",
+                resource_id, x, y, hot_x, hot_y
+            );
+        }
         // Before flush_resource, which is what hands the pixels to the backend: a backend that
         // publishes image and hotspot together (VNC's rfbSetCursor does) would otherwise publish
         // this frame's image with the previous frame's hotspot.
@@ -1408,7 +1511,10 @@ impl VirtioGpu {
     }
 
     /// Moves the cursor's position to the given coordinates.
-    pub fn move_cursor(&mut self, _scanout_id: u32, x: u32, y: u32) -> VirtioGpuResult {
+    pub fn move_cursor(&mut self, _scanout_id: u32, x: i32, y: i32) -> VirtioGpuResult {
+        if gpu_diag_enabled() {
+            base::warn!("CURSOR-MOVE: pos=({},{})", x, y);
+        }
         self.cursor_scanout.set_position(&self.display, x, y)?;
         self.cursor_scanout.commit(&self.display)?;
         Ok(OkNoData)
@@ -1680,7 +1786,9 @@ impl VirtioGpu {
         let mut pool_refs: Option<Vec<(GuestAddress, usize)>> = None;
 
         if resource_create_blob.blob_flags & VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE != 0 {
-            base::warn!(
+            // debug!, like the GPU-MAPBLOB traces below: this fires once per blob creation,
+            // which is hundreds per desktop session and thousands under a benchmark.
+            base::debug!(
                 "GUEST-ALLOC: create_blob CREATE_GUEST_HANDLE res={} mem={} nvecs={} first={:#x} len={} udmabuf={}",
                 resource_id,
                 resource_create_blob.blob_mem,
@@ -1804,7 +1912,7 @@ impl VirtioGpu {
                 .ok_or(ErrInvalidResourceId)?;
             resource.pool_offset = Some(pool_offset);
             let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
-            base::warn!(
+            base::debug!(
                 "GPU-MAPBLOB: res={} POOL-resident offset={:#x} (no SHARE)",
                 resource_id,
                 pool_offset,

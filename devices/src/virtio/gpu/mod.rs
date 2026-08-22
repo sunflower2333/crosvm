@@ -544,18 +544,21 @@ impl Frontend {
             GpuCommand::ResourceDetachBacking(info) => {
                 self.virtio_gpu.detach_backing(info.resource_id.to_native())
             }
+            // pos is the guest's crtc_x/crtc_y for the cursor plane -- the image's top-left corner,
+            // already hotspot-compensated, and SIGNED. Reading it unsigned turns a pointer against
+            // the left edge into a position near 4.29e9.
             GpuCommand::UpdateCursor(info) => self.virtio_gpu.update_cursor(
                 info.resource_id.to_native(),
                 info.pos.scanout_id.to_native(),
-                info.pos.x.into(),
-                info.pos.y.into(),
+                info.pos.x.to_native() as i32,
+                info.pos.y.to_native() as i32,
                 info.hot_x.into(),
                 info.hot_y.into(),
             ),
             GpuCommand::MoveCursor(info) => self.virtio_gpu.move_cursor(
                 info.pos.scanout_id.to_native(),
-                info.pos.x.into(),
-                info.pos.y.into(),
+                info.pos.x.to_native() as i32,
+                info.pos.y.to_native() as i32,
             ),
             GpuCommand::ResourceAssignUuid(info) => {
                 let resource_id = info.resource_id.to_native();
@@ -800,10 +803,30 @@ impl Frontend {
             Ok(gpu_response) => gpu_response,
             Err(gpu_response) => {
                 if let Some(gpu_cmd) = gpu_cmd {
-                    error!(
-                        "error processing gpu command {:?}: {:?}",
-                        gpu_cmd, gpu_response
+                    // Detaching a resource from a context that is already gone is what teardown
+                    // looks like, not a fault: the guest driver destroys the context and frees
+                    // its id in postclose, and resources of that context are detached as their
+                    // GEM handles go away, which can land either side of it. The resource is
+                    // being torn down regardless, so nothing is lost -- but at error level it
+                    // fills the log with 732 lines per session that read like a real failure.
+                    let expected_during_teardown = matches!(
+                        (&gpu_cmd, &gpu_response),
+                        (
+                            GpuCommand::CtxDetachResource(_),
+                            GpuResponse::ErrRutabaga(RutabagaError::InvalidContextId)
+                        )
                     );
+                    if expected_during_teardown {
+                        debug!(
+                            "gpu command {:?} arrived after its context went away: {:?}",
+                            gpu_cmd, gpu_response
+                        );
+                    } else {
+                        error!(
+                            "error processing gpu command {:?}: {:?}",
+                            gpu_cmd, gpu_response
+                        );
+                    }
                 }
                 gpu_response
             }
