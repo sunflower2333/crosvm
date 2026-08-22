@@ -324,26 +324,43 @@ fn export_query(resource_id: u32) -> RutabagaResult<Query> {
     Ok(query)
 }
 
-/// The drm2kgsl native-context arena, as (host VA, size), announced by the VMM before the GPU
-/// device is built. `None` when no Drm2KgslPool was configured.
-fn drm2kgsl_pool_window() -> Option<(u64, u64)> {
-    static WINDOW: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
-    *WINDOW.get_or_init(|| {
-        let va: u64 = std::env::var("CROSVM_DRM2KGSL_ARENA_HOST_VA").ok()?.parse().ok()?;
-        let size: u64 = std::env::var("CROSVM_DRM2KGSL_ARENA_SIZE").ok()?.parse().ok()?;
-        (va != 0 && size != 0).then_some((va, size))
+/// The host-owned pool windows a virgl-family renderer sub-allocates from, as (host VA, size):
+/// the drm2kgsl native-context arena and the venus_host transport pool. Announced by the VMM
+/// before the GPU device is built; empty when neither pool was configured. A resource whose
+/// persistent map_ptr falls inside one of these windows is pool-resident: the guest maps it at
+/// pool_base+offset from the map response (MAP_INFO_POOL) and no runtime SHARE happens.
+fn virgl_pool_windows() -> &'static [(u64, u64)] {
+    static WINDOWS: std::sync::OnceLock<Vec<(u64, u64)>> = std::sync::OnceLock::new();
+    WINDOWS.get_or_init(|| {
+        let read = |va_key: &str, size_key: &str| -> Option<(u64, u64)> {
+            let va: u64 = std::env::var(va_key).ok()?.parse().ok()?;
+            let size: u64 = std::env::var(size_key).ok()?.parse().ok()?;
+            (va != 0 && size != 0).then_some((va, size))
+        };
+        let mut v = Vec::new();
+        if let Some(w) = read("CROSVM_DRM2KGSL_ARENA_HOST_VA", "CROSVM_DRM2KGSL_ARENA_SIZE") {
+            v.push(w);
+        }
+        if let Some(w) = read("VENUS_POOL_HOST_VA", "VENUS_POOL_SIZE") {
+            v.push(w);
+        }
+        v
     })
 }
 
-/// Byte offset of a resource inside the drm2kgsl pool, or None if it does not live there.
+/// Byte offset of a resource inside a host-owned renderer pool (drm2kgsl arena or venus_host),
+/// or None if it does not live in one.
 ///
 /// Asked at creation, when the drm2kgsl backend has just recorded the arena pointer on the
 /// resource, and asked through an accessor that only READS it. The obvious alternative --
 /// map() then unmap() -- is not a query: virglrenderer's map records res->mapped and its
 /// unmap munmaps a dmabuf, so probing with the pair tears down mappings the renderer is
 /// still using.
-fn drm2kgsl_pool_offset(resource_id: u32) -> Option<u64> {
-    let (pool_va, pool_size) = drm2kgsl_pool_window()?;
+fn virgl_pool_offset(resource_id: u32) -> Option<u64> {
+    let windows = virgl_pool_windows();
+    if windows.is_empty() {
+        return None;
+    }
     let mut ptr: *mut c_void = null_mut();
     let mut size: u64 = 0;
     // SAFETY: the accessor only reads virgl_resource fields and writes the two out params.
@@ -353,7 +370,9 @@ fn drm2kgsl_pool_offset(resource_id: u32) -> Option<u64> {
     }
     let addr = ptr as u64;
     let end = addr.checked_add(size)?;
-    (addr >= pool_va && end <= pool_va.checked_add(pool_size)?).then(|| addr - pool_va)
+    windows.iter().find_map(|&(pool_va, pool_size)| {
+        (addr >= pool_va && end <= pool_va.checked_add(pool_size)?).then(|| addr - pool_va)
+    })
 }
 
 impl VirglRenderer {
@@ -565,9 +584,26 @@ impl RutabagaComponent for VirglRenderer {
     }
 
     fn create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
+        // A fence carrying a ring index belongs to a per-context timeline (venus
+        // queue rings, drm native-context submit queues); handing it to the global
+        // virgl_renderer_create_fence retires it on vrend's GL timeline instead and
+        // the guest's per-ring fence never signals. Venus's WSI present blocked on
+        // exactly that (sync_wait(-1) on the EXECBUF out-fence), wedging the whole
+        // desktop behind the first swapchain buffer.
         // TODO(b/315870313): Add safety comment
         #[allow(clippy::undocumented_unsafe_blocks)]
-        let ret = unsafe { virgl_renderer_create_fence(fence.fence_id as i32, fence.ctx_id) };
+        let ret = if fence.flags & RUTABAGA_FLAG_INFO_RING_IDX != 0 {
+            unsafe {
+                virgl_renderer_context_create_fence(
+                    fence.ctx_id,
+                    VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
+                    fence.ring_idx.into(),
+                    fence.fence_id,
+                )
+            }
+        } else {
+            unsafe { virgl_renderer_create_fence(fence.fence_id as i32, fence.ctx_id) }
+        };
         ret_to_res(ret)
     }
 
@@ -851,7 +887,7 @@ impl RutabagaComponent for VirglRenderer {
             component_mask: 1 << (RutabagaComponentType::VirglRenderer as u8),
             size: resource_create_blob.size,
             mapping: None,
-            pool_offset: drm2kgsl_pool_offset(resource_id),
+            pool_offset: virgl_pool_offset(resource_id),
         })
     }
 

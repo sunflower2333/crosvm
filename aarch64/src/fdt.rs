@@ -38,6 +38,7 @@ use rand::RngCore;
 use resources::AddressRange;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
+use vm_memory::MemoryRegionPurpose;
 
 // These are GIC address-space location constants.
 use crate::AARCH64_GIC_CPUI_BASE;
@@ -95,10 +96,36 @@ const IRQ_TYPE_LEVEL_LOW: u32 = 0x00000008;
 fn create_memory_node(fdt: &mut Fdt, guest_mem: &GuestMemory) -> Result<()> {
     let mut mem_reg_prop = Vec::new();
     let mut previous_memory_region_end = None;
+    // A growable pool is declared to the guest whole but backed only up to its floor, so it must
+    // not appear here: a guest that took the window for ordinary RAM would allocate in the part
+    // nothing has granted yet, where a read silently returns zeros and a write kills the VM. The
+    // floor is described by the pool's own reserved-memory node instead, and everything above it
+    // is address space the guest only reaches through a grant.
+    //
+    // Non-growable pools stay in `/memory` exactly as before, marked no-map by their node -- the
+    // arrangement every existing pool boots with.
+    // A pseudo-unprotected VM's window is left out for the same reason and one more: nothing has
+    // been handed to the hypervisor for it yet, and the guest is not told it exists until the
+    // shim has accepted it and pointed `/memory` here itself. The handoff page is not the guest's
+    // RAM either -- it is the one place the host can still write once the boot region is lent.
+    let hidden: HashSet<u64> = guest_mem
+        .regions()
+        .filter(|r| {
+            r.options.step_size != 0
+                || matches!(
+                    r.options.purpose,
+                    MemoryRegionPurpose::SharedGuestRam | MemoryRegionPurpose::ShimHandoff
+                )
+        })
+        .map(|r| r.guest_addr.offset())
+        .collect();
     let mut regions = guest_mem.guest_memory_regions();
     regions.sort();
     for region in regions {
         if region.0.offset() == AARCH64_PROTECTED_VM_FW_START {
+            continue;
+        }
+        if hidden.contains(&region.0.offset()) {
             continue;
         }
         // Merge with the previous region if possible.
@@ -202,6 +229,21 @@ struct GrowablePool {
 ///   memparcel registered before VM start (`vm_creation.c
 ///   find_memparcel_for_resmem_node_by_address`). It walks every `/reserved-memory` child and
 ///   never looks at `compatible`.
+///
+/// # `reg` is the FLOOR, not the window
+///
+/// For a growable pool the two are different, and which one goes in `reg` decides whether the VM
+/// starts at all. The RM's match is exact -- same base, same size, one mapping -- so a `reg` that
+/// covers the whole declared window while only its floor is really shared matches nothing, and
+/// android14-6.1's RM refuses the VM outright (`GH_VM_START` -> ENODEV). Measured on sm8650: the
+/// same pool boots with the node removed and is refused with it present.
+///
+/// So `reg` describes exactly what was SHARE'd before boot, and the window's real size travels in
+/// `droidvm,pool-size`. The rest of the window is address space the guest is never told about
+/// through `reg` at all; a grant lands there as a runtime memparcel the guest accepts itself,
+/// which is a shape the RM does not police (measured on the same device). A pool that is fully
+/// pre-shared emits exactly the node it always did -- no `pool-size`, `reg` covering everything --
+/// because for it the floor IS the window.
 /// * edk2's `GunyahPoolAcpiDxe` walks every `droidvm,pool` node and emits one ACPI device per pool
 ///   under `\_SB`, so a guest that cannot read a device tree -- Windows -- still finds its pool.
 ///   `pool-name` becomes the ACPI `_UID`, so a pool shows up as e.g. `ACPI\DRVM0001\gpu_guest`.
@@ -246,7 +288,13 @@ fn create_pool_node(
     } else {
         node.set_prop("compatible", "droidvm,pool")?;
     }
-    node.set_prop("reg", &[gpa, size])?;
+    // See "`reg` is the FLOOR" above: the node describes the pre-shared floor, and the window's
+    // size rides along beside it when the two differ.
+    let floor = growable.as_ref().map_or(size, |g| g.pre_alloc_size.min(size));
+    node.set_prop("reg", &[gpa, floor])?;
+    if floor != size {
+        node.set_prop("droidvm,pool-size", size)?;
+    }
     node.set_prop("no-map", ())?;
     // The name again, as a property: a consumer that reaches the node by phandle or by scanning
     // for the compatible never sees the node name, and edk2 turns this into the ACPI `_UID`.
@@ -697,7 +745,9 @@ fn create_rtc_node(fdt: &mut Fdt) -> Result<()> {
 
     let rtc_name = format!("rtc@{:x}", AARCH64_RTC_ADDR);
     let reg = [AARCH64_RTC_ADDR, AARCH64_RTC_SIZE];
-    let irq = [GIC_FDT_IRQ_TYPE_SPI, AARCH64_RTC_IRQ, IRQ_TYPE_LEVEL_HIGH];
+    // Same as the PL061 below: the PL030 alarm is an IrqEdgeEvent, so declare the line edge-
+    // triggered instead of level (a level declaration on an edge doorbell storms after EOI).
+    let irq = [GIC_FDT_IRQ_TYPE_SPI, AARCH64_RTC_IRQ, IRQ_TYPE_EDGE_RISING];
 
     let rtc_node = fdt.root_mut().subnode_mut(&rtc_name)?;
     rtc_node.set_prop("compatible", "arm,primecell")?;
@@ -722,7 +772,13 @@ fn create_gpio_node(fdt: &mut Fdt) -> Result<()> {
 
     let gpio_name = format!("gpio@{:x}", AARCH64_GPIO_ADDR);
     let reg = [AARCH64_GPIO_ADDR, AARCH64_GPIO_SIZE];
-    let irq = [GIC_FDT_IRQ_TYPE_SPI, AARCH64_GPIO_IRQ, IRQ_TYPE_LEVEL_HIGH];
+    // The PL061 model injects its aggregate interrupt through an IrqEdgeEvent (one edge per
+    // rising transition of MIS -- the Gunyah irqchip only supports edge irqfds, and the doorbell
+    // vdevice behind it is declared IRQ_TYPE_EDGE_RISING in the hypervisor DT). Declaring it
+    // LEVEL_HIGH here made the guest GIC treat the doorbell as a level line that nobody ever
+    // deasserts: the first power-button press left vCPU0 spinning in the interrupt handler
+    // (RCU stalls, soft lockups, hung tasks -- a hard guest hang on every "Power" press).
+    let irq = [GIC_FDT_IRQ_TYPE_SPI, AARCH64_GPIO_IRQ, IRQ_TYPE_EDGE_RISING];
 
     let gpio_node = fdt.root_mut().subnode_mut(&gpio_name)?;
     gpio_node.set_prop("compatible", &["arm,pl061", "arm,primecell"])?;
@@ -803,6 +859,24 @@ fn create_simplefb_node(fdt: &mut Fdt, cfg: &SimplefbDtConfig, has_resv: bool) -
     if has_resv {
         fb_node.set_prop("memory-region", PHANDLE_SIMPLEFB_RESERVED)?;
     }
+    Ok(())
+}
+
+pub struct PflashDtConfig {
+    pub base: u64,
+    pub size: u64,
+    pub block_size: u32,
+}
+
+fn create_pflash_node(fdt: &mut Fdt, cfg: &PflashDtConfig) -> Result<()> {
+    let node = fdt
+        .root_mut()
+        .subnode_mut(&format!("pflash@{:x}", cfg.base))?;
+    node.set_prop("compatible", "cfi-flash")?;
+    node.set_prop("reg", &[cfg.base, cfg.size])?;
+    node.set_prop("erase-size", cfg.block_size)?;
+    node.set_prop("no-unaligned-direct-access", ())?;
+    node.set_prop("status", "okay")?;
     Ok(())
 }
 
@@ -890,6 +964,9 @@ pub fn create_fdt(
     gpu_resv: Option<(u64, u64)>,
     gpu_guest_resv: Option<(u64, u64, u64, u64)>,
     edk2_preload_resv: Option<(u64, u64, u64, u64)>,
+    venus_resv: Option<(u64, u64)>,
+    test_pool_resv: Vec<(u64, u64, u64, u64)>,
+    shim_handoff_resv: Option<(u64, u64)>,
     drm2kgsl_resv: Option<(u64, u64)>,
     bat_mmio_base_and_irq: Option<(u64, u32)>,
     vmwdt_cfg: VmWdtConfig,
@@ -902,6 +979,7 @@ pub fn create_fdt(
     virt_cpufreq_v2: bool,
     is_kvm: bool,
     smbios: &SmbiosOptions,
+    pflash_cfg: Option<PflashDtConfig>,
 ) -> Result<()> {
     let mut fdt = Fdt::new(&[]);
     let mut phandles_key_cache = Vec::new();
@@ -975,9 +1053,31 @@ pub fn create_fdt(
         create_pool_node(&mut fdt, "gpu_guest", gpa, size, None, growable)?;
     }
 
-    // Dedicated firmware preload pool. EDK2 accepts its complete runtime SHARE and removes this
-    // reserved-memory node before handing the otherwise already-declared RAM range to Linux.
-    if let Some((gpa, size, prealloc, step)) = edk2_preload_resv {
+    // The shim's handoff page. It is a SHARE'd region like the pools, and it needs this node for
+    // the same reason they do: the resource manager blesses a memparcel by finding a
+    // `/reserved-memory` child whose `reg` matches it, and refuses to start a VM that was handed
+    // a parcel no node accounts for (measured on sm8650 / android14-6.1: without this node
+    // GH_VM_START answers NORESOURCE, and the whole VM never runs). The guest ignores it -- the
+    // compatible is a vendor string no Linux handler claims, and `no-map` keeps it out of the
+    // linear map -- and the shim does not read it either, since crosvm patches the address
+    // straight into the shim's header.
+    if let Some((gpa, size)) = shim_handoff_resv {
+        let resv = fdt.root_mut().subnode_mut("reserved-memory")?;
+        resv.set_prop("#address-cells", 0x2u32)?;
+        resv.set_prop("#size-cells", 0x2u32)?;
+        resv.set_prop("ranges", ())?;
+        let node = resv.subnode_mut(&format!("shim_handoff@{:x}", gpa))?;
+        // Its own compatible rather than `droidvm,pool`: edk2's GunyahPoolAcpiDxe turns every
+        // pool node into an ACPI device, and this is not a pool -- it is one page of protocol
+        // between the host and the shim, finished with before anything else runs.
+        node.set_prop("compatible", "droidvm,shim-handoff")?;
+        node.set_prop("reg", &[gpa, size])?;
+        node.set_prop("no-map", ())?;
+    }
+
+    // The growable test pool: exists so the grow/shrink path can be exercised end to end without
+    // disturbing the production pools, which are all fully pre-shared and must stay that way.
+    for (idx, (gpa, size, prealloc, step)) in test_pool_resv.into_iter().enumerate() {
         let growable = if step != 0 {
             let pool_id = next_growable_pool_id;
             next_growable_pool_id += 1;
@@ -989,14 +1089,43 @@ pub fn create_fdt(
         } else {
             None
         };
-        create_pool_node(
-            &mut fdt,
-            "edk2_preload",
-            gpa,
-            size,
-            None,
-            growable,
-        )?;
+        // First pool keeps the historical node name; a second gets a distinct one so both
+        // droidvm,dynamic-pool nodes are present and the guest can drive each by pool-id.
+        let name = if idx == 0 {
+            "test_guest".to_string()
+        } else {
+            format!("test_guest{}", idx + 1)
+        };
+        // DROIDVM_POOL_HIDE=dt|shm|both (diagnostic): omit the reserved-memory node for the test
+        // pools. The sm8650-era RM refuses a `/reserved-memory` child whose `reg` does not match
+        // an accepted memparcel exactly, which is one of three tangled explanations for why a
+        // partially-shared pool fails to start there -- the others being the shm vdevice node and
+        // the region itself. Each has to be removable on its own or the cause stays unknown.
+        let hide = std::env::var("DROIDVM_POOL_HIDE").unwrap_or_default();
+        if hide == "dt" || hide == "both" {
+            base::warn!(
+                "GH-POOL: DROIDVM_POOL_HIDE={} -- omitting the {} reserved-memory node ({:#x}+{:#x})",
+                hide, name, gpa, size,
+            );
+            continue;
+        }
+        create_pool_node(&mut fdt, &name, gpa, size, None, growable)?;
+    }
+
+    // EDK2 is laid out after the test pools, so assign its ID after theirs as well. PoolGrants
+    // indexes growable pools in GPA order and the FDT IDs must describe the same ordering.
+    if let Some((gpa, size, prealloc, step)) = edk2_preload_resv {
+        let growable = if step != 0 {
+            let pool_id = next_growable_pool_id;
+            Some(GrowablePool {
+                pre_alloc_size: prealloc,
+                step_size: step,
+                pool_id,
+            })
+        } else {
+            None
+        };
+        create_pool_node(&mut fdt, "edk2_preload", gpa, size, None, growable)?;
     }
 
     // drm2kgsl's native-context arena: the guest allocates nothing from it -- it holds the host's
@@ -1004,6 +1133,12 @@ pub fn create_fdt(
     // the RM blesses the range.
     if let Some((gpa, size)) = drm2kgsl_resv {
         create_pool_node(&mut fdt, "drm2kgsl_host", gpa, size, None, None)?;
+    }
+
+    // venus's host-alloc transport pool: the guest maps ring blobs by pool-relative offset
+    // (MAP_INFO_POOL), same contract as gfx_host.
+    if let Some((gpa, size)) = venus_resv {
+        create_pool_node(&mut fdt, "venus_host", gpa, size, None, None)?;
     }
 
     create_cpu_nodes(
@@ -1031,6 +1166,9 @@ pub fn create_fdt(
     if let Some(ref sfb_cfg) = simplefb_cfg {
         let has_resv = swiotlb.is_some() || sfb_cfg.addr >= crate::AARCH64_PHYS_MEM_START;
         create_simplefb_node(&mut fdt, sfb_cfg, has_resv)?;
+    }
+    if let Some(ref pflash_cfg) = pflash_cfg {
+        create_pflash_node(&mut fdt, pflash_cfg)?;
     }
     create_vmwdt_node(&mut fdt, vmwdt_cfg, num_cpus)?;
     if is_kvm {
@@ -1100,6 +1238,25 @@ pub fn create_fdt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pflash_node() {
+        let mut fdt = Fdt::new(&[]);
+        let config = PflashDtConfig {
+            base: 0x9000_0000,
+            size: 0xc_0000,
+            block_size: 0x1000,
+        };
+
+        create_pflash_node(&mut fdt, &config).unwrap();
+
+        let node = fdt.get_node("/pflash@90000000").unwrap();
+        assert_eq!(node.get_prop::<String>("compatible").unwrap(), "cfi-flash");
+        assert_eq!(node.get_prop::<Vec<u64>>("reg").unwrap(), [config.base, config.size]);
+        assert_eq!(node.get_prop::<u32>("erase-size").unwrap(), config.block_size);
+        assert!(node.get_prop::<()>("no-unaligned-direct-access").is_some());
+        assert_eq!(node.get_prop::<String>("status").unwrap(), "okay");
+    }
 
     #[test]
     fn psci_compatible_v0_1() {

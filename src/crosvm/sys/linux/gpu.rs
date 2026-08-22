@@ -7,6 +7,7 @@
 static_assertions::assert_cfg!(feature = "gpu");
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::env;
 use std::path::PathBuf;
 
@@ -90,6 +91,9 @@ pub fn create_gpu_device(
     render_server_fd: Option<SafeDescriptor>,
     has_vfio_gfx_device: bool,
     event_devices: Vec<EventDevice>,
+    // Frames from the VMM's simplefb bridge, presented through this device's display whenever
+    // the guest is not driving it itself. See `ExternalScanout`.
+    external_scanout: Option<Arc<virtio::ExternalScanout>>,
 ) -> DeviceResult {
     let is_sandboxed = cfg.jail_config.is_some();
     let mut gpu_params = cfg.gpu_parameters.clone().unwrap();
@@ -165,7 +169,15 @@ pub fn create_gpu_device(
     //   - is_sandboxed implies that blob mapping will be done out-of-process by the crosvm
     //     hypervisor process.
     //   - fixed_blob_mapping is not yet compatible with VmMemorySource::ExternalMapping
-    gpu_params.external_blob = is_sandboxed || gpu_params.fixed_blob_mapping;
+    //   - udmabuf (guest-alloc): the guest owns the pool and hands the host an external descriptor
+    //     per blob. gfxstream's guest-handle blob path (VirtioGpuResource::create, the
+    //     STREAM_BLOB_MEM_GUEST|CREATE_GUEST_HANDLE branch) is gated on ExternalBlob; with it off,
+    //     ResourceCreateBlob falls through to no-premapped-external-blob-mapping and returns
+    //     ComponentError(-22), so guest Vulkan can't allocate device memory. Under --disable-sandbox
+    //     with the gfxstream feature (fixed_blob_mapping=false) that gate was always off, which is
+    //     what broke app-driven gfxstream guest-alloc. drm2kgsl is unaffected: its guest pool goes
+    //     through virglrenderer's own path, not the gfxstream ExternalBlob one.
+    gpu_params.external_blob = is_sandboxed || gpu_params.fixed_blob_mapping || gpu_params.udmabuf;
 
     // Implicit launch is not allowed when sandboxed. A socket fd from a separate sandboxed
     // render_server process must be provided instead.
@@ -179,12 +191,23 @@ pub fn create_gpu_device(
 
     #[cfg(feature = "android_display")]
     if let Some(service_name) = &cfg.android_display_service {
+        // The GPU device owns this sink even when `--simplefb` is also configured: it registers
+        // the one ICrosvmAndroidDisplayService the app hands its Surface to, and the simplefb
+        // bridge feeds its frames through the same device (ExternalScanout) instead of opening a
+        // second display under the same name. Two registrations under one name is what made the
+        // app's Surface go to whichever producer won the race, with the loser drawing into
+        // nothing for the rest of the VM's life.
         display_backends.insert(0, virtio::DisplayBackend::Android(service_name.to_string()));
     }
 
     #[cfg(feature = "vnc")]
     if let Some(ref vnc_cfg) = cfg.vnc_server {
-        if cfg.simplefb.is_none() {
+        {
+            // Taken even with `--simplefb`, for the same reason as the Android sink above: there
+            // is one display and the GPU device owns it, with the bridge feeding its frames in
+            // through ExternalScanout. This used to stand down for simplefb, from when the bridge
+            // presented on its own -- leaving nobody to open the VNC server once the bridge
+            // started handing frames over instead.
             let host = vnc_cfg.host.as_deref().unwrap_or("0.0.0.0");
             let port = vnc_cfg.port.unwrap_or(5900);
             let addr = format!("{}:{}", host, port);
@@ -225,6 +248,7 @@ pub fn create_gpu_device(
         virtio::base_features(cfg.protection_type),
         &cfg.wayland_socket_paths,
         cfg.gpu_cgroup_path.as_ref(),
+        external_scanout,
     );
 
     let jail = if let Some(jail_config) = cfg.jail_config.as_ref() {

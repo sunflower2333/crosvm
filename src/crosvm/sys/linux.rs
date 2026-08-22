@@ -382,6 +382,7 @@ fn create_virtio_devices(
     #[cfg(feature = "gpu")] has_vfio_gfx_device: bool,
     #[cfg(feature = "registered_events")] registered_evt_q: &SendTube,
     #[cfg(feature = "vnc")] simplefb_event_devices_out: &mut Vec<EventDevice>,
+    #[cfg(feature = "gpu")] external_scanout_out: &mut Option<Arc<virtio::ExternalScanout>>,
 ) -> DeviceResult<Vec<VirtioDeviceStub>> {
     let mut devs = Vec::new();
 
@@ -457,13 +458,30 @@ fn create_virtio_devices(
             let event_devices =
                 create_display_window_input_devices(cfg, gpu_display_w, gpu_display_h, &mut devs)?;
 
-            #[cfg(feature = "vnc")]
-            let event_devices = if cfg.simplefb.is_some() && cfg.vnc_server.is_some() {
-                log::info!("GPU: simplefb+VNC mode — event_devices go to simplefb bridge");
-                *simplefb_event_devices_out = event_devices;
-                Vec::new()
-            } else {
-                event_devices
+            // Input arrives through whichever display is being presented on, and with a GPU
+            // device present that display is always this one -- VNC and the app's Surface alike,
+            // with the simplefb bridge feeding frames in rather than presenting. The bridge keeps
+            // its own event devices only when there is no GPU device at all, which is handled
+            // where it opens its own display (below).
+
+            // With `--simplefb` there are two things that can produce a picture and only one
+            // Surface to put it on. Rather than opening a second display (two registrations of
+            // one Android service name, with the app's Surface going to whichever won), the
+            // bridge hands its frames to this device, which shows them whenever the guest is not
+            // displaying through virtio-gpu itself. See ExternalScanout.
+            let external_scanout = match cfg.simplefb.as_ref() {
+                Some(sfb) => {
+                    let bpp: u32 = match sfb.format.as_str() {
+                        "r8g8b8" => 3,
+                        "r5g6b5" => 2,
+                        _ => 4,
+                    };
+                    let scanout = virtio::ExternalScanout::new(sfb.width, sfb.height, sfb.width * bpp)
+                        .context("failed to create the simplefb scanout")?;
+                    *external_scanout_out = Some(scanout.clone());
+                    Some(scanout)
+                }
+                None => None,
             };
 
             let (gpu_control_host_tube, gpu_control_device_tube) =
@@ -477,12 +495,13 @@ fn create_virtio_devices(
                 render_server_fd,
                 has_vfio_gfx_device,
                 event_devices,
+                external_scanout,
             )?);
         }
     }
 
     #[cfg(feature = "vnc")]
-    if cfg.gpu_parameters.is_none() && cfg.simplefb.is_some() && cfg.vnc_server.is_some() {
+    if cfg.gpu_parameters.is_none() && cfg.simplefb.is_some() {  // bridge owns its own sink
         // Same device set as the virtio-gpu display path above, so a VNC session gets
         // identical guest input devices (including the `input=tablet` absolute mouse)
         // regardless of which display backend serves it.
@@ -1170,6 +1189,7 @@ fn create_devices(
     // Stores a set of PID of child processes that are suppose to exit cleanly.
     worker_process_pids: &mut BTreeSet<Pid>,
     #[cfg(feature = "vnc")] simplefb_event_devices_out: &mut Vec<EventDevice>,
+    #[cfg(feature = "gpu")] external_scanout_out: &mut Option<Arc<virtio::ExternalScanout>>,
 ) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
     let mut devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
     #[cfg(feature = "balloon")]
@@ -1309,6 +1329,8 @@ fn create_devices(
         registered_evt_q,
         #[cfg(feature = "vnc")]
         simplefb_event_devices_out,
+        #[cfg(feature = "gpu")]
+        external_scanout_out,
     )?;
 
     for stub in stubs {
@@ -1570,7 +1592,15 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
             size.checked_mul(1024 * 1024)
                 .ok_or_else(|| anyhow!("requested swiotlb size too large"))?,
         )
-    } else if matches!(cfg.protection_type, ProtectionType::Unprotected) {
+    } else if matches!(
+        cfg.protection_type,
+        // A pseudo-unprotected VM has no use for a bounce pool: its RAM is shared to it rather
+        // than lent, so the host can already reach every buffer the guest hands a device. Worse
+        // than useless, in fact -- crosvm defaults protected VMs to 64 MiB of it, and that puts a
+        // `restricted-dma-pool` node in the tree for a guest kernel that was never built to
+        // honour one, which is the whole reason this mode exists.
+        ProtectionType::Unprotected | ProtectionType::ProtectedPseudoUnprotected
+    ) {
         None
     } else {
         Some(64 * 1024 * 1024)
@@ -2240,6 +2270,21 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         if let Some(mb) = pa.drm_host_mb {
             std::env::set_var("NCTX_DRM2KGSL_POOL_MB", mb.to_string());
         }
+        if let Some(mb) = pa.venus_host_mb {
+            std::env::set_var("NCTX_VENUS_POOL_MB", mb.to_string());
+        }
+        if let Some(v) = pa.alloc_from_vm_sys_ram {
+            std::env::set_var("NCTX_POOL_FROM_SYSRAM", if v { "1" } else { "0" });
+        }
+        if let Some(mb) = pa.test_pool_mb {
+            std::env::set_var("DROIDVM_TEST_POOL_MB", mb.to_string());
+        }
+        if let Some(mb) = pa.test_pool_prealloc_mb {
+            std::env::set_var("DROIDVM_TEST_POOL_PREALLOC_MB", mb.to_string());
+        }
+        if let Some(mb) = pa.test_pool_step_mb {
+            std::env::set_var("DROIDVM_TEST_POOL_STEP_MB", mb.to_string());
+        }
     }
 
     // The EDK2 preload pool is deliberately independent of GPU pre-allocation. Always override
@@ -2430,6 +2475,8 @@ where
 
     #[cfg(feature = "vnc")]
     let mut simplefb_event_devices: Vec<EventDevice> = Vec::new();
+    #[cfg(feature = "gpu")]
+    let mut external_scanout: Option<Arc<virtio::ExternalScanout>> = None;
 
     let mut devices = create_devices(
         &cfg,
@@ -2449,6 +2496,8 @@ where
         &mut worker_process_pids,
         #[cfg(feature = "vnc")]
         &mut simplefb_event_devices,
+        #[cfg(feature = "gpu")]
+        &mut external_scanout,
     )?;
 
     #[cfg(feature = "pci-hotplug")]
@@ -2734,6 +2783,8 @@ where
         vcpu_domain_paths,
         #[cfg(feature = "vnc")]
         simplefb_event_devices,
+        #[cfg(feature = "gpu")]
+        external_scanout,
     )
 }
 
@@ -3847,6 +3898,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         PathBuf,
     >,
     #[cfg(feature = "vnc")] simplefb_event_devices: Vec<EventDevice>,
+    #[cfg(feature = "gpu")] external_scanout: Option<Arc<virtio::ExternalScanout>>,
 ) -> Result<ExitState> {
     // Split up `all_control_tubes`.
     #[cfg(feature = "balloon")]
@@ -4032,6 +4084,28 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         let android_service = cfg.android_display_service.clone();
         #[cfg(not(feature = "android_display"))]
         let android_service: Option<String> = None;
+
+        // With a GPU device present there is exactly one display and it belongs to that device;
+        // feed it instead of opening a second one (see ExternalScanout). Without a GPU the bridge
+        // presents on its own, as it always did.
+        #[cfg(feature = "gpu")]
+        if let Some(scanout) = external_scanout.clone() {
+            return match simplefb_display::start_simplefb_display_thread(
+                guest_mem,
+                params,
+                simplefb_display::SimplefbDisplayTarget::GpuDevice { scanout },
+                Vec::new(),
+            ) {
+                Ok(handle) => {
+                    info!("simplefb: frames go to the gpu device's display");
+                    Some(handle)
+                }
+                Err(e) => {
+                    error!("failed to start the simplefb feed: {:?}", e);
+                    None
+                }
+            };
+        }
 
         let target = match android_service {
             Some(service_name) => simplefb_display::SimplefbDisplayTarget::Android { service_name },
@@ -4537,11 +4611,14 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                         // child processes that exit cleanly which should not be considered a
                         // crash. When running with sandboxing, this should be handled by the
                         // device's process handler.
+                        // Some vendor GPU driver builds (observed: OPPO sm8650 / Android 14
+                        // Adreno stack) fork helpers that exit with a NON-zero status during
+                        // normal operation; only crosvm's own (tracked) children are evidence
+                        // of a crash. Accept any exit code from untracked children.
                         if cfg.jail_config.is_none()
                             && !linux.pid_debug_label_map.contains_key(&pid)
                             && siginfo.ssi_signo == libc::SIGCHLD as u32
                             && siginfo.ssi_code == libc::CLD_EXITED
-                            && siginfo.ssi_status == 0
                         {
                             continue;
                         }

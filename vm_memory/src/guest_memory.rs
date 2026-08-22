@@ -147,6 +147,13 @@ pub enum MemoryRegionPurpose {
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     Drm2KgslPool,
 
+    /// DroidVM: a GROWABLE test pool. Declared to the guest at its full size but SHARE'd only up
+    /// to `pre_alloc_size` at boot; the rest is granted at runtime over virtio-gunyah-accept's
+    /// pool queue. Exists so the growable path can be exercised end to end without disturbing the
+    /// three production pools, which are all fully pre-shared and must stay that way.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    DynamicTestPool,
+
     /// DroidVM: memory accepted by EDK2 before Linux boots. The range starts with no boot-time
     /// backing and is granted as one runtime SHARE over virtio-gunyah-accept. Firmware removes
     /// only this pool's reserved-memory node after MEM_ACCEPT succeeds.
@@ -181,8 +188,35 @@ pub enum MemoryRegionPurpose {
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     SharedFramebuffer,
 
+    /// DroidVM: the guest's RAM in a pseudo-unprotected VM.
+    ///
+    /// Declared to crosvm like any region -- it is a memfd the host writes the payload into
+    /// before the VM starts -- but never handed to the hypervisor at boot. It appears in no
+    /// device tree node, so the resource manager has nothing to object to, and arrives in the
+    /// guest as a runtime memparcel the boot shim accepts. From then on it is ordinary memory
+    /// that both sides can reach, which is the point: no bounce pool, and a stock kernel with no
+    /// CONFIG_RESTRICTED_DMA_POOL boots.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    SharedGuestRam,
+
+    /// DroidVM: the page a pseudo-unprotected VM's host and shim talk through.
+    ///
+    /// SHARE'd at boot like a pool, because the memparcel handles it carries do not exist until
+    /// after GH_VM_START -- by which time the boot region is lent and the host can no longer
+    /// write to it. It is also the shim's only way to report: a failure written here is a log
+    /// line, and a failure with nowhere to go is a VM that hangs.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    ShimHandoff,
+
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     StaticSwiotlbRegion,
+
+    /// DroidVM: venus (vkr) host-alloc transport pool. The region vkr's blob_id==0 shmems
+    /// (per-instance ring, CS/reply chunks) are sub-allocated from (pool merge landed), so the
+    /// guest maps them pool-relative with no runtime SHARE; blessed and access-checked exactly
+    /// like GpuPool. Its own `venus_host` DT node.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    VenusPool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues, PartialEq, Eq, PartialOrd, Ord)]
@@ -239,15 +273,23 @@ pub struct MemoryRegionOptions {
     /// Granularity of a runtime grant into the unbacked remainder, in bytes.
     ///
     /// `0` means this pool does not grow at all: everything is shared before boot, which is what
-    /// the three existing pools do and must keep doing. Non-zero must be a multiple of 2 MiB (the
-    /// folio size the share path is built around). GPU pools additionally require a power of two
-    /// because drm_buddy rejects anything else; the one-shot EDK2 preload grant does not.
+    /// the three existing pools do and must keep doing. Non-zero must be a multiple of 2 MiB --
+    /// the folio the share path is built around, and the granularity the reserve pool serves.
     ///
     /// Each grant costs one RM memparcel, and MAX_MEMPARCEL_PER_VM is 1024 across the whole VM --
     /// shared with Android's own parcels, and never released until the phone reboots for anything
     /// a killed VMM left behind. A 2 MiB step therefore exhausts the quota at 2 GiB and takes the
     /// phone with it; 32-64 MiB is the range that leaves room.
     pub step_size: u64,
+
+    /// Whether this pool's memory comes out of the VM's system RAM rather than being added on
+    /// top of it.
+    ///
+    /// The pool region itself is unaffected -- same size, same place, same everything. All this
+    /// changes is the arithmetic that sizes system RAM: with it set, a 4 GiB VM with a 1 GiB pool
+    /// has 3 GiB of RAM and takes 4 GiB from the host, instead of 4 GiB of RAM and taking 5. The
+    /// point is being able to say in advance what a VM will cost: ask for 4 GiB, get 4 GiB.
+    pub alloc_from_vm_sys_ram: bool,
 
     /// Cap on this pool's simultaneously live grants. Zero means "as many as the window holds",
     /// which is only safe for a small window: the real limit is MAX_MEMPARCEL_PER_VM = 1024 for
@@ -287,6 +329,12 @@ impl MemoryRegionOptions {
     pub fn growable_pool(mut self, pre_alloc: u64, step: u64) -> Self {
         self.pre_alloc_size = Some(pre_alloc);
         self.step_size = step;
+        self
+    }
+
+    /// Take this pool out of the VM's system RAM rather than adding it on top. See the field.
+    pub fn alloc_from_vm_sys_ram(mut self, from_sys_ram: bool) -> Self {
+        self.alloc_from_vm_sys_ram = from_sys_ram;
         self
     }
 
@@ -331,26 +379,47 @@ impl MemoryRegionOptions {
                 self.step_size, MIN_STEP
             ));
         }
+        // A multiple of a folio, not a power of two. The power-of-two rule was written down as
+        // "drm_buddy rejects anything else", and that turned out to be about a different number:
+        // the guest's allocator is initialised with PAGE_SIZE as its chunk (virtgpu_vram.c
+        // `drm_buddy_init(..., PAGE_SIZE)`), and never sees the step at all. What the step really
+        // has to satisfy is the share path -- grants are made of 2 MiB folios -- and the
+        // bookkeeping below, which wants the window and the floor to be whole numbers of steps.
         if self.step_size % MIN_STEP != 0 {
             return Some(format!(
                 "step_size {:#x} is not a multiple of {:#x} (a grant is shared as 2 MiB folios)",
                 self.step_size, MIN_STEP
             ));
         }
-        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-        let requires_power_of_two = self.purpose != MemoryRegionPurpose::Edk2PreloadPool;
-        #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
-        let requires_power_of_two = true;
-        if requires_power_of_two && !self.step_size.is_power_of_two() {
-            return Some(format!(
-                "step_size {:#x} is not a power of two (drm_buddy in the guest rejects it)",
-                self.step_size
-            ));
-        }
         if size % self.step_size != 0 || pre_alloc % self.step_size != 0 {
             return Some(format!(
                 "size {:#x} and pre_alloc_size {:#x} must both be multiples of step_size {:#x}",
                 size, pre_alloc, self.step_size
+            ));
+        }
+        // A growable pool must have SOMETHING shared before boot, and at least a folio of it.
+        //
+        // The pool's `/reserved-memory` node declares the pre-shared floor, and the Gunyah
+        // resource manager on android14-6.1 requires every such node's `reg` to match an accepted
+        // memparcel exactly -- base, size, and a single mapping. A zero floor leaves nothing for
+        // it to match and the VM does not start at all: GH_VM_START answers ENODEV, which reads
+        // as a broken VMM rather than as the one line of configuration it is. (Measured on
+        // sm8650: with the node the VM is refused, without it the same VM boots -- see
+        // plans/PSEUDO_UNPROTECTED_SHIM_PLAN.md.)
+        //
+        // The floor is also where the pool's identity lives: it is the range a driver may touch
+        // without asking, and the node that carries the pool's name, id, step and total size.
+        // EDK2 preload is intentionally different: firmware owns its zero-floor node and accepts
+        // the complete window as one runtime parcel before exposing it to the operating system.
+        const MIN_FLOOR: u64 = 2 << 20;
+        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+        let allows_zero_floor = self.purpose == MemoryRegionPurpose::Edk2PreloadPool;
+        #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+        let allows_zero_floor = false;
+        if !allows_zero_floor && pre_alloc < MIN_FLOOR {
+            return Some(format!(
+                "pre_alloc_size {:#x} is below the {:#x} minimum for a growable pool; the                  reserved-memory node has to describe a memparcel that really exists",
+                pre_alloc, MIN_FLOOR
             ));
         }
         None
@@ -490,10 +559,11 @@ impl GuestMemory {
     pub fn new_with_options(
         ranges: &[(GuestAddress, u64, MemoryRegionOptions)],
     ) -> Result<GuestMemory> {
-        // Refuse bad pool parameters here, before a single page is mapped. Left to run, an invalid
-        // GPU step surfaces as drm_buddy returning -EINVAL inside the guest and a pre_alloc short
-        // of the size on a non-growable pool surfaces as reads of the shortfall silently returning
-        // zeros -- both of which read as guest driver bugs rather than command line mistakes.
+        // Refuse bad pool parameters here, before a single page is mapped. Left to run, a step
+        // the share path cannot honour surfaces as an error deep inside the guest driver, and
+        // a pre_alloc short of the size on a non-growable pool surfaces as reads of the shortfall
+        // silently returning zeros -- both of which read as guest driver bugs rather than as the
+        // command line mistake they are.
         for (addr, size, options) in ranges {
             if let Some(why) = options.pool_param_error(*size) {
                 return Err(Error::PoolParams(*addr, why));
@@ -950,11 +1020,33 @@ impl GuestMemory {
             MemoryRegionPurpose::Drm2KgslPool => {
                 self.check_pool_backed_range(region, guest_addr, 1)
             }
+            // venus transport pool: SHARE'd like the gfx pools; vkr lives in this process and
+            // sub-allocates ring shmems out of it, so the host needs access.  Fully
+            // pre-shared (step 0), so the range check is a formality with the same answer.
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::VenusPool => {
+                self.check_pool_backed_range(region, guest_addr, 1)
+            }
+            // The one region where this actually gates anything today: everything else has
+            // step_size == 0 and answers yes everywhere.
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::DynamicTestPool => {
+                self.check_pool_backed_range(region, guest_addr, 1)
+            }
             // EDK2 may access this range only after its complete runtime grant is live.
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
             MemoryRegionPurpose::Edk2PreloadPool => {
                 self.check_pool_backed_range(region, guest_addr, 1)
             }
+            // The window of a pseudo-unprotected VM, and the page the shim is told about it
+            // through. Both are SHARE'd rather than lent -- that is the whole of the mode -- so
+            // the host keeps its access, and needs it: the window IS the guest's RAM, and every
+            // virtqueue the guest publishes lives in it. Gating them here is what a protected VM
+            // needs and what this one exists to avoid.
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::SharedGuestRam => Ok(()),
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::ShimHandoff => Ok(()),
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
             MemoryRegionPurpose::SharedFramebuffer => Ok(()),
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
@@ -1671,7 +1763,7 @@ mod tests {
 
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     #[test]
-    fn edk2_preload_step_allows_non_power_of_two_2m_multiple() {
+    fn pool_steps_require_2m_multiples_not_powers_of_two() {
         const MIB: u64 = 1 << 20;
         let edk2 = MemoryRegionOptions::new()
             .purpose(MemoryRegionPurpose::Edk2PreloadPool)
@@ -1680,10 +1772,15 @@ mod tests {
 
         let gpu = MemoryRegionOptions::new()
             .purpose(MemoryRegionPurpose::GpuPoolGuest)
+            .growable_pool(6 * MIB, 6 * MIB);
+        assert_eq!(gpu.pool_param_error(6 * MIB), None);
+
+        let zero_floor_gpu = MemoryRegionOptions::new()
+            .purpose(MemoryRegionPurpose::GpuPoolGuest)
             .growable_pool(0, 6 * MIB);
-        assert!(gpu
+        assert!(zero_floor_gpu
             .pool_param_error(6 * MIB)
-            .is_some_and(|error| error.contains("not a power of two")));
+            .is_some_and(|error| error.contains("below the")));
 
         let unaligned_edk2 = MemoryRegionOptions::new()
             .purpose(MemoryRegionPurpose::Edk2PreloadPool)

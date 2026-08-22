@@ -1,7 +1,8 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright DroidVM contributors
 // Additional permissions apply; see ADDITIONAL-PERMISSIONS in the repository root.
 
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -10,6 +11,7 @@ use anyhow::Context;
 use anyhow::Result;
 use base::error;
 use base::info;
+use base::warn;
 use base::AsRawDescriptor;
 use base::SafeDescriptor;
 use base::WaitContext;
@@ -21,6 +23,8 @@ use vm_control::gpu::DisplayMode;
 use vm_control::gpu::DisplayParameters;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
+
+use devices::virtio::ExternalScanout;
 
 pub struct SimplefbDisplayParams {
     pub addr: u64,
@@ -46,9 +50,79 @@ pub enum SimplefbDisplayTarget {
     /// NOT come through the display here -- it arrives on the `--input` evdev sockets, same as
     /// the virtio-gpu native-display path.
     Android { service_name: String },
+    /// The virtio-gpu device's own display. Used whenever this VM has a GPU: there is one
+    /// Surface, so there must be one writer, and the device is it -- we hand frames over and it
+    /// shows them while the guest is not displaying through virtio-gpu itself. See
+    /// `devices::virtio::ExternalScanout`.
+    GpuDevice { scanout: Arc<ExternalScanout> },
 }
 
 const DEFAULT_FPS: u32 = 30;
+
+/// Feeds guest framebuffer frames to the GPU device, which owns the one display.
+///
+/// Skips the copy entirely while the guest is displaying through virtio-gpu (the device tells us
+/// so), and only submits when the framebuffer actually changed -- a frozen firmware framebuffer
+/// behind a live guest desktop must not keep waking the worker, and an unchanged frame is not a
+/// reason to take the display away from anyone.
+fn simplefb_feed_loop(
+    guest_mem: GuestMemory,
+    params: &SimplefbDisplayParams,
+    scanout: Arc<ExternalScanout>,
+) -> Result<()> {
+    let frame_duration = Duration::from_nanos(1_000_000_000 / DEFAULT_FPS as u64);
+    let guest_addr = GuestAddress(params.addr);
+    let fb_size = (params.stride as usize) * (params.height as usize);
+    let mut read_buf = vec![0u8; fb_size];
+    let mut last_buf: Vec<u8> = Vec::new();
+
+    info!(
+        "simplefb: feeding the gpu display: {}x{} stride={} addr={:#x} @ {}fps",
+        params.width, params.height, params.stride, params.addr, DEFAULT_FPS,
+    );
+
+    let mut idle_pokes: u32 = 0;
+    loop {
+        let frame_start = Instant::now();
+        if scanout.guest_owns() {
+            // Nothing to send while the guest is driving the display -- but ownership can also
+            // lapse on a clock (a guest that bound a scanout and stopped presenting), and that is
+            // only ever re-evaluated on the worker's side of this event. Poke it about once a
+            // second so a lapse is noticed without copying a frame nobody will look at.
+            idle_pokes += 1;
+            if idle_pokes >= DEFAULT_FPS {
+                idle_pokes = 0;
+                scanout.poke();
+            }
+        } else {
+            if idle_pokes != 0 {
+                // Just took the display back. The framebuffer may not have changed a byte since
+                // we last looked at it (a Windows guest that has been sitting on the same picture
+                // since the firmware handed over), and "unchanged" must not mean "not shown" on
+                // the frame where the display became ours.
+                idle_pokes = 0;
+                last_buf.clear();
+            }
+            if guest_mem
+                .read_exact_at_addr(&mut read_buf, guest_addr)
+                .is_err()
+            {
+                info!("simplefb: guest memory no longer readable, exiting");
+                break;
+            }
+            if last_buf != read_buf {
+                last_buf.clear();
+                last_buf.extend_from_slice(&read_buf);
+                scanout.submit(&read_buf);
+            }
+        }
+        let elapsed = frame_start.elapsed();
+        if elapsed < frame_duration {
+            thread::sleep(frame_duration - elapsed);
+        }
+    }
+    Ok(())
+}
 
 pub fn start_simplefb_display_thread(
     guest_mem: GuestMemory,
@@ -59,6 +133,15 @@ pub fn start_simplefb_display_thread(
     thread::Builder::new()
         .name("simplefb_display".into())
         .spawn(move || {
+            // Handing frames to the GPU device needs no display of our own -- it owns the one
+            // Surface, so this thread is a producer, not a presenter.
+            if let SimplefbDisplayTarget::GpuDevice { scanout } = &target {
+                if let Err(e) = simplefb_feed_loop(guest_mem, &params, scanout.clone()) {
+                    error!("simplefb feed thread exited with error: {:?}", e);
+                }
+                return;
+            }
+
             let display_result = match &target {
                 SimplefbDisplayTarget::Vnc {
                     addr,
@@ -74,6 +157,8 @@ pub fn start_simplefb_display_thread(
                 SimplefbDisplayTarget::Android { service_name } => {
                     GpuDisplay::open_android(service_name)
                 }
+                // Handled above; it never opens a display.
+                SimplefbDisplayTarget::GpuDevice { .. } => unreachable!(),
             };
             let mut display = match display_result {
                 Ok(d) => d,
@@ -116,6 +201,7 @@ fn simplefb_display_loop(
     let guest_addr = GuestAddress(params.addr);
     let fb_size = (params.stride as usize) * (params.height as usize);
     let mut read_buf = vec![0u8; fb_size];
+    let mut no_framebuffer: u64 = 0;
 
     info!(
         "simplefb display bridge: {}x{} stride={} bpp={} addr={:#x} @ {}fps",
@@ -157,6 +243,20 @@ fn simplefb_display_loop(
             let dst = fb.as_volatile_slice();
             let copy_len = dst.size().min(read_buf.len());
             dst.copy_from(&read_buf[..copy_len]);
+            no_framebuffer = 0;
+        } else {
+            // No framebuffer to write into: the sink never gave us one (an Android display whose
+            // service lost the name race hands out a surface with no window behind it) or it is
+            // transiently locked. Silence here cost a whole debugging session -- the bridge looked
+            // perfectly healthy while presenting nothing -- so say it, backing off so a permanent
+            // condition does not fill the log.
+            no_framebuffer += 1;
+            if no_framebuffer == 1 || no_framebuffer % 300 == 0 {
+                warn!(
+                    "simplefb: no framebuffer from the display sink ({} frame(s) dropped)",
+                    no_framebuffer
+                );
+            }
         }
         display.flip(surface_id);
 

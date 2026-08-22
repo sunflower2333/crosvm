@@ -146,6 +146,7 @@ impl VmAArch64 for GunyahVm {
         let window_top = window_base.next_multiple_of(BAR_TARGET) + BAR_TARGET + (1u64 << 29);
         let size_max =
             core::cmp::max((window_top - base_address).next_multiple_of(GIB), 4 * GIB);
+        base::info!("GH: layout base={:#x} ram_top={:#x} size-max={:#x}", base_address, ram_top, size_max);
         memory_node.set_prop("base-address", base_address)?;
         memory_node.set_prop("size-max", size_max)?;
 
@@ -204,6 +205,37 @@ impl VmAArch64 for GunyahVm {
                 // EDK2 preload pool: its zero-length boot floor creates no fixed mapping; the
                 // complete range is installed later by runtime SHARE plus guest MEM_ACCEPT.
                 MemoryRegionPurpose::Edk2PreloadPool => true,
+                // venus transport pool: same -- shm vdevice + stage-2 mapping, no runtime accept.
+                MemoryRegionPurpose::VenusPool => true,
+                // Growable test pool: needs the shm vdevice for its pre-shared floor, exactly
+                // like the pools above. Runtime grants do not use it -- they go through
+                // runtime_share and the guest's own MEM_ACCEPT.
+                //
+                // DROIDVM_POOL_HIDE=shm|both (diagnostic) drops it. On android14-6.1 this node is
+                // how the RM ties a SHARE'd memparcel to the guest -- it is the reason the shm
+                // vdevice exists at all (see fdt_create_shm_device) -- so a pool that is declared
+                // but never SHARE'd may be refused because of THIS node rather than because of
+                // its reserved-memory node or its region. Separating the three is the point.
+                MemoryRegionPurpose::DynamicTestPool => {
+                    let hide = std::env::var("DROIDVM_POOL_HIDE").unwrap_or_default();
+                    if hide == "shm" || hide == "both" {
+                        base::warn!(
+                            "GH-POOL: DROIDVM_POOL_HIDE={} -- no shm vdevice for the test pool at {:#x}",
+                            hide,
+                            region.guest_addr.offset(),
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                }
+                // The window gets no shm vdevice: nothing about it is handed over at VM
+                // creation, and a node describing memory the resource manager has not been given
+                // is exactly what it refuses to start a VM over.
+                MemoryRegionPurpose::SharedGuestRam => false,
+                // The handoff page does, like every other SHARE'd region: on android14-6.1 this
+                // node's `base` is what pins the memparcel at the address crosvm chose.
+                MemoryRegionPurpose::ShimHandoff => true,
                 MemoryRegionPurpose::GuestMemoryRegion => false,
                 // Described by the "firmware-address" property
                 MemoryRegionPurpose::ProtectedFirmwareRegion => false,
@@ -253,7 +285,28 @@ impl VmAArch64 for GunyahVm {
         // guest RAM can legitimately exist below it; it is the natural bottom of the fence.
         const GUNYAH_RM_LOWMEM_FLOOR: u64 = 0x4000_0000;
         let resv_top = firmware_base.unwrap_or(base_address);
-        if resv_top > GUNYAH_RM_LOWMEM_FLOOR {
+        // The sm8650-era RM (observed on 6.1 host kernels, OPPO 6.1.118) REJECTS a
+        // guest DTB that carries this reserved-memory node: VM init fails with
+        // ENODEV at GH_VM_START. Newer RMs (6.6/6.12 hosts) accept it, and there
+        // the fence is required (the RM's low-IPA donation is silently
+        // non-executable; without the fence the guest faults on code placed
+        // there -- see the commit that introduced it). No RM version is exposed
+        // to the host, so the host kernel release is the best available proxy
+        // for the RM generation. GUNYAH_LOWMEM_FENCE=0/1 forces either way.
+        let fence_enabled = match std::env::var("GUNYAH_LOWMEM_FENCE").ok().as_deref() {
+            Some("0") => false,
+            Some(_) => true,
+            None => {
+                let pre_6_6 = super::host_kernel_pre_6_6();
+                if pre_6_6 {
+                    base::info!(
+                        "GH: pre-6.6 host kernel: omitting the RM-lowmem fence node                          (this RM generation rejects DTBs that carry it)"
+                    );
+                }
+                !pre_6_6
+            }
+        };
+        if fence_enabled && resv_top > GUNYAH_RM_LOWMEM_FLOOR {
             let resv_size = resv_top - GUNYAH_RM_LOWMEM_FLOOR;
             let resv = fdt.root_mut().subnode_mut("reserved-memory")?;
             resv.set_prop("#address-cells", 2u32)?;
@@ -318,7 +371,9 @@ impl VmAArch64 for GunyahVm {
         }
 
         if let Err(e) = self.set_boot_pc(payload_entry_address.offset()) {
-            if e.errno() == ENOTTY {
+            // Kernels without GH_VM_SET_BOOT_CONTEXT answer ENOTTY (mainline ioctl
+            // dispatch) or ENODEV (OPPO sm8650 6.1 downstream dispatch).
+            if e.errno() == ENOTTY || e.errno() == libc::ENODEV {
                 // GH_VM_SET_BOOT_CONTEXT ioctl is not supported, but returning success
                 // for backward compatibility when the offset is zero.
                 if payload_offset != 0 {

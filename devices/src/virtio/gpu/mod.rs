@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 mod edid;
+mod external_scanout;
 mod parameters;
 mod protocol;
 mod snapshot;
@@ -18,6 +19,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ::snapshot::AnySnapshot;
 use anyhow::anyhow;
@@ -50,6 +52,7 @@ use base::VmEventType;
 use base::WaitContext;
 use base::WorkerThread;
 use data_model::*;
+pub use external_scanout::ExternalScanout;
 pub use gpu_display::EventDevice;
 use gpu_display::*;
 use hypervisor::MemCacheType;
@@ -409,9 +412,32 @@ pub struct ReturnDescriptor {
     pub len: u32,
 }
 
+/// A RESOURCE_FLUSH whose virtio fence completion is parked on a display fence: the zero-copy
+/// flip handed back a sync_file that signals when the display has finished reading the flipped
+/// buffer, and the guest (which dma_fence-waits this virtio fence in its plane update) must not
+/// reuse the dmabuf before then.  The descriptor itself already sits in `fence_state.descs`;
+/// this records what to complete and when to give up.
+struct PendingFlipFence {
+    ring: VirtioGpuRing,
+    fence_id: u64,
+    fence: SafeDescriptor,
+    /// Safety valve: a display that never signals (surface torn down mid-flip, HWC stall) must
+    /// not freeze the guest compositor.  Past this instant the fence is completed regardless.
+    deadline: std::time::Instant,
+    /// Whether the fd has been added to the worker's WaitContext yet.
+    registered: bool,
+}
+
+/// How long a flip completion fence may stay unsignaled before it is force-completed.  Three
+/// 120Hz vsyncs -- generous for a healthy display, small enough that a torn-down surface only
+/// hiccups the guest instead of stalling it (the guest side waits with its own multi-second
+/// timeout, which would otherwise be the visible failure).
+const FLIP_FENCE_TIMEOUT: Duration = Duration::from_millis(25);
+
 pub struct Frontend {
     fence_state: Arc<Mutex<FenceState>>,
     virtio_gpu: VirtioGpu,
+    pending_flip_fences: Vec<PendingFlipFence>,
 }
 
 impl Frontend {
@@ -419,7 +445,89 @@ impl Frontend {
         Frontend {
             fence_state,
             virtio_gpu,
+            pending_flip_fences: Vec::new(),
         }
+    }
+
+    /// Registers any not-yet-registered flip fences with the worker's WaitContext so their
+    /// signal wakes the worker exactly when the display is done, rather than on the timeout.
+    fn register_flip_fences(&mut self, wait_ctx: &WaitContext<WorkerToken>) {
+        for pending in self.pending_flip_fences.iter_mut() {
+            if !pending.registered {
+                // Registration failure is not fatal: the deadline path still completes it.
+                if let Err(e) = wait_ctx.add(&pending.fence, WorkerToken::FlipFence) {
+                    base::warn!("failed to poll flip fence, falling back to timeout: {}", e);
+                }
+                pending.registered = true;
+            }
+        }
+    }
+
+    /// The nearest deadline among pending flip fences, if any -- the worker bounds its wait by
+    /// this so an unsignaled fence cannot stall the guest past `FLIP_FENCE_TIMEOUT`.
+    fn next_flip_fence_deadline(&self) -> Option<std::time::Instant> {
+        self.pending_flip_fences.iter().map(|f| f.deadline).min()
+    }
+
+    /// Completes every pending flip fence that has signaled or passed its deadline.  Returns
+    /// whether any completion was delivered (the caller then signals the ctrl queue).
+    fn complete_flip_fences(
+        &mut self,
+        ctrl_queue: &dyn QueueReader,
+        wait_ctx: &WaitContext<WorkerToken>,
+    ) -> bool {
+        let now = std::time::Instant::now();
+        let mut any = false;
+        let mut i = 0;
+        while i < self.pending_flip_fences.len() {
+            let pending = &self.pending_flip_fences[i];
+            // A sync_file reads as POLLIN once its fence signals.
+            let mut pfd = libc::pollfd {
+                fd: pending.fence.as_raw_descriptor(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: pfd points at a valid pollfd for the duration of the call.
+            let signaled = unsafe { libc::poll(&mut pfd, 1, 0) } > 0;
+            if !signaled && now < pending.deadline {
+                i += 1;
+                continue;
+            }
+            if !signaled {
+                base::warn!(
+                    "flip fence {} timed out after {:?}; completing anyway",
+                    pending.fence_id,
+                    FLIP_FENCE_TIMEOUT
+                );
+            }
+            let pending = self.pending_flip_fences.remove(i);
+            if pending.registered {
+                let _ = wait_ctx.delete(&pending.fence);
+            }
+            // Mirror create_fence_handler: deliver every descriptor at or below this fence on
+            // the same ring, then advance the ring's completed counter.
+            let mut fence_state = self.fence_state.lock();
+            let mut j = 0;
+            while j < fence_state.descs.len() {
+                if fence_state.descs[j].ring == pending.ring
+                    && fence_state.descs[j].fence_id <= pending.fence_id
+                {
+                    let completed = fence_state.descs.remove(j);
+                    ctrl_queue.add_used(completed.desc_chain, completed.len);
+                    any = true;
+                } else {
+                    j += 1;
+                }
+            }
+            let completed = fence_state
+                .completed_fences
+                .entry(pending.ring.clone())
+                .or_insert(0);
+            if pending.fence_id > *completed {
+                *completed = pending.fence_id;
+            }
+        }
+        any
     }
 
     /// Returns the internal connection to the compositor and its associated state.
@@ -832,6 +940,12 @@ impl Frontend {
             }
         };
 
+        // A flush that performed a zero-copy flip parks its display completion fence in
+        // virtio_gpu; collect it here regardless of FLAG_FENCE so a stale fence can never leak
+        // onto a later, unrelated command.  Without FLAG_FENCE it is dropped -- closed without
+        // waiting, which is the pre-fence behaviour the legacy guest path expects.
+        let flip_fence = self.virtio_gpu.take_pending_flip_fence();
+
         if writer.available_bytes() != 0 {
             let mut fence_id = 0;
             let mut ctx_id = 0;
@@ -845,6 +959,10 @@ impl Frontend {
             // that strands the descriptor forever and hard-hangs the whole VM
             // (all vCPUs idle waiting on a GPU fence). Respond with the error instead.
             let mut fence_created = false;
+            // A fenced flush with a display fence skips rutabaga entirely: its virtio fence
+            // completes when the display fence fires (see complete_flip_fences), not when the
+            // renderer is done.  This is what backpressures the guest compositor to the display.
+            let mut deferred_flip: Option<SafeDescriptor> = None;
             if let Some(cmd) = gpu_cmd {
                 let ctrl_hdr = cmd.ctrl_hdr();
                 if ctrl_hdr.flags.to_native() & VIRTIO_GPU_FLAG_FENCE != 0 {
@@ -853,22 +971,26 @@ impl Frontend {
                     ctx_id = ctrl_hdr.ctx_id.to_native();
                     ring_idx = ctrl_hdr.ring_idx;
 
-                    let fence = RutabagaFence {
-                        flags,
-                        fence_id,
-                        ctx_id,
-                        ring_idx,
-                    };
-                    gpu_response = match self.virtio_gpu.create_fence(fence) {
-                        Ok(_) => {
-                            fence_created = true;
-                            gpu_response
-                        }
-                        Err(fence_resp) => {
-                            warn!("create_fence {} -> {:?}", fence_id, fence_resp);
-                            fence_resp
-                        }
-                    };
+                    if let Some(fence) = flip_fence {
+                        deferred_flip = Some(fence);
+                    } else {
+                        let fence = RutabagaFence {
+                            flags,
+                            fence_id,
+                            ctx_id,
+                            ring_idx,
+                        };
+                        gpu_response = match self.virtio_gpu.create_fence(fence) {
+                            Ok(_) => {
+                                fence_created = true;
+                                gpu_response
+                            }
+                            Err(fence_resp) => {
+                                warn!("create_fence {} -> {:?}", fence_id, fence_resp);
+                                fence_resp
+                            }
+                        };
+                    }
                 }
             }
 
@@ -877,6 +999,27 @@ impl Frontend {
             match gpu_response.encode(flags, fence_id, ctx_id, ring_idx, writer) {
                 Ok(l) => len = l,
                 Err(e) => debug!("ctrl queue response encode error: {}", e),
+            }
+
+            if let Some(fence) = deferred_flip {
+                let ring = match flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
+                    0 => VirtioGpuRing::Global,
+                    _ => VirtioGpuRing::ContextSpecific { ctx_id, ring_idx },
+                };
+                self.fence_state.lock().descs.push(FenceDescriptor {
+                    ring: ring.clone(),
+                    fence_id,
+                    desc_chain,
+                    len,
+                });
+                self.pending_flip_fences.push(PendingFlipFence {
+                    ring,
+                    fence_id,
+                    fence,
+                    deadline: std::time::Instant::now() + FLIP_FENCE_TIMEOUT,
+                    registered: false,
+                });
+                return None;
             }
 
             if fence_created {
@@ -922,6 +1065,11 @@ enum WorkerToken {
         index: usize,
     },
     VirtioGpuPoll,
+    /// A zero-copy flip's completion fence signaled; one token covers every pending fence and
+    /// the handler polls each to find the signaled ones (they are few and short-lived).
+    FlipFence,
+    /// The VMM's simplefb bridge offered a frame (see `ExternalScanout`).
+    ExternalFrame,
     #[cfg(windows)]
     DisplayDescriptorRequest,
 }
@@ -1017,6 +1165,9 @@ struct Worker {
     #[cfg(windows)]
     gpu_display_wait_descriptor_ctrl_rd: RecvTube,
     activation_resources: Option<GpuActivationResources>,
+    /// Frames from the VMM's simplefb bridge, shown while the guest is not displaying through
+    /// this device (see `ExternalScanout`).
+    external_scanout: Option<Arc<ExternalScanout>>,
 }
 
 #[derive(Copy, Clone)]
@@ -1054,6 +1205,7 @@ impl Worker {
         #[cfg(windows)] gpu_display_wait_descriptor_ctrl_rd: RecvTube,
         #[cfg(windows)] gpu_display_wait_descriptor_ctrl_wr: SendTube,
         snapshot_scratch_directory: Option<PathBuf>,
+        external_scanout: Option<Arc<ExternalScanout>>,
     ) -> anyhow::Result<Worker> {
         let fence_state = Arc::new(Mutex::new(Default::default()));
         let fence_handler_resources = Arc::new(Mutex::new(None));
@@ -1098,6 +1250,7 @@ impl Worker {
             #[cfg(windows)]
             gpu_display_wait_descriptor_ctrl_rd,
             activation_resources: None,
+            external_scanout,
         })
     }
 
@@ -1105,12 +1258,37 @@ impl Worker {
         // This loop effectively only runs while the worker is inactive. Once activated via
         // a `WorkerRequest::Activate`, the worker will remain in `run_until_sleep_or_exit()`
         // until suspended via `kill_evt` or `suspend_evt` being signaled.
+        //
+        // "Inactive" is not the same as "nothing to display". A guest with no virtio-gpu driver
+        // resets the device on its way out of the firmware and never activates it again -- that
+        // is exactly what Windows does, whose Basic Display Driver only knows the linear
+        // framebuffer the firmware left behind -- and the simplefb bridge feeding that
+        // framebuffer to this device is still running. Waiting on the request channel alone would
+        // park this thread for the rest of the VM's life with the firmware's last frame frozen on
+        // screen, which is the one case the whole arbitration exists for. So while there is a
+        // bridge, wait with a timeout and serve it in between.
         loop {
-            let request = match self.request_receiver.recv() {
-                Ok(r) => r,
-                Err(_) => {
-                    info!("virtio gpu worker connection ended, exiting.");
-                    return;
+            let request = if self.external_scanout.is_some() {
+                match self.request_receiver.recv_timeout(EXTERNAL_IDLE_POLL) {
+                    Ok(r) => r,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if let Some(external) = self.external_scanout.clone() {
+                            serve_external_scanout(&external, &mut self.state.virtio_gpu);
+                        }
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        info!("virtio gpu worker connection ended, exiting.");
+                        return;
+                    }
+                }
+            } else {
+                match self.request_receiver.recv() {
+                    Ok(r) => r,
+                    Err(_) => {
+                        info!("virtio gpu worker connection ended, exiting.");
+                        return;
+                    }
                 }
             };
 
@@ -1290,6 +1468,13 @@ impl Worker {
                 .context("failed adding poll event to WaitContext")?;
         }
 
+        let external_evt = self.external_scanout.as_ref().map(|e| e.event().try_clone());
+        if let Some(Ok(evt)) = &external_evt {
+            event_manager
+                .add(evt, WorkerToken::ExternalFrame)
+                .context("failed adding the external scanout event to WaitContext")?;
+        }
+
         self.resource_bridges
             .add_to_wait_context(&mut event_manager.wait_ctx);
 
@@ -1302,10 +1487,24 @@ impl Worker {
         // isn't used so this isn't a huge issue.
 
         loop {
-            let events = event_manager
-                .wait_ctx
-                .wait()
-                .context("failed polling for gpu worker events")?;
+            // A pending flip fence bounds the wait: its fd wakes us the moment the display is
+            // done, and the deadline turns a fence that never fires into a bounded hiccup
+            // instead of a frozen guest compositor.
+            let events = match self.state.next_flip_fence_deadline() {
+                Some(deadline) => {
+                    let timeout = deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .max(Duration::from_millis(1));
+                    event_manager
+                        .wait_ctx
+                        .wait_timeout(timeout)
+                        .context("failed polling for gpu worker events")?
+                }
+                None => event_manager
+                    .wait_ctx
+                    .wait()
+                    .context("failed polling for gpu worker events")?,
+            };
 
             let mut signal_used_cursor = false;
             let mut signal_used_ctrl = false;
@@ -1314,8 +1513,12 @@ impl Worker {
             let mut needs_config_interrupt = false;
 
             // Remove event triggers that have been hung-up to prevent unnecessary worker wake-ups
-            // (see b/244486346#comment62 for context).
-            for event in events.iter().filter(|e| e.is_hungup) {
+            // (see b/244486346#comment62 for context).  FlipFence fds are exempt: their
+            // completion sweep below owns their registration lifecycle.
+            for event in events
+                .iter()
+                .filter(|e| e.is_hungup && !matches!(e.token, WorkerToken::FlipFence))
+            {
                 error!(
                     "unhandled virtio-gpu worker event hang-up detected: {:?}",
                     event.token
@@ -1325,6 +1528,16 @@ impl Worker {
 
             for event in events.iter().filter(|e| e.is_readable) {
                 match event.token {
+                    WorkerToken::ExternalFrame => {
+                        // The simplefb bridge has a frame. It only offers one while the guest is
+                        // not displaying through this device, and `present_external` checks that
+                        // again here, in the thread that owns the display -- so the two sources
+                        // can never be mid-frame at the same time.
+                        if let Some(external) = self.external_scanout.clone() {
+                            let _ = external.event().wait();
+                            serve_external_scanout(&external, &mut self.state.virtio_gpu);
+                        }
+                    }
                     WorkerToken::CtrlQueue => {
                         let _ = ctrl_evt.wait();
                         // Set flag that control queue is available to be read, but defer reading
@@ -1389,6 +1602,10 @@ impl Worker {
                     WorkerToken::VirtioGpuPoll => {
                         self.state.event_poll();
                     }
+                    WorkerToken::FlipFence => {
+                        // Handled by the completion sweep after queue processing; the wake-up
+                        // itself is all this event needed to accomplish.
+                    }
                     WorkerToken::Sleep => {
                         return Ok(WorkerStopReason::Sleep);
                     }
@@ -1419,6 +1636,18 @@ impl Worker {
                 signal_used_ctrl = true;
             }
 
+            // Republish who owns the display after every batch of guest commands. This is where
+            // ownership actually changes -- a scanout bound or unbound, a device reset at OS
+            // handover -- and the bridge reads the flag to decide whether to bother producing a
+            // frame at all. Updating it only when a frame arrives would make the first "the guest
+            // owns it" observation permanent: the bridge stops offering, nothing wakes this
+            // thread, and the flag can never go back. That is exactly the handover this exists
+            // for (firmware paints through virtio-gpu, then Windows, which has no virtio-gpu
+            // driver, never binds a scanout again).
+            if let Some(external) = &self.external_scanout {
+                external.set_guest_owns(self.state.virtio_gpu.guest_owns_display());
+            }
+
             // Process the entire control queue before the resource bridge in case a resource is
             // created or destroyed by the control queue. Processing the resource bridge first may
             // lead to a race condition.
@@ -1427,6 +1656,17 @@ impl Worker {
             // processed above and before the corresponding bridge is processed below.
             self.resource_bridges
                 .process_resource_bridges(&mut self.state, &mut event_manager.wait_ctx);
+
+            // Flip fences: register the ones queue processing just parked, then complete every
+            // one that signaled (or expired).  Runs every iteration -- the wait above was woken
+            // either by the fence fd itself or bounded by its deadline.
+            self.state.register_flip_fences(&event_manager.wait_ctx);
+            if self
+                .state
+                .complete_flip_fences(&activation_resources.ctrl_queue, &event_manager.wait_ctx)
+            {
+                signal_used_ctrl = true;
+            }
 
             if signal_used_ctrl {
                 activation_resources.ctrl_queue.signal_used();
@@ -1509,6 +1749,27 @@ impl DisplayBackend {
     }
 }
 
+/// How long the worker parks on the request channel before looking at the simplefb bridge again,
+/// while no driver has the device activated. The bridge produces at 30 fps, so this is one frame:
+/// long enough that a device nobody is displaying through costs nothing, short enough that a
+/// Windows desktop is not a third of a second behind itself.
+const EXTERNAL_IDLE_POLL: Duration = Duration::from_millis(33);
+
+/// Take whatever the simplefb bridge is offering and put it on the display.
+///
+/// Both callers are the gpu worker thread: the event loop while the device is active, and the
+/// request loop while it is not. Ownership is re-evaluated on the way out, because this is the
+/// only place it is evaluated at all -- the bridge only ever reads the flag.
+fn serve_external_scanout(external: &ExternalScanout, virtio_gpu: &mut VirtioGpu) {
+    let (w, h, stride) = (external.width(), external.height(), external.stride());
+    external.take_frame(|frame| {
+        if let Err(e) = virtio_gpu.present_external(w, h, stride, frame) {
+            error!("failed to present an external frame: {:?}", e);
+        }
+    });
+    external.set_guest_owns(virtio_gpu.guest_owns_display());
+}
+
 pub struct Gpu {
     exit_evt_wrtube: SendTube,
     pub gpu_control_tube: Option<Tube>,
@@ -1522,6 +1783,10 @@ pub struct Gpu {
     worker_thread: Option<WorkerThread<()>>,
     display_backends: Vec<DisplayBackend>,
     display_params: Vec<GpuDisplayParameters>,
+    /// What the guest is told in `virtio_gpu_config.num_scanouts`. Zero means render-only.
+    num_scanouts: u32,
+    /// Frames from the VMM's simplefb bridge, if this VM has one (see `ExternalScanout`).
+    external_scanout: Option<Arc<ExternalScanout>>,
     display_event: Arc<AtomicBool>,
     rutabaga_builder: RutabagaBuilder,
     pci_address: Option<PciAddress>,
@@ -1588,7 +1853,10 @@ fn set_gpu_worker_rt_prio() {
                 }
             }
         }
-        Err(_) => DEFAULT_GPU_RT_LEVEL,
+        // Absent -> do not set real-time scheduling at all. RT is opt-in: the daemon only exports
+        // CROSVM_GPU_RT_PRIO when the graphics tab's switch is on. (An explicit "off"/"0" also
+        // disables it; an explicit level sets SCHED_FIFO at that level.)
+        Err(_) => 0,
     };
 
     if prio == 0 {
@@ -1625,8 +1893,18 @@ impl Gpu {
         channels: &BTreeMap<String, PathBuf>,
         #[cfg(windows)] wndproc_thread: WindowProcedureThread,
         #[cfg(any(target_os = "android", target_os = "linux"))] gpu_cgroup_path: Option<&PathBuf>,
+        external_scanout: Option<Arc<ExternalScanout>>,
     ) -> Gpu {
         let mut display_params = gpu_parameters.display_params.clone();
+        // Zero configured displays is a real configuration, not an oversight: the picture comes
+        // from somewhere else (crosvm's simplefb bridge) and this device is here to render. Keep
+        // a nominal size for the internal bookkeeping below, but report no scanouts to the guest
+        // (`num_scanouts` in build_config) so it never picks this device to display on.
+        let num_scanouts = if display_params.is_empty() {
+            0
+        } else {
+            VIRTIO_GPU_MAX_SCANOUTS as u32
+        };
         if display_params.is_empty() {
             display_params.push(Default::default());
         }
@@ -1792,6 +2070,8 @@ impl Gpu {
             worker_thread: None,
             display_backends,
             display_params,
+            num_scanouts,
+            external_scanout,
             display_event: Arc::new(AtomicBool::new(false)),
             rutabaga_builder,
             pci_address: gpu_parameters.pci_address,
@@ -1927,6 +2207,7 @@ impl Gpu {
         let (worker_request_sender, worker_request_receiver) = mpsc::channel();
         let (worker_response_sender, worker_response_receiver) = mpsc::channel();
 
+        let external_scanout = self.external_scanout.clone();
         let worker_thread = WorkerThread::start("v_gpu", move |kill_evt| {
             #[cfg(any(target_os = "android", target_os = "linux"))]
             if let Some(cgroup_path) = gpu_cgroup_path {
@@ -1959,6 +2240,7 @@ impl Gpu {
                 #[cfg(windows)]
                 gpu_display_wait_descriptor_ctrl_wr,
                 snapshot_scratch_directory,
+                external_scanout,
             )
             .expect("Failed to create virtio gpu worker thread");
 
@@ -2034,7 +2316,7 @@ impl Gpu {
         virtio_gpu_config {
             events_read: Le32::from(events_read),
             events_clear: Le32::from(0),
-            num_scanouts: Le32::from(VIRTIO_GPU_MAX_SCANOUTS as u32),
+            num_scanouts: Le32::from(self.num_scanouts),
             num_capsets: Le32::from(num_capsets),
         }
     }

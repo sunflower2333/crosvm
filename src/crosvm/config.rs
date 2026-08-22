@@ -592,6 +592,42 @@ pub struct PreAllocConfig {
     /// the round trip this route exists to avoid. Its own Drm2KgslPool region + `drm2kgsl_host` DT
     /// node. Only meaningful with `--gpu backend=virglrenderer`.
     pub drm_host_mb: Option<u64>,
+    /// venus (vkr) HOST-allocated pool size (MB): where the venus transport shmems (per-instance
+    /// ring + CS/reply chunks) are served from. The vkr pool merge is landed (virglrenderer vkr
+    /// sub-allocates every blob_id==0 shmem from this region and publishes map_ptr, so the guest
+    /// maps pool_base+offset with no runtime SHARE); venus's real VkDeviceMemory is separately
+    /// guest-alloc in the shared gpu-guest pool. Absent/0 => vkr falls back to a per-blob memfd +
+    /// runtime SHARE apiece (the round trip this pool exists to avoid; fatal to the fragile sm8650
+    /// RM). Size for the peak transport working set (cs pool alone is >=8M per instance). Its own
+    /// VenusPool region + `venus_host` DT node. Only meaningful with
+    /// `--gpu backend=virglrenderer,context-types=venus`.
+    pub venus_host_mb: Option<u64>,
+
+    /// Take every pool below out of the VM's system RAM instead of adding it on top of `--mem`.
+    ///
+    /// Off by default, which is the arithmetic these pools have always had: `--mem 4096` with a
+    /// 1 GiB pool asks the host for 5 GiB. On, the same VM asks for 4 GiB and gives the guest 3 --
+    /// so what a VM costs is what was typed, which is the number worth being able to predict when
+    /// the memory comes out of a fixed reserve pool.
+    pub alloc_from_vm_sys_ram: Option<bool>,
+
+    /// Growable TEST pool: total window size (MB). Declared to the guest whole but backed only up
+    /// to `test-pool-prealloc-mb`; the rest is granted at runtime as the guest asks, a
+    /// `test-pool-step-mb` multiple at a time.
+    ///
+    /// Exists to exercise the growable-pool path end to end -- the three pools above are all
+    /// fully pre-shared (step 0) and cannot. Nothing in the guest uses it except the test driver.
+    pub test_pool_mb: Option<u64>,
+    /// Bytes of the test pool SHARE'd before boot. Defaults to the whole window, i.e. an ordinary
+    /// non-growable pool, so setting only `test-pool-mb` changes nothing about how it behaves.
+    pub test_pool_prealloc_mb: Option<u64>,
+    /// Grant granularity for the test pool (MB). Must be >= 2 and a power of two. 0, or absent,
+    /// means the pool does not grow.
+    ///
+    /// One grant is one RM memparcel however many steps it spans, and MAX_MEMPARCEL_PER_VM is
+    /// 1024 for the whole VM -- so this is not "how much to allocate at once", it is the smallest
+    /// piece the guest can ever release. Small steps buy fine-grained release and spend quota.
+    pub test_pool_step_mb: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues)]
