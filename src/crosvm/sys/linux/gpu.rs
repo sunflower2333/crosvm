@@ -7,9 +7,9 @@
 static_assertions::assert_cfg!(feature = "gpu");
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::env;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use base::linux::move_proc_to_cgroup;
 use jail::*;
@@ -97,6 +97,16 @@ pub fn create_gpu_device(
 ) -> DeviceResult {
     let is_sandboxed = cfg.jail_config.is_some();
     let mut gpu_params = cfg.gpu_parameters.clone().unwrap();
+
+    // Gunyah cannot safely replace the host-visible BAR's prepared PROT_NONE arena after
+    // GH_VM_START: stage-2 keeps the original user-memory-region PFNs. Use one dynamic mapping
+    // per blob so the fd-backed pages are what the guest actually sees. This is especially
+    // important for the drm2kgsl blob-0 control ring, which is allocated from its boot-blessed
+    // host arena but consumed through the standard VirtIO PCI BAR by the Windows KMD.
+    #[cfg(all(any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah"))]
+    if matches!(cfg.hypervisor.as_ref(), Some(HypervisorKind::Gunyah { .. })) {
+        gpu_params.fixed_blob_mapping = false;
+    }
 
     if is_sandboxed {
         gpu_params.snapshot_scratch_path = Some(Path::new("/tmpfs-gpu-snapshot").to_path_buf());

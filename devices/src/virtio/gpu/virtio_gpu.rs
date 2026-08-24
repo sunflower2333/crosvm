@@ -212,6 +212,10 @@ struct VirtioGpuResource {
     // this byte offset. Its map was reported to the guest as a pool GPA (no runtime SHARE), so
     // unmap must NOT try to remove a (nonexistent) host mapping.
     pool_offset: Option<u64>,
+    // blob_id 0 is the drm2kgsl native-context control/response shmem. It may be allocated from
+    // the host arena, but Windows consumes it through the ordinary VirtIO PCI BAR mapping rather
+    // than the pool-relative MAP_INFO_POOL contract used by guest-visible pool BOs.
+    native_control_blob: bool,
 
     // Only saved for snapshotting, so that we can re-attach backing iovecs with the correct new
     // host addresses.
@@ -266,6 +270,7 @@ impl VirtioGpuResource {
             display_import_state: DisplayImportState::Unknown,
             rutabaga_external_mapping: false,
             pool_offset: None,
+            native_control_blob: false,
             backing_iovecs: None,
             pool_refs: None,
             pool_scanout_iovecs: None,
@@ -2187,6 +2192,8 @@ impl VirtioGpu {
             None
         };
 
+        let native_control_blob = resource_create_blob.blob_id == 0
+            && resource_create_blob.blob_mem == VIRTIO_GPU_BLOB_MEM_HOST3D;
         let create_result = self.rutabaga.resource_create_blob(
             ctx_id,
             resource_id,
@@ -2208,6 +2215,7 @@ impl VirtioGpu {
         resource.pool_scanout_iovecs = pool_iovecs;
         resource.pool_refs = pool_refs;
         resource.pool_scanout_dmabuf = pool_scanout_dmabuf;
+        resource.native_control_blob = native_control_blob;
 
         // Rely on rutabaga to check for duplicate resource ids.
         self.resources.insert(resource_id, resource);
@@ -2228,23 +2236,31 @@ impl VirtioGpu {
         // runtime SHARE happens at all). gfxstream records the offset when it sub-allocates from
         // the HostVisiblePool; virglrenderer's drm2kgsl backend when it sub-allocates from the
         // Drm2KgslPool. Both arrive here as RutabagaResource::pool_offset.
-        if let Some(pool_offset) = self.rutabaga.resource_pool_offset(resource_id) {
-            let resource = self
-                .resources
-                .get_mut(&resource_id)
-                .ok_or(ErrInvalidResourceId)?;
-            resource.pool_offset = Some(pool_offset);
-            let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
-            base::debug!(
-                "GPU-MAPBLOB: res={} POOL-resident offset={:#x} (no SHARE)",
-                resource_id,
-                pool_offset,
-            );
-            return Ok(OkMapInfo {
-                map_info: (map_info & RUTABAGA_MAP_CACHE_MASK) | VIRTIO_GPU_MAP_INFO_POOL,
-                // A 2 GiB pool keeps the offset within u32.
-                pool_offset: Some(pool_offset as u32),
-            });
+        let native_control_blob = self
+            .resources
+            .get(&resource_id)
+            .ok_or(ErrInvalidResourceId)?
+            .native_control_blob;
+        let pool_offset = self.rutabaga.resource_pool_offset(resource_id);
+        if !native_control_blob {
+            if let Some(pool_offset) = pool_offset {
+                let resource = self
+                    .resources
+                    .get_mut(&resource_id)
+                    .ok_or(ErrInvalidResourceId)?;
+                resource.pool_offset = Some(pool_offset);
+                let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+                base::debug!(
+                    "GPU-MAPBLOB: res={} POOL-resident offset={:#x} (no SHARE)",
+                    resource_id,
+                    pool_offset,
+                );
+                return Ok(OkMapInfo {
+                    map_info: (map_info & RUTABAGA_MAP_CACHE_MASK) | VIRTIO_GPU_MAP_INFO_POOL,
+                    // A 2 GiB pool keeps the offset within u32.
+                    pool_offset: Some(pool_offset as u32),
+                });
+            }
         }
 
         let resource = self
@@ -2282,9 +2298,58 @@ impl VirtioGpu {
                         size: resource.size,
                     });
                 } else if export.handle_type != RUTABAGA_HANDLE_TYPE_MEM_OPAQUE_FD {
+                    let descriptor_offset = if native_control_blob {
+                        let arena_fd_offset = std::env::var("CROSVM_DRM2KGSL_ARENA_FD_OFFSET")
+                            .ok()
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .ok_or_else(|| {
+                                base::error!(
+                                    "GPU-MAPBLOB: native control blob has no drm2kgsl arena fd offset"
+                                );
+                                ErrUnspec
+                            })?;
+                        let pool_offset = pool_offset.ok_or_else(|| {
+                            base::error!(
+                                "GPU-MAPBLOB: native control blob is not resident in drm2kgsl arena"
+                            );
+                            ErrUnspec
+                        })?;
+                        let arena_size = std::env::var("CROSVM_DRM2KGSL_ARENA_SIZE")
+                            .ok()
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .ok_or_else(|| {
+                                base::error!(
+                                    "GPU-MAPBLOB: native control blob has no drm2kgsl arena size"
+                                );
+                                ErrUnspec
+                            })?;
+                        if pool_offset > arena_size || resource.size > arena_size - pool_offset {
+                            base::error!(
+                                "GPU-MAPBLOB: native control range offset={:#x} size={:#x} exceeds arena={:#x}",
+                                pool_offset,
+                                resource.size,
+                                arena_size,
+                            );
+                            return Err(ErrUnspec);
+                        }
+                        arena_fd_offset.checked_add(pool_offset).ok_or_else(|| {
+                            base::error!("GPU-MAPBLOB: native control arena offset overflow");
+                            ErrUnspec
+                        })?
+                    } else {
+                        0
+                    };
+                    if native_control_blob {
+                        base::debug!(
+                            "GPU-MAPBLOB: res={} native control BAR offset={:#x} source offset={:#x}",
+                            resource_id,
+                            offset,
+                            descriptor_offset,
+                        );
+                    }
                     source = Some(VmMemorySource::Descriptor {
                         descriptor: to_safe_descriptor(export.os_handle),
-                        offset: 0,
+                        offset: descriptor_offset,
                         size: resource.size,
                     });
                 }
@@ -2310,7 +2375,7 @@ impl VirtioGpu {
         // NOTE: the original gate returned ErrUnspec here when external_blob/fixed_blob_mapping
         // were set; we deliberately relax it for the Gunyah + disable-sandbox configuration.
         if source.is_none() {
-            if self.fixed_blob_mapping {
+            if self.fixed_blob_mapping && !native_control_blob {
                 return Err(ErrUnspec);
             }
 
