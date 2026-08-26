@@ -287,6 +287,11 @@ impl PoolGrants {
         match self.granted.get(&offset) {
             None => Err(GrantError::NotGranted),
             Some(g) if g.len != len => Err(GrantError::PartialRelease),
+            // A successful begin_unshare reserves the range before the host drops its
+            // mapping. Keep the reservation visible to callers that only perform the
+            // read-only validation step; otherwise a racing unregister can proceed as if
+            // the grant were still available and clear the reservation's ownership state.
+            Some(g) if g.releasing => Err(GrantError::Busy),
             // Refuse while the host still has something built over it. The guest cannot make this
             // call correctly on its own: it drops a buffer from its allocator the moment it sends
             // RESOURCE_UNREF, without waiting to hear that the host is done.

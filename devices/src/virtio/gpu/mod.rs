@@ -11,6 +11,7 @@ mod virtio_gpu;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::env;
 use std::io::Read;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -39,12 +40,12 @@ use base::warn;
 use base::AsRawDescriptor;
 use base::Event;
 use base::EventToken;
+use base::FromRawDescriptor;
 use base::RawDescriptor;
 use base::ReadNotifier;
 #[cfg(windows)]
 use base::RecvTube;
 use base::Result;
-use base::FromRawDescriptor;
 use base::SafeDescriptor;
 use base::SendTube;
 use base::Tube;
@@ -72,9 +73,12 @@ pub use vm_control::gpu::DEFAULT_DISPLAY_WIDTH;
 pub use vm_control::gpu::DEFAULT_REFRESH_RATE;
 #[cfg(windows)]
 use vm_control::ModifyWaitContext;
+use vm_control::VmMemorySource;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 use zerocopy::IntoBytes;
+
+const DRM2KGSL_BAR_BASE_GUARD: u64 = 2 << 20;
 
 pub use self::protocol::virtio_gpu_config;
 pub use self::protocol::VIRTIO_GPU_F_CONTEXT_INIT;
@@ -602,10 +606,9 @@ impl Frontend {
                 self.virtio_gpu
                     .resource_create_3d(resource_id, resource_create_3d)
             }
-            GpuCommand::ResourceUnref(info) => {
-                self.virtio_gpu
-                    .unref_resource(mem, info.resource_id.to_native())
-            }
+            GpuCommand::ResourceUnref(info) => self
+                .virtio_gpu
+                .unref_resource(mem, info.resource_id.to_native()),
             GpuCommand::SetScanout(info) => self.virtio_gpu.set_scanout(
                 info.r,
                 info.scanout_id.to_native(),
@@ -1468,7 +1471,10 @@ impl Worker {
                 .context("failed adding poll event to WaitContext")?;
         }
 
-        let external_evt = self.external_scanout.as_ref().map(|e| e.event().try_clone());
+        let external_evt = self
+            .external_scanout
+            .as_ref()
+            .map(|e| e.event().try_clone());
         if let Some(Ok(evt)) = &external_evt {
             event_manager
                 .add(evt, WorkerToken::ExternalFrame)
@@ -2500,6 +2506,61 @@ impl VirtioDevice for Gpu {
             } else {
                 MemCacheType::CacheCoherent
             };
+            if matches!(
+                self.rutabaga_component,
+                RutabagaComponentType::VirglRenderer
+            ) {
+                let arena_fd = env::var("CROSVM_DRM2KGSL_ARENA_FD")
+                    .ok()
+                    .and_then(|value| value.parse::<RawDescriptor>().ok());
+                let arena_offset = env::var("CROSVM_DRM2KGSL_ARENA_FD_OFFSET")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok());
+                let arena_size = env::var("CROSVM_DRM2KGSL_ARENA_SIZE")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok());
+                if let (Some(fd), Some(offset), Some(size)) = (arena_fd, arena_offset, arena_size) {
+                    if size > DRM2KGSL_BAR_BASE_GUARD && size <= self.pci_bar_size {
+                        if let (Some(source_offset), Some(source_size)) = (
+                            offset.checked_add(DRM2KGSL_BAR_BASE_GUARD),
+                            size.checked_sub(DRM2KGSL_BAR_BASE_GUARD),
+                        ) {
+                            if let Ok(descriptor) = base::clone_descriptor(&base::Descriptor(fd)) {
+                                // drm2kgsl sub-allocates blob zero from the arena suffix. The BAR
+                                // is registered before VM start, so the renderer must never
+                                // replace those pages after Gunyah installs the stage-2 mapping.
+                                info!(
+                                    "drm2kgsl: eagerly backing BAR suffix offset={:#x} size={:#x} from arena fd={} offset={:#x}",
+                                    DRM2KGSL_BAR_BASE_GUARD,
+                                    source_size,
+                                    fd,
+                                    source_offset,
+                                );
+                                return SharedMemoryPrepareType::SingleMappingEager(
+                                    cache_type,
+                                    VmMemorySource::Descriptor {
+                                        descriptor,
+                                        offset: source_offset,
+                                        size: source_size,
+                                    },
+                                    DRM2KGSL_BAR_BASE_GUARD,
+                                );
+                            }
+                        }
+                    } else if size <= DRM2KGSL_BAR_BASE_GUARD {
+                        error!(
+                            "drm2kgsl BAR size {:#x} is not larger than the {:#x} base guard",
+                            size,
+                            DRM2KGSL_BAR_BASE_GUARD,
+                        );
+                    } else if size > self.pci_bar_size {
+                        error!(
+                            "drm2kgsl BAR backing size {:#x} exceeds pci-bar-size {:#x}",
+                            size, self.pci_bar_size
+                        );
+                    }
+                }
+            }
             SharedMemoryPrepareType::SingleMappingOnFirst(cache_type)
         } else {
             SharedMemoryPrepareType::DynamicPerMapping

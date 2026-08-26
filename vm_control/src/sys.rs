@@ -27,4 +27,5 @@ cfg_if::cfg_if! {
 pub use platform::handle_request;
 pub use platform::handle_request_with_timeout;
 pub use platform::prepare_shared_memory_region;
+pub use platform::prepare_shared_memory_region_at_offset;
 pub use platform::should_prepare_memory_region;

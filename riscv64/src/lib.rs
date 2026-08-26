@@ -266,7 +266,14 @@ impl arch::LinuxArch for Riscv64 {
             .into_iter()
             .map(|(dev, jail_orig)| (dev.into_pci_device().unwrap(), jail_orig))
             .collect();
-        let (pci, pci_irqs, mut pid_debug_label_map, _amls, _gpe_scope_amls) =
+        let (
+            pci,
+            pci_irqs,
+            mut pid_debug_label_map,
+            _amls,
+            _gpe_scope_amls,
+            pre_mapped_memory_regions,
+        ) =
             arch::generate_pci_root(
                 pci_devices,
                 irq_chip.as_irq_chip_mut(),
@@ -445,6 +452,7 @@ impl arch::LinuxArch for Riscv64 {
             irq_chip: irq_chip.try_box_clone().map_err(Error::CloneIrqChip)?,
             io_bus,
             mmio_bus,
+            pre_mapped_memory_regions,
             pid_debug_label_map,
             resume_notify_devices: Vec::new(),
             root_config: pci_root,

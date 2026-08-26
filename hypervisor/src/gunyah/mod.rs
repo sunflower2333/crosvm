@@ -313,8 +313,9 @@ impl GunyahVm {
                     // mem-entries into it), never lent.
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                     MemoryRegionPurpose::GpuPoolGuest => false,
-                    // drm2kgsl arena: SHARE'd like the gfx pools; that backend runs in this
-                    // process and must keep reaching it.
+                    // drm2kgsl arena: never LEND because the host renderer must retain access.
+                    // The normal route SHAREs its pool GPA; the prebacked-BAR route below skips
+                    // that alias and SHAREs only the PCI BAR mapping.
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                     MemoryRegionPurpose::Drm2KgslPool => false,
                     // EDK2 preload pool: no boot-time prefix; firmware accepts one runtime SHARE.
@@ -503,27 +504,39 @@ impl GunyahVm {
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                 let full_size: u64 = region.size.try_into().unwrap();
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-                let boot_share_len = if is_pool {
+                let drm2kgsl_bar_backing = region.options.purpose
+                    == MemoryRegionPurpose::Drm2KgslPool
+                    && std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some();
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                let boot_share_len = if drm2kgsl_bar_backing {
+                    0
+                } else if is_pool {
                     region.options.boot_share_len(full_size)
                 } else {
                     full_size
                 };
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                let backing_prepare_len = if drm2kgsl_bar_backing {
+                    full_size
+                } else {
+                    boot_share_len
+                };
 
                 // GPU pre-alloc pool: force order-9 backing (MADV_HUGEPAGE + populate +
-                // cascading COLLAPSE + mlock) BEFORE the SHARE so the gh_hugepage_reserve
-                // supply hook serves the pool from reserved 2MB folios, exactly like the
-                // mTHP-prepared LEND'd guest RAM.
+                // cascading COLLAPSE + mlock) before its guest mapping is installed. For the
+                // drm2kgsl prebacked path this pins the host arena before the BAR alias is
+                // SHARE'd; the original pool GPA itself remains unmapped.
                 // Same gate as the guest-RAM LEND path below: this whole mechanism only
                 // exists for the Qualcomm reserve-pool hook, so it's opt-in via
                 // --prepare-lend-mthp-mode, not unconditional for every arm/aarch64 host.
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-                if cfg.prepare_lend_mthp.is_some() && is_pool && boot_share_len != 0
+                if cfg.prepare_lend_mthp.is_some() && is_pool && backing_prepare_len != 0
                 {
                     // SAFETY: host_addr is a valid mapping of region.size bytes.
                     let prep = unsafe {
                         mthp::prepare_lend_region(
                             region.host_addr as *mut u8,
-                            boot_share_len,
+                            backing_prepare_len,
                         )
                     };
                     if !prep.populated {
@@ -536,7 +549,7 @@ impl GunyahVm {
                              (reserve pool exhausted?) -- refusing to share unbacked memory",
                             region.options.purpose,
                             region.guest_addr.offset(),
-                            boot_share_len
+                            backing_prepare_len
                         );
                         return Err(Error::new(libc::ENOMEM));
                     }
@@ -550,7 +563,7 @@ impl GunyahVm {
                              refusing to share memory the kernel may still migrate",
                             region.options.purpose,
                             region.guest_addr.offset(),
-                            boot_share_len
+                            backing_prepare_len
                         );
                         return Err(Error::new(libc::ENOMEM));
                     }
@@ -584,6 +597,16 @@ impl GunyahVm {
                     base::info!(
                         "GH-SHIM: window gpa={:#x} size={:#x} prepared; it is shared after \
                          GH_VM_START and accepted by the shim",
+                        region.guest_addr.offset(),
+                        full_size,
+                    );
+                    continue;
+                }
+
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                if drm2kgsl_bar_backing {
+                    base::info!(
+                        "GH: Drm2KgslPool gpa={:#x} size={:#x} is host-only BAR backing; skipping the original SHARE",
                         region.guest_addr.offset(),
                         full_size,
                     );

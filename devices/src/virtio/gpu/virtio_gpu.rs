@@ -12,23 +12,23 @@ use std::rc::Rc;
 use std::result::Result;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use std::sync::Arc;
 
 use anyhow::Context;
-use data_model::Le32;
 use base::error;
 use base::info;
 use base::linux::MemoryMappingBuilderUnix;
 use base::FromRawDescriptor;
+use base::IntoRawDescriptor;
 use base::MappedRegion;
 use base::MemoryMapping;
 use base::MemoryMappingBuilder;
-use base::IntoRawDescriptor;
 use base::Protection;
 use base::SafeDescriptor;
 use base::VolatileSlice;
+use data_model::Le32;
 use gpu_display::*;
 use hypervisor::MemCacheType;
 use hypervisor::VmAccept;
@@ -101,6 +101,20 @@ const DRM_FORMAT_XRGB8888: u32 = drm_fourcc(b'X', b'R', b'2', b'4');
 const DRM_FORMAT_ARGB8888: u32 = drm_fourcc(b'A', b'R', b'2', b'4');
 const DRM_FORMAT_XBGR8888: u32 = drm_fourcc(b'X', b'B', b'2', b'4');
 const DRM_FORMAT_ABGR8888: u32 = drm_fourcc(b'A', b'B', b'2', b'4');
+const DRM2KGSL_BAR_BASE_GUARD: u64 = 2 << 20;
+
+fn drm2kgsl_bar_range_is_valid(
+    requested_offset: u64,
+    pool_offset: u64,
+    resource_size: u64,
+    arena_size: u64,
+) -> bool {
+    arena_size > DRM2KGSL_BAR_BASE_GUARD
+        && pool_offset >= DRM2KGSL_BAR_BASE_GUARD
+        && pool_offset <= arena_size
+        && resource_size <= arena_size - pool_offset
+        && requested_offset == pool_offset
+}
 
 // A guest-pool blob must be at least this large to be retained as a possible scanout source (its
 // udmabuf duped for direct display import in `try_import_resource_to_display`). Real scanouts are
@@ -216,6 +230,10 @@ struct VirtioGpuResource {
     // the host arena, but Windows consumes it through the ordinary VirtIO PCI BAR mapping rather
     // than the pool-relative MAP_INFO_POOL contract used by guest-visible pool BOs.
     native_control_blob: bool,
+    // The resource lives in the immutable drm2kgsl file that already backs the ordinary
+    // host-visible PCI BAR. MAP_BLOB validates the requested offset but installs no runtime
+    // mapping, because replacing pages after Gunyah starts would leave stale stage-2 PFNs.
+    prebacked_bar: bool,
 
     // Only saved for snapshotting, so that we can re-attach backing iovecs with the correct new
     // host addresses.
@@ -271,6 +289,7 @@ impl VirtioGpuResource {
             rutabaga_external_mapping: false,
             pool_offset: None,
             native_control_blob: false,
+            prebacked_bar: false,
             backing_iovecs: None,
             pool_refs: None,
             pool_scanout_iovecs: None,
@@ -545,7 +564,9 @@ impl VirtioGpuScanout {
         visible: bool,
     ) -> VirtioGpuResult {
         if let Some(surface_id) = self.surface_id {
-            display.borrow_mut().set_cursor_visible(surface_id, visible)?;
+            display
+                .borrow_mut()
+                .set_cursor_visible(surface_id, visible)?;
         }
         Ok(OkNoData)
     }
@@ -587,7 +608,9 @@ impl VirtioGpuScanout {
             surface_id,
             self.width,
             self.height,
-            resource.scanout_data.map(|d| (d.width, d.height, d.strides[0], d.offsets[0])),
+            resource
+                .scanout_data
+                .map(|d| (d.width, d.height, d.strides[0], d.offsets[0])),
             resource.pool_scanout_iovecs.is_some(),
         );
 
@@ -634,7 +657,10 @@ impl VirtioGpuScanout {
                     // doing anyway. Pin the resource to the CPU path instead of erroring out: a
                     // slow desktop beats a dead one.
                     Err(e) => {
-                        error!("flip_to failed; switching resource to CPU fallback: {:#}", e);
+                        error!(
+                            "flip_to failed; switching resource to CPU fallback: {:#}",
+                            e
+                        );
                         strace!("flush.flip_to.fail");
                         resource.transition_display_import(
                             &mut display.borrow_mut(),
@@ -859,9 +885,7 @@ impl VirtioGpuScanout {
                 let fb_stride = fb.stride() as usize;
                 let fb_slice = fb.as_volatile_slice();
                 // SAFETY: `m` maps at least `map_size` bytes of the exported dmabuf; we read within.
-                let src = unsafe {
-                    std::slice::from_raw_parts(m.as_ptr() as *const u8, m.size())
-                };
+                let src = unsafe { std::slice::from_raw_parts(m.as_ptr() as *const u8, m.size()) };
                 strace!(
                     "flush.blob.copy.begin src_len={} src_stride={} src_off={} fb_stride={} rows={}",
                     src.len(),
@@ -921,7 +945,9 @@ impl VirtioGpuScanout {
                 let fb_slice = fb.as_volatile_slice();
                 let buf = IoSliceMut::new(
                     // SAFETY: trivially safe
-                    unsafe { std::slice::from_raw_parts_mut(fb_slice.as_mut_ptr(), fb_slice.size()) },
+                    unsafe {
+                        std::slice::from_raw_parts_mut(fb_slice.as_mut_ptr(), fb_slice.size())
+                    },
                 );
                 rutabaga.transfer_read(0, resource.resource_id, transfer, Some(buf))?;
                 // Whether the readback produced anything, every 64th frame: a black display can mean
@@ -930,7 +956,10 @@ impl VirtioGpuScanout {
                 self.flush_probe_counter = self.flush_probe_counter.wrapping_add(1);
                 if self.flush_probe_counter % 64 == 1 {
                     let probe = unsafe {
-                        std::slice::from_raw_parts(fb_slice.as_mut_ptr() as *const u8, 4096.min(fb_slice.size()))
+                        std::slice::from_raw_parts(
+                            fb_slice.as_mut_ptr() as *const u8,
+                            4096.min(fb_slice.size()),
+                        )
                     };
                     // Count only the color channels: XRGB frames carry 0xff in every fourth byte,
                     // which made an all-black frame read as "25% nonzero" and pass for content.
@@ -1022,7 +1051,8 @@ impl VirtioGpuScanout {
 
         // A resource that failed once will fail the same way every present. Cache the verdict
         // instead of paying an export + query + refused import per frame on top of the copy.
-        let imported = Self::try_import_resource_to_display(display, surface_id, resource, rutabaga);
+        let imported =
+            Self::try_import_resource_to_display(display, surface_id, resource, rutabaga);
         if imported.is_none() {
             resource.display_import_state = DisplayImportState::CpuFallback;
         }
@@ -1083,7 +1113,11 @@ impl VirtioGpuScanout {
                             base::warn!(
                                 "pool-scanout udmabuf import engaged (drm2kgsl 1-gpu-copy): \
                                  res={} {}x{} fourcc={:#x} stride={}",
-                                resource.resource_id, width, height, format, stride,
+                                resource.resource_id,
+                                width,
+                                height,
+                                format,
+                                stride,
                             );
                         } else {
                             base::debug!(
@@ -1126,7 +1160,9 @@ impl VirtioGpuScanout {
         // dmabuf. The display backend cannot import one, and those resources reach the screen
         // through pool_scanout_iovecs instead.
         if handle_type != RUTABAGA_HANDLE_TYPE_MEM_DMABUF {
-            note_no_import(&format!("exported handle type {handle_type:#x} is not a dmabuf"));
+            note_no_import(&format!(
+                "exported handle type {handle_type:#x} is not a dmabuf"
+            ));
             return None;
         }
         let dmabuf = to_safe_descriptor(exported.os_handle);
@@ -1800,12 +1836,19 @@ impl VirtioGpu {
         // this). Tell the backend BEFORE update_scanout_resource releases the surface, or the last
         // cursor image simply stays on screen with nothing left to take it down.
         if resource_id == 0 {
-            self.cursor_scanout.set_cursor_visible(&self.display, false)?;
+            self.cursor_scanout
+                .set_cursor_visible(&self.display, false)?;
             return self.update_scanout_resource(
-                SurfaceType::Cursor, None, scanout_id, None, resource_id);
+                SurfaceType::Cursor,
+                None,
+                scanout_id,
+                None,
+                resource_id,
+            );
         }
         self.update_scanout_resource(SurfaceType::Cursor, None, scanout_id, None, resource_id)?;
-        self.cursor_scanout.set_cursor_visible(&self.display, true)?;
+        self.cursor_scanout
+            .set_cursor_visible(&self.display, true)?;
 
         // What the guest actually asked for. Two cursor complaints need this and neither can be
         // settled by reading the code: a VNC client's own pointer drifting up-left from the one
@@ -1816,7 +1859,11 @@ impl VirtioGpu {
         if gpu_diag_enabled() {
             base::warn!(
                 "CURSOR: res={} pos=({},{}) hot=({},{})",
-                resource_id, x, y, hot_x, hot_y
+                resource_id,
+                x,
+                y,
+                hot_x,
+                hot_y
             );
         }
         // Before flush_resource, which is what hands the pixels to the backend: a backend that
@@ -2132,7 +2179,11 @@ impl VirtioGpu {
             descriptor = match self.udmabuf_driver {
                 Some(ref driver) => Some(driver.create_udmabuf(mem, &vecs[..]).map_err(|e| {
                     mem.pool_unref_iovecs(&vecs[..]);
-                    base::error!("GUEST-ALLOC: create_udmabuf failed res={}: {:?}", resource_id, e);
+                    base::error!(
+                        "GUEST-ALLOC: create_udmabuf failed res={}: {:?}",
+                        resource_id,
+                        e
+                    );
                     ErrUnspec
                 })?),
                 None => {
@@ -2211,6 +2262,15 @@ impl VirtioGpu {
         }
         create_result?;
 
+        if native_control_blob && std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some() {
+            base::info!(
+                "GPU-CREATE-BLOB: res={} native control size={:#x} prebacked BAR offset={:?}",
+                resource_id,
+                resource_create_blob.size,
+                self.rutabaga.resource_pool_offset(resource_id),
+            );
+        }
+
         let mut resource = VirtioGpuResource::new(resource_id, 0, 0, resource_create_blob.size);
         resource.pool_scanout_iovecs = pool_iovecs;
         resource.pool_refs = pool_refs;
@@ -2242,6 +2302,45 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?
             .native_control_blob;
         let pool_offset = self.rutabaga.resource_pool_offset(resource_id);
+        if native_control_blob && std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some() {
+            let pool_offset = pool_offset.ok_or_else(|| {
+                base::error!(
+                    "GPU-MAPBLOB: native control blob {} has no prebacked BAR offset",
+                    resource_id
+                );
+                ErrUnspec
+            })?;
+            let resource = self
+                .resources
+                .get_mut(&resource_id)
+                .ok_or(ErrInvalidResourceId)?;
+            let bar_size = std::env::var("CROSVM_DRM2KGSL_ARENA_SIZE")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or(ErrUnspec)?;
+            if !drm2kgsl_bar_range_is_valid(offset, pool_offset, resource.size, bar_size) {
+                base::error!(
+                    "GPU-MAPBLOB: native control blob {} requested BAR offset={:#x}, backing offset={:#x}, size={:#x} (guard={:#x})",
+                    resource_id,
+                    offset,
+                    pool_offset,
+                    resource.size,
+                    DRM2KGSL_BAR_BASE_GUARD,
+                );
+                return Err(ErrUnspec);
+            }
+            let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+            resource.prebacked_bar = true;
+            base::info!(
+                "GPU-MAPBLOB: res={} native control BAR offset={:#x} prebacked before VM start",
+                resource_id,
+                offset,
+            );
+            return Ok(OkMapInfo {
+                map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
+                pool_offset: None,
+            });
+        }
         if !native_control_blob {
             if let Some(pool_offset) = pool_offset {
                 let resource = self
@@ -2272,10 +2371,8 @@ impl VirtioGpu {
 
         // A remap re-backs the resource, so any display import cached against the old backing is
         // stale. Drop it here rather than letting the next flush post the previous frame's pages.
-        resource.transition_display_import(
-            &mut self.display.borrow_mut(),
-            DisplayImportState::Unknown,
-        );
+        resource
+            .transition_display_import(&mut self.display.borrow_mut(), DisplayImportState::Unknown);
 
         let mut source: Option<VmMemorySource> = None;
         match self.rutabaga.export_blob(resource_id) {
@@ -2472,15 +2569,17 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         // The backing is going away, so a cached display import of it must go first.
-        resource.transition_display_import(
-            &mut self.display.borrow_mut(),
-            DisplayImportState::Unknown,
-        );
+        resource
+            .transition_display_import(&mut self.display.borrow_mut(), DisplayImportState::Unknown);
 
         // PRE-ALLOC: pool-resident blobs were never runtime-SHARE'd (the guest maps the pool GPA
         // out of its own blessed RAM), so there is no host mapping to remove. The pool
         // sub-allocation is returned to the pool on the host side by gfxstream at vkFreeMemory.
         if resource.pool_offset.take().is_some() {
+            return Ok(OkNoData);
+        }
+        if resource.prebacked_bar {
+            resource.prebacked_bar = false;
             return Ok(OkNoData);
         }
 
@@ -2649,14 +2748,12 @@ impl VirtioGpu {
         }
         resource.scanout_data = scanout_data;
 
-        let buffer_fourcc = scanout_data
-            .map(|data| data.drm_format.into())
-            .or_else(|| {
-                self.rutabaga
-                    .query(resource_id)
-                    .ok()
-                    .map(|query| query.drm_fourcc)
-            });
+        let buffer_fourcc = scanout_data.map(|data| data.drm_format.into()).or_else(|| {
+            self.rutabaga
+                .query(resource_id)
+                .ok()
+                .map(|query| query.drm_fourcc)
+        });
         if let (Some(surface_id), Some(fourcc)) = (scanout.surface_id, buffer_fourcc) {
             self.display
                 .borrow_mut()
@@ -2846,5 +2943,55 @@ impl VirtioGpu {
         }
 
         self.rutabaga.resume().context("failed to resume rutabaga")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ARENA_SIZE: u64 = 8 << 20;
+
+    #[test]
+    fn drm2kgsl_bar_range_requires_guarded_offset() {
+        assert!(!drm2kgsl_bar_range_is_valid(
+            DRM2KGSL_BAR_BASE_GUARD - 4096,
+            DRM2KGSL_BAR_BASE_GUARD - 4096,
+            4096,
+            ARENA_SIZE,
+        ));
+        assert!(drm2kgsl_bar_range_is_valid(
+            DRM2KGSL_BAR_BASE_GUARD,
+            DRM2KGSL_BAR_BASE_GUARD,
+            4096,
+            ARENA_SIZE,
+        ));
+    }
+
+    #[test]
+    fn drm2kgsl_bar_range_requires_guest_offset_match() {
+        assert!(!drm2kgsl_bar_range_is_valid(
+            DRM2KGSL_BAR_BASE_GUARD + 4096,
+            DRM2KGSL_BAR_BASE_GUARD,
+            4096,
+            ARENA_SIZE,
+        ));
+    }
+
+    #[test]
+    fn drm2kgsl_bar_range_rejects_extent_outside_arena() {
+        let offset = ARENA_SIZE - 4096;
+        assert!(drm2kgsl_bar_range_is_valid(
+            offset, offset, 4096, ARENA_SIZE
+        ));
+        assert!(!drm2kgsl_bar_range_is_valid(
+            offset, offset, 8192, ARENA_SIZE
+        ));
+        assert!(!drm2kgsl_bar_range_is_valid(
+            DRM2KGSL_BAR_BASE_GUARD,
+            DRM2KGSL_BAR_BASE_GUARD,
+            4096,
+            DRM2KGSL_BAR_BASE_GUARD,
+        ));
     }
 }

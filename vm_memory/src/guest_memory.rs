@@ -139,11 +139,10 @@ pub enum MemoryRegionPurpose {
     /// BIOS/firmware ROM
     Bios,
 
-    /// DroidVM: drm2kgsl native-context arena. A third SHARE-blessed pool, treated exactly like
-    /// GpuPool for access/bless/hugepage, that virglrenderer's drm2kgsl backend sub-allocates every
-    /// GPU BO from. Distinct from GpuPool so a build carrying both renderers cannot hand the
-    /// drm2kgsl arena to gfxstream's HostVisiblePool (which is handed any GpuPool region), so the
-    /// two can be sized independently, and so it gets its own `drm2kgsl_host` DT node.
+    /// DroidVM: drm2kgsl native-context host arena. The renderer sub-allocates control/response
+    /// shmem from it. Legacy guests see a SHARE-blessed `drm2kgsl_host` pool; the Gunyah
+    /// prebacked-BAR path keeps its original GPA hidden and maps these pages only through the
+    /// VirtIO-GPU PCI BAR. It remains distinct from GpuPool so gfxstream cannot consume it.
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     Drm2KgslPool,
 

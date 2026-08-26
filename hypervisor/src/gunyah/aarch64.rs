@@ -200,8 +200,11 @@ impl VmAArch64 for GunyahVm {
                 // Guest-alloc pool: same — needs the shm vdevice + stage-2 mapping so the
                 // guest driver can allocate from it and the host resolves its mem-entries.
                 MemoryRegionPurpose::GpuPoolGuest => true,
-                // drm2kgsl arena: same -- shm vdevice + stage-2 mapping, no runtime accept.
-                MemoryRegionPurpose::Drm2KgslPool => true,
+                // With the prebacked BAR contract this is only a host mapping; the BAR memslot
+                // below gets the one shm vdevice and stage-2 mapping for these pages.
+                MemoryRegionPurpose::Drm2KgslPool => {
+                    std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_none()
+                }
                 // EDK2 preload pool: its zero-length boot floor creates no fixed mapping; the
                 // complete range is installed later by runtime SHARE plus guest MEM_ACCEPT.
                 MemoryRegionPurpose::Edk2PreloadPool => true,
@@ -250,6 +253,41 @@ impl VmAArch64 for GunyahVm {
                     region.index.try_into().unwrap(),
                     region.guest_addr,
                 )?;
+            }
+        }
+
+        // `Vm::add_memory_region` installs the drm2kgsl BAR suffix before VM start, but the RM
+        // also needs one matching shm vdevice to place that parcel in the guest stage-2. Filter
+        // the generic memslot table by the BAR GPA so unrelated pre-start regions (for example
+        // PV-time) are not accidentally advertised as shared-memory devices.
+        if let Some(bar_gpa) = std::env::var("CROSVM_DRM2KGSL_BAR_GPA")
+            .ok()
+            .and_then(|value| {
+                value
+                    .strip_prefix("0x")
+                    .map_or_else(|| value.parse().ok(), |hex| u64::from_str_radix(hex, 16).ok())
+            })
+            .and_then(|gpa| gpa.checked_add(2 << 20))
+        {
+            let mut found = false;
+            for (slot, (_, guest_addr)) in self.mem_regions.lock().iter() {
+                if guest_addr.offset() != bar_gpa {
+                    continue;
+                }
+                base::info!(
+                    "GH: declaring drm2kgsl pre-start BAR suffix slot={} gpa={:#x}",
+                    slot,
+                    guest_addr.offset(),
+                );
+                fdt_create_shm_device(vdev_node, *slot, *guest_addr)?;
+                found = true;
+                break;
+            }
+            if !found {
+                base::error!(
+                    "GH: drm2kgsl pre-start BAR suffix gpa={:#x} has no mapped memslot",
+                    bar_gpa,
+                );
             }
         }
 

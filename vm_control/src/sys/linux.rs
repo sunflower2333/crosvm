@@ -5,6 +5,7 @@
 #[cfg(feature = "gpu")]
 pub(crate) mod gpu;
 
+use std::env;
 use std::path::Path;
 use std::time::Duration;
 
@@ -12,6 +13,7 @@ use base::error;
 use base::AsRawDescriptor;
 use base::Descriptor;
 use base::Error as SysError;
+use base::MappedRegion;
 use base::MemoryMappingArena;
 use base::MmapError;
 use base::Protection;
@@ -188,32 +190,75 @@ pub fn prepare_shared_memory_region(
     allocator: &mut SystemAllocator,
     alloc: Alloc,
     cache: MemCacheType,
+    source: Option<Box<dyn MappedRegion>>,
+) -> Result<VmMappedMemoryRegion, SysError> {
+    prepare_shared_memory_region_at_offset(vm, allocator, alloc, cache, 0, source)
+}
+
+/// Prepare a fixed mapping for a subrange of an allocated PCI BAR. The allocation remains the
+/// BAR-sized address range, while only `[guest_offset, guest_offset + source.size())` is installed
+/// in the hypervisor. This is used for the drm2kgsl BAR guard, whose first 2 MiB are intentionally
+/// left unmapped.
+pub fn prepare_shared_memory_region_at_offset(
+    vm: &mut dyn Vm,
+    allocator: &mut SystemAllocator,
+    alloc: Alloc,
+    cache: MemCacheType,
+    guest_offset: u64,
+    source: Option<Box<dyn MappedRegion>>,
 ) -> Result<VmMappedMemoryRegion, SysError> {
     if !matches!(alloc, Alloc::PciBar { .. }) {
         return Err(SysError::new(EINVAL));
     }
     match allocator.mmio_allocator_any().get(&alloc) {
         Some((range, _)) => {
-            let size: usize = match range.len().and_then(|x| x.try_into().ok()) {
+            let allocation_size: u64 = match range.len() {
                 Some(v) => v,
                 None => return Err(SysError::new(ERANGE)),
             };
-            let arena = match MemoryMappingArena::new(size) {
-                Ok(a) => a,
-                Err(MmapError::SystemCallFailed(e)) => return Err(e),
-                _ => return Err(SysError::new(EINVAL)),
+            // The drm2kgsl pre-backed path needs the BAR GPA in the guest DT so its
+            // virtio-gpu driver can resolve the ordinary guarded MAP_BLOB offset. This
+            // helper is reached before FDT generation, while the allocator still knows the
+            // complete BAR range. Keep the metadata opt-in to that path only.
+            if env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some() {
+                env::set_var("CROSVM_DRM2KGSL_BAR_GPA", format!("{:#x}", range.start));
+                env::set_var("CROSVM_DRM2KGSL_BAR_SIZE", allocation_size.to_string());
+            }
+            if guest_offset > allocation_size {
+                return Err(SysError::new(EINVAL));
+            }
+            let size: usize = match source
+                .as_ref()
+                .map(|region| region.size() as u64)
+                .or_else(|| allocation_size.checked_sub(guest_offset))
+                .filter(|size| *size <= allocation_size - guest_offset)
+                .and_then(|size| size.try_into().ok())
+            {
+                Some(v) => v,
+                None => return Err(SysError::new(ERANGE)),
+            };
+            let region: Box<dyn MappedRegion> = match source {
+                Some(region) if region.size() == size => region,
+                Some(_) => return Err(SysError::new(EINVAL)),
+                None if guest_offset == 0 => match MemoryMappingArena::new(size) {
+                    Ok(arena) => Box::new(arena),
+                    Err(MmapError::SystemCallFailed(e)) => return Err(e),
+                    _ => return Err(SysError::new(EINVAL)),
+                },
+                None => return Err(SysError::new(EINVAL)),
             };
 
-            match vm.add_memory_region(
-                GuestAddress(range.start),
-                Box::new(arena),
-                false,
-                false,
-                cache,
-            ) {
+            let guest_address = range
+                .start
+                .checked_add(guest_offset)
+                .ok_or_else(|| SysError::new(ERANGE))?;
+            match vm.add_memory_region(GuestAddress(guest_address), region, false, false, cache) {
                 Ok(slot) => Ok(VmMappedMemoryRegion {
-                    guest_address: GuestAddress(range.start),
+                    allocation: alloc,
+                    guest_address: GuestAddress(guest_address),
                     slot,
+                    allocation_offset: guest_offset,
+                    size,
                 }),
                 Err(e) => Err(e),
             }
@@ -254,6 +299,7 @@ impl FsMappingRequest {
                     allocator,
                     alloc,
                     MemCacheType::CacheCoherent,
+                    None,
                 ) {
                     Ok(VmMappedMemoryRegion { slot, .. }) => VmResponse::RegisterMemory { slot },
                     Err(e) => VmResponse::Err(e),

@@ -25,6 +25,45 @@ pub struct GpuCacheInfo<'a> {
     environment: Vec<(&'a str, &'a str)>,
 }
 
+pub(crate) fn uses_drm2kgsl_prebacked_bar(cfg: &Config) -> bool {
+    #[cfg(all(
+        feature = "virgl_renderer",
+        feature = "gunyah",
+        any(target_arch = "arm", target_arch = "aarch64")
+    ))]
+    {
+        let Some(gpu_params) = cfg.gpu_parameters.as_ref() else {
+            return false;
+        };
+        let drm_capset = 1u64 << rutabaga_gfx::RUTABAGA_CAPSET_DRM;
+        const BAR_BASE_GUARD: u64 = 2 << 20;
+        let arena_size = cfg
+            .pre_alloc
+            .as_ref()
+            .and_then(|pre_alloc| pre_alloc.drm_host_mb)
+            .and_then(|mb| mb.checked_shl(20));
+
+        return gpu_params.mode == devices::virtio::GpuMode::ModeVirglRenderer
+            && gpu_params.udmabuf
+            && gpu_params.capset_mask & drm_capset != 0
+            // The BAR is an address window. Only the arena suffix is installed in it; requiring
+            // equality here would silently disable the intended 8 MiB arena + larger BAR setup.
+            && arena_size.is_some_and(|size| {
+                size > BAR_BASE_GUARD && size <= gpu_params.pci_bar_size
+            });
+    }
+
+    #[cfg(not(all(
+        feature = "virgl_renderer",
+        feature = "gunyah",
+        any(target_arch = "arm", target_arch = "aarch64")
+    )))]
+    {
+        let _ = cfg;
+        false
+    }
+}
+
 pub fn get_gpu_cache_info<'a>(
     cache_dir: Option<&'a String>,
     cache_size: Option<&'a String>,
@@ -98,14 +137,17 @@ pub fn create_gpu_device(
     let is_sandboxed = cfg.jail_config.is_some();
     let mut gpu_params = cfg.gpu_parameters.clone().unwrap();
 
-    // Gunyah cannot safely replace the host-visible BAR's prepared PROT_NONE arena after
-    // GH_VM_START: stage-2 keeps the original user-memory-region PFNs. Use one dynamic mapping
-    // per blob so the fd-backed pages are what the guest actually sees. This is especially
-    // important for the drm2kgsl blob-0 control ring, which is allocated from its boot-blessed
-    // host arena but consumed through the standard VirtIO PCI BAR by the Windows KMD.
-    #[cfg(all(any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah"))]
-    if matches!(cfg.hypervisor.as_ref(), Some(HypervisorKind::Gunyah { .. })) {
-        gpu_params.fixed_blob_mapping = false;
+    let drm2kgsl_prebacked_bar = uses_drm2kgsl_prebacked_bar(cfg)
+        && env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some();
+
+    if drm2kgsl_prebacked_bar {
+        // The drm2kgsl control arena is host-only backing. Install it exactly once through the
+        // host-visible BAR before GH_VM_START; the unused pool GPA is deliberately not SHARE'd.
+        gpu_params.fixed_blob_mapping = true;
+        info!(
+            "drm2kgsl: enabling fixed blob mapping for prebacked BAR size={:#x}",
+            gpu_params.pci_bar_size
+        );
     }
 
     if is_sandboxed {
@@ -166,7 +208,7 @@ pub fn create_gpu_device(
             // GPU pci passthrough.
             debug!("gpu fixed blob mapping disabled: not compatible with passthrough GPU.");
             gpu_params.fixed_blob_mapping = false;
-        } else if cfg!(feature = "vulkano") {
+        } else if cfg!(feature = "vulkano") && !drm2kgsl_prebacked_bar {
             // TODO(b/244591751): make fixed_blob_mapping compatible with vulkano for opaque_fd blob
             // mapping.
             debug!("gpu fixed blob mapping disabled: not compatible with vulkano");

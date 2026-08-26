@@ -908,10 +908,10 @@ impl arch::LinuxArch for AArch64 {
             ));
             pool_top = base + size;
         }
-        // DRM native context HOST-alloc pool (--pre-alloc drm-host-mb): what virglrenderer's DRM
-        // backend sub-allocates from. Since BO backing moved to the guest pool above, this holds
-        // only the per-context msm shmem rings. Separate from GpuPool so a binary carrying both
-        // renderers cannot hand this one to gfxstream's HostVisiblePool.
+        // DRM native context host arena (--pre-alloc drm-host-mb): what virglrenderer's DRM
+        // backend sub-allocates control/response shmem from. In the Gunyah prebacked-BAR route
+        // this region supplies host pages only; its original GPA is hidden and the same file is
+        // mapped once at the VirtIO-GPU BAR GPA. Other routes retain the legacy shared-pool view.
         let drm2kgsl_pool_mb: u64 = std::env::var("NCTX_DRM2KGSL_POOL_MB")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -926,10 +926,8 @@ impl arch::LinuxArch for AArch64 {
                     .purpose(MemoryRegionPurpose::Drm2KgslPool)
                     .align(2 << 20)
                     .alloc_from_vm_sys_ram(from_sys_ram)
-                    // Fully pre-shared: this pool does not grow. `growable_pool(size, 0)` is
-                    // the same thing the defaults already produce -- it is written out so the
-                    // intent is in the code rather than in an absent field, and so that turning
-                    // one of these into a growable pool is a visible edit here.
+                    // This arena never grows. Gunyah may override its boot SHARE length to zero
+                    // when it is used as exclusive prebacked BAR storage.
                     .growable_pool(size, 0),
             ));
             pool_top = base + size;
@@ -1409,7 +1407,14 @@ impl arch::LinuxArch for AArch64 {
             .into_iter()
             .map(|(dev, jail_orig)| (dev.into_pci_device().unwrap(), jail_orig))
             .collect();
-        let (pci, pci_irqs, mut pid_debug_label_map, _amls, _gpe_scope_amls) =
+        let (
+            pci,
+            pci_irqs,
+            mut pid_debug_label_map,
+            _amls,
+            _gpe_scope_amls,
+            pre_mapped_memory_regions,
+        ) =
             arch::generate_pci_root(
                 pci_devices,
                 irq_chip.as_irq_chip_mut(),
@@ -1796,6 +1801,8 @@ impl arch::LinuxArch for AArch64 {
                 if region.options.purpose == vm_memory::MemoryRegionPurpose::Drm2KgslPool {
                     let fd = region.shm.as_raw_descriptor();
                     let gpa = region.guest_addr.offset();
+                    let bar_prebacked =
+                        std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some();
                     std::env::set_var("CROSVM_DRM2KGSL_ARENA_FD", fd.to_string());
                     std::env::set_var(
                         "CROSVM_DRM2KGSL_ARENA_FD_OFFSET",
@@ -1805,18 +1812,51 @@ impl arch::LinuxArch for AArch64 {
                         "CROSVM_DRM2KGSL_ARENA_HOST_VA",
                         (region.host_addr as u64).to_string(),
                     );
-                    std::env::set_var("CROSVM_DRM2KGSL_ARENA_GPA", format!("{:#x}", gpa));
+                    if !bar_prebacked {
+                        std::env::set_var("CROSVM_DRM2KGSL_ARENA_GPA", format!("{:#x}", gpa));
+                    }
                     std::env::set_var("CROSVM_DRM2KGSL_ARENA_SIZE", (region.size as u64).to_string());
-                    base::warn!(
-                        "GPU-POOL: Drm2KgslPool region gpa={:#x} size={:#x} fd={} off={:#x} \
-                         hva={:#x} (blessed by GunyahVm::new)",
-                        gpa,
-                        region.size,
-                        fd,
-                        region.shm_offset,
-                        region.host_addr,
-                    );
-                    drm2kgsl_resv = Some((gpa, region.size as u64));
+                    if bar_prebacked {
+                        base::warn!(
+                            "GPU-POOL: Drm2KgslPool host-only backing size={:#x} fd={} off={:#x} \
+                             hva={:#x}; guest access is exclusively through the VirtIO PCI BAR",
+                            region.size,
+                            fd,
+                            region.shm_offset,
+                            region.host_addr,
+                        );
+                        // Keep the host-only arena out of guest RAM and reserve the complete BAR
+                        // range in the DT. vm_control records that range while installing the
+                        // eager suffix mapping, before this FDT pass runs.
+                        let bar_gpa = std::env::var("CROSVM_DRM2KGSL_BAR_GPA")
+                            .ok()
+                            .and_then(|value| {
+                                value
+                                    .strip_prefix("0x")
+                                    .map_or_else(|| value.parse().ok(), |hex| u64::from_str_radix(hex, 16).ok())
+                            });
+                        let bar_size = std::env::var("CROSVM_DRM2KGSL_BAR_SIZE")
+                            .ok()
+                            .and_then(|value| value.parse::<u64>().ok());
+                        match (bar_gpa, bar_size) {
+                            (Some(gpa), Some(size)) => drm2kgsl_resv = Some((gpa, size)),
+                            _ => base::error!(
+                                 "GPU-POOL: prebacked drm2kgsl BAR metadata is missing; \
+                                 guarded guest BAR mapping will be unavailable"
+                            ),
+                        }
+                    } else {
+                        base::warn!(
+                            "GPU-POOL: Drm2KgslPool region gpa={:#x} size={:#x} fd={} off={:#x} \
+                             hva={:#x} (blessed by GunyahVm::new)",
+                            gpa,
+                            region.size,
+                            fd,
+                            region.shm_offset,
+                            region.host_addr,
+                        );
+                        drm2kgsl_resv = Some((gpa, region.size as u64));
+                    }
                 }
                 // venus transport pool (pool merge, landed): hand vkr the memfd view it
                 // sub-allocates blob_id==0 shmems from, and announce `venus_host` so the guest
@@ -1965,6 +2005,7 @@ impl arch::LinuxArch for AArch64 {
             irq_chip: irq_chip.try_box_clone().map_err(Error::CloneIrqChip)?,
             io_bus,
             mmio_bus,
+            pre_mapped_memory_regions,
             pid_debug_label_map,
             suspend_tube: (suspend_tube_send, suspend_tube_recv),
             rt_cpus: components.rt_cpus,

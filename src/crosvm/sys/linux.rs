@@ -2294,13 +2294,33 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         cfg.edk2_preload_mb.unwrap_or(0).to_string(),
     );
 
-    let components = setup_vm_components(&cfg)?;
-
     let hypervisor = cfg
         .hypervisor
         .clone()
         .or_else(get_default_hypervisor)
         .context("no enabled hypervisor")?;
+
+    #[cfg(all(
+        feature = "gpu",
+        feature = "gunyah",
+        any(target_arch = "arm", target_arch = "aarch64")
+    ))]
+    if matches!(&hypervisor, HypervisorKind::Gunyah { .. })
+        && gpu::uses_drm2kgsl_prebacked_bar(&cfg)
+    {
+        // Gunyah cannot expose the same physical pages at both the historical pool GPA and the
+        // VirtIO PCI BAR GPA. Mark the arena host-only before GuestMemory is handed to Gunyah;
+        // the BAR preparation later installs the sole guest-visible stage-2 mapping.
+        std::env::set_var("CROSVM_DRM2KGSL_BAR_PREBACKED", "1");
+    } else {
+        std::env::remove_var("CROSVM_DRM2KGSL_BAR_PREBACKED");
+        std::env::remove_var("CROSVM_DRM2KGSL_BAR_GPA");
+        std::env::remove_var("CROSVM_DRM2KGSL_BAR_SIZE");
+    }
+
+    // GPU construction happens inside setup_vm_components and reads the pre-backed flag when it
+    // chooses the fixed BAR mapper. Publish it before constructing any devices.
+    let components = setup_vm_components(&cfg)?;
 
     debug!("creating hypervisor: {:?}", hypervisor);
 
@@ -2477,6 +2497,39 @@ where
     let mut simplefb_event_devices: Vec<EventDevice> = Vec::new();
     #[cfg(feature = "gpu")]
     let mut external_scanout: Option<Arc<virtio::ExternalScanout>> = None;
+
+    // PCI BARs are allocated while Arch::build_vm generates the PCI root, before aarch64's FDT
+    // pass exports pool metadata. Publish the drm2kgsl arena now so virtio-gpu can use its exact
+    // fd-backed pages for the host-visible BAR instead of preparing an anonymous arena first.
+    #[cfg(all(feature = "gpu", any(target_arch = "arm", target_arch = "aarch64")))]
+    for region in vm.get_memory().regions() {
+        if region.options.purpose == vm_memory::MemoryRegionPurpose::Drm2KgslPool {
+            let fd = region.shm.as_raw_descriptor();
+            std::env::set_var("CROSVM_DRM2KGSL_ARENA_FD", fd.to_string());
+            std::env::set_var(
+                "CROSVM_DRM2KGSL_ARENA_FD_OFFSET",
+                region.shm_offset.to_string(),
+            );
+            std::env::set_var(
+                "CROSVM_DRM2KGSL_ARENA_HOST_VA",
+                (region.host_addr as u64).to_string(),
+            );
+            if std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_none() {
+                std::env::set_var(
+                    "CROSVM_DRM2KGSL_ARENA_GPA",
+                    format!("{:#x}", region.guest_addr.offset()),
+                );
+            }
+            std::env::set_var(
+                "CROSVM_DRM2KGSL_ARENA_SIZE",
+                (region.size as u64).to_string(),
+            );
+            info!(
+                "GPU-POOL-EARLY: published Drm2KgslPool fd={} off={:#x} size={:#x} before PCI BAR allocation",
+                fd, region.shm_offset, region.size
+            );
+        }
+    }
 
     let mut devices = create_devices(
         &cfg,
@@ -4398,6 +4451,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         .unwrap();
 
     let (vm_memory_handler_control, vm_memory_handler_control_for_thread) = Tube::pair()?;
+    let pre_mapped_memory_regions = std::mem::take(&mut linux.pre_mapped_memory_regions);
     let vm_memory_handler_thread = std::thread::Builder::new()
         .name("vm_memory_handler_thread".into())
         .spawn({
@@ -4415,6 +4469,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                     iommu_client,
                     vm_memory_handler_control_for_thread,
                     gunyah_accept_host_tube,
+                    pre_mapped_memory_regions,
                 )
             }
         })
@@ -5111,6 +5166,7 @@ fn vm_memory_handler_thread(
     mut iommu_client: Option<VmMemoryRequestIommuClient>,
     handler_control: Tube,
     gunyah_accept_tube: Option<Tube>,
+    pre_mapped_memory_regions: Vec<vm_control::VmMappedMemoryRegion>,
 ) -> anyhow::Result<()> {
     #[derive(EventToken)]
     enum Token {
@@ -5129,7 +5185,7 @@ fn vm_memory_handler_thread(
             .context("failed to add descriptor to wait context")?;
     }
 
-    let mut region_state: VmMemoryRegionState = Default::default();
+    let mut region_state = VmMemoryRegionState::with_mapped_regions(pre_mapped_memory_regions);
 
     'wait: loop {
         let events = {

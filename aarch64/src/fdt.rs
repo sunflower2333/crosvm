@@ -108,6 +108,7 @@ fn create_memory_node(fdt: &mut Fdt, guest_mem: &GuestMemory) -> Result<()> {
     // been handed to the hypervisor for it yet, and the guest is not told it exists until the
     // shim has accepted it and pointed `/memory` here itself. The handoff page is not the guest's
     // RAM either -- it is the one place the host can still write once the boot region is lent.
+    let drm2kgsl_bar_backing = std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some();
     let hidden: HashSet<u64> = guest_mem
         .regions()
         .filter(|r| {
@@ -116,6 +117,7 @@ fn create_memory_node(fdt: &mut Fdt, guest_mem: &GuestMemory) -> Result<()> {
                     r.options.purpose,
                     MemoryRegionPurpose::SharedGuestRam | MemoryRegionPurpose::ShimHandoff
                 )
+                || (drm2kgsl_bar_backing && r.options.purpose == MemoryRegionPurpose::Drm2KgslPool)
         })
         .map(|r| r.guest_addr.offset())
         .collect();
@@ -1129,10 +1131,15 @@ pub fn create_fdt(
     }
 
     // drm2kgsl's native-context arena: the guest allocates nothing from it -- it holds the host's
-    // own msm shmem rings -- so nothing in the guest matches this name. It is announced anyway so
-    // the RM blesses the range.
+    // own msm shmem rings. In the pre-backed BAR path this reserved node hides the host-only arena
+    // from guest RAM while its `reg` describes the actual VirtIO PCI BAR range.
     if let Some((gpa, size)) = drm2kgsl_resv {
-        create_pool_node(&mut fdt, "drm2kgsl_host", gpa, size, None, None)?;
+        let name = if std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some() {
+            "gpu_blob_reserved"
+        } else {
+            "drm2kgsl_host"
+        };
+        create_pool_node(&mut fdt, name, gpa, size, None, None)?;
     }
 
     // venus's host-alloc transport pool: the guest maps ring blobs by pool-relative offset
