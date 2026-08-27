@@ -116,6 +116,10 @@ fn drm2kgsl_bar_range_is_valid(
         && requested_offset == pool_offset
 }
 
+fn pool_offset_to_wire(pool_offset: u64) -> Option<u32> {
+    u32::try_from(pool_offset).ok()
+}
+
 // A guest-pool blob must be at least this large to be retained as a possible scanout source (its
 // udmabuf duped for direct display import in `try_import_resource_to_display`). Real scanouts are
 // multi-MiB; gating on size keeps us from holding an extra fd for every small guest BO (which can
@@ -2343,6 +2347,14 @@ impl VirtioGpu {
         }
         if !native_control_blob {
             if let Some(pool_offset) = pool_offset {
+                let wire_pool_offset = pool_offset_to_wire(pool_offset).ok_or_else(|| {
+                    base::error!(
+                        "GPU-MAPBLOB: res={} pool offset {:#x} exceeds the u32 wire field",
+                        resource_id,
+                        pool_offset,
+                    );
+                    ErrUnspec
+                })?;
                 let resource = self
                     .resources
                     .get_mut(&resource_id)
@@ -2356,8 +2368,7 @@ impl VirtioGpu {
                 );
                 return Ok(OkMapInfo {
                     map_info: (map_info & RUTABAGA_MAP_CACHE_MASK) | VIRTIO_GPU_MAP_INFO_POOL,
-                    // A 2 GiB pool keeps the offset within u32.
-                    pool_offset: Some(pool_offset as u32),
+                    pool_offset: Some(wire_pool_offset),
                 });
             }
         }
@@ -2993,5 +3004,11 @@ mod tests {
             4096,
             DRM2KGSL_BAR_BASE_GUARD,
         ));
+    }
+
+    #[test]
+    fn pool_offset_wire_conversion_rejects_truncation() {
+        assert_eq!(pool_offset_to_wire(u32::MAX as u64), Some(u32::MAX));
+        assert_eq!(pool_offset_to_wire(u32::MAX as u64 + 1), None);
     }
 }
