@@ -406,7 +406,11 @@ impl LongtermPin {
         // the first look turns that into "reboot kills the VM", so wait for the reserve before
         // giving up. Runtime blobs never wait: they are on the allocation hot path and a caller
         // that gets an error simply allocates elsewhere.
-        let attempts = if site == PinSite::PreBoot { PREBOOT_PROBE_ATTEMPTS } else { 1 };
+        let attempts = if site == PinSite::PreBoot {
+            PREBOOT_PROBE_ATTEMPTS
+        } else {
+            1
+        };
         for attempt in 1..attempts {
             match probe_range(host_addr, size) {
                 Some(v) if v.bad > 0 => {

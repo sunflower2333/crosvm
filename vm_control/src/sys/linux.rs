@@ -253,13 +253,28 @@ pub fn prepare_shared_memory_region_at_offset(
                 .checked_add(guest_offset)
                 .ok_or_else(|| SysError::new(ERANGE))?;
             match vm.add_memory_region(GuestAddress(guest_address), region, false, false, cache) {
-                Ok(slot) => Ok(VmMappedMemoryRegion {
-                    allocation: alloc,
-                    guest_address: GuestAddress(guest_address),
-                    slot,
-                    allocation_offset: guest_offset,
-                    size,
-                }),
+                Ok(slot) => {
+                    if env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some() {
+                        base::info!(
+                            "GPU-BAR-MAP: allocation={:?} bar_gpa={:#x} guest_offset={:#x} \
+                             guest_start={:#x} size={:#x} cache={:?} slot={}",
+                            alloc,
+                            range.start,
+                            guest_offset,
+                            guest_address,
+                            size,
+                            cache,
+                            slot,
+                        );
+                    }
+                    Ok(VmMappedMemoryRegion {
+                        allocation: alloc,
+                        guest_address: GuestAddress(guest_address),
+                        slot,
+                        allocation_offset: guest_offset,
+                        size,
+                    })
+                }
                 Err(e) => Err(e),
             }
         }

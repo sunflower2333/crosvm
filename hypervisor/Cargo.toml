@@ -24,6 +24,7 @@ enumn = "0.1.0"
 fnv = "1"
 libc = "0.2"
 once_cell = "1.7"
+resources = { path = "../resources" }
 serde = { version = "1", features = [ "derive" ] }
 serde_json = { version = "1" }
 snapshot = { workspace = true }

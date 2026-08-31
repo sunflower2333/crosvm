@@ -145,20 +145,28 @@ impl SystemAllocator {
                 if reserved_len > high_mmio_len {
                     return Err(Error::OutOfSpace);
                 }
-                let reserved_start = config.high_mmio.start;
-                let reserved_end = reserved_start + reserved_len - 1;
-                let high_mmio_start = reserved_end + 1;
-                let high_mmio_end = config.high_mmio.end;
-                (
-                    AddressRange {
-                        start: high_mmio_start,
-                        end: high_mmio_end,
-                    },
-                    Some(AddressRange {
-                        start: reserved_start,
-                        end: reserved_end,
-                    }),
-                )
+                // A zero-sized pstore reservation is a valid configuration and must not turn the
+                // inclusive end calculation below into `start - 1`.
+                if reserved_len == 0 {
+                    (config.high_mmio, None)
+                } else {
+                    let reserved_start = config.high_mmio.start;
+                    let reserved_end = reserved_start
+                        .checked_add(reserved_len - 1)
+                        .ok_or(Error::OutOfBounds)?;
+                    let high_mmio_start = reserved_end.checked_add(1).ok_or(Error::OutOfBounds)?;
+                    let high_mmio_end = config.high_mmio.end;
+                    (
+                        AddressRange {
+                            start: high_mmio_start,
+                            end: high_mmio_end,
+                        },
+                        Some(AddressRange {
+                            start: reserved_start,
+                            end: reserved_end,
+                        }),
+                    )
+                }
             }
             None => (config.high_mmio, None),
         };
@@ -558,5 +566,47 @@ mod tests {
                 .is_err(),
             true
         );
+    }
+
+    #[test]
+    fn zero_length_reserved_region_is_not_a_reservation() {
+        let mut allocator = SystemAllocator::new(
+            SystemAllocatorConfig {
+                io: None,
+                low_mmio: AddressRange::from_start_and_end(0x20_0000, 0x2f_ffff),
+                high_mmio: AddressRange::from_start_and_end(0x1_0000_0000, 0x1_0ff_fffff),
+                platform_mmio: None,
+                first_irq: 5,
+            },
+            Some(0),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(allocator.reserved_region(), None);
+        assert_eq!(
+            allocator.mmio_allocator(MmioType::High).pools(),
+            &[AddressRange::from_start_and_end(
+                0x1_0000_0000,
+                0x1_0ff_fffff
+            )]
+        );
+    }
+
+    #[test]
+    fn reserved_region_end_overflow_is_rejected() {
+        let result = SystemAllocator::new(
+            SystemAllocatorConfig {
+                io: None,
+                low_mmio: AddressRange::from_start_and_end(0x20_0000, 0x2f_ffff),
+                high_mmio: AddressRange::from_start_and_end(u64::MAX - 1, u64::MAX),
+                platform_mmio: None,
+                first_irq: 5,
+            },
+            Some(2),
+            &[],
+        );
+
+        assert!(matches!(result, Err(Error::OutOfBounds)));
     }
 }

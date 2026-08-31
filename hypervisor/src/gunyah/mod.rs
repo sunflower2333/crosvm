@@ -7,8 +7,8 @@ mod aarch64;
 
 mod gunyah_sys;
 mod mthp;
-pub mod shim_abi;
 mod pin;
+pub mod shim_abi;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BinaryHeap;
@@ -23,17 +23,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
+use base::debug;
 use base::errno_result;
 use base::error;
 use base::info;
-use base::AsRawDescriptor;
 use base::ioctl;
 use base::ioctl_with_mut_ref;
 use base::ioctl_with_ref;
-use base::debug;
 use base::ioctl_with_val;
 use base::pagesize;
 use base::warn;
+use base::AsRawDescriptor;
 use base::Error;
 use base::FromRawDescriptor;
 use base::IntoRawDescriptor;
@@ -41,13 +41,13 @@ use base::MemoryMapping;
 use base::MemoryMappingArena;
 use base::MemoryMappingBuilder;
 use base::MmapError;
-use base::RawDescriptor;
 use base::Protection;
+use base::RawDescriptor;
 use base::SharedMemory;
 use gunyah_sys::*;
 use libc::open;
-use libc::EFAULT;
 use libc::EEXIST;
+use libc::EFAULT;
 use libc::EINVAL;
 use libc::EIO;
 use libc::ENOENT;
@@ -269,7 +269,10 @@ unsafe fn android_lend_user_memory_region(
     if ret == 0 {
         Ok(())
     } else {
-        { base::error!("GH-DIAG: GH_VM_ANDROID_LEND_USER_MEM failed"); errno_result() }
+        {
+            base::error!("GH-DIAG: GH_VM_ANDROID_LEND_USER_MEM failed");
+            errno_result()
+        }
     }
 }
 
@@ -313,7 +316,10 @@ unsafe fn set_user_memory_region(
     if ret == 0 {
         Ok(())
     } else {
-        { base::error!("GH-DIAG: GH_VM_SET_USER_MEM_REGION failed"); errno_result() }
+        {
+            base::error!("GH-DIAG: GH_VM_SET_USER_MEM_REGION failed");
+            errno_result()
+        }
     }
 }
 
@@ -334,8 +340,7 @@ fn map_cma_region(
     }
     if lend {
         flags |= GUNYAH_MEM_FORCE_LEND;
-    }
-    else {
+    } else {
         flags |= GUNYAH_MEM_FORCE_SHARE;
     }
     let region = gunyah_map_cma_mem_args {
@@ -351,7 +356,10 @@ fn map_cma_region(
     if ret == 0 {
         Ok(())
     } else {
-        { base::error!("GH-DIAG: GH_VM_ANDROID_MAP_CMA_MEM failed"); errno_result() }
+        {
+            base::error!("GH-DIAG: GH_VM_ANDROID_MAP_CMA_MEM failed");
+            errno_result()
+        }
     }
 }
 
@@ -387,6 +395,10 @@ pub struct GunyahVm {
     vm_id: Option<u16>,
     pas_id: Option<u32>,
     guest_mem: GuestMemory,
+    /// End of the statically declared guest-memory layout. Dynamic PCI BAR aliases and pstore
+    /// mappings are added after the allocator has chosen the high-MMIO window and must not feed
+    /// back into that calculation.
+    layout_guest_memory_end: u64,
     mem_regions: Arc<Mutex<BTreeMap<MemSlot, (Box<dyn MappedRegion>, GuestAddress)>>>,
     /// A min heap of MemSlot numbers that were used and then removed and can now be re-used
     mem_slot_gaps: Arc<Mutex<BinaryHeap<Reverse<MemSlot>>>>,
@@ -414,7 +426,27 @@ impl AsRawDescriptor for GunyahVm {
 }
 
 impl GunyahVm {
-    pub fn new(gh: &Gunyah, vm_id: Option<u16>, pas_id: Option<u32>, guest_mem: GuestMemory, cfg: Config) -> Result<GunyahVm> {
+    pub fn new(
+        gh: &Gunyah,
+        vm_id: Option<u16>,
+        pas_id: Option<u32>,
+        guest_mem: GuestMemory,
+        cfg: Config,
+    ) -> Result<GunyahVm> {
+        // `GuestMemory::end_addr()` assumes the region with the greatest start also has the
+        // greatest end. That is true for the normal contiguous layout, but the pool and firmware
+        // regions are independently configured. Compute the actual maximum with checked
+        // arithmetic so the FDT layout cannot silently omit a high static region.
+        let layout_guest_memory_end = guest_mem
+            .regions()
+            .try_fold(0u64, |end, region| {
+                region
+                    .guest_addr
+                    .offset()
+                    .checked_add(region.size as u64)
+                    .map(|region_end| end.max(region_end))
+            })
+            .ok_or_else(|| Error::new(EOVERFLOW))?;
         // SAFETY:
         // Safe because we know gunyah is a real gunyah fd as this module is the only one that can
         // make Gunyah objects.
@@ -477,14 +509,14 @@ impl GunyahVm {
             };
             if region.options.file_backed.is_some() {
                 map_cma_region(
-                        &vm_descriptor,
-                        region.index as MemSlot,
-                        lend,
-                        !region.options.file_backed.unwrap().writable,
-                        region.guest_addr.offset(),
-                        region.shm.as_raw_descriptor().try_into().unwrap(),
-                        region.size.try_into().unwrap(),
-                        region.shm_offset,
+                    &vm_descriptor,
+                    region.index as MemSlot,
+                    lend,
+                    !region.options.file_backed.unwrap().writable,
+                    region.guest_addr.offset(),
+                    region.shm.as_raw_descriptor().try_into().unwrap(),
+                    region.size.try_into().unwrap(),
+                    region.shm_offset,
                 )?;
             } else if lend {
                 let region_size: u64 = region.size.try_into().unwrap();
@@ -656,14 +688,10 @@ impl GunyahVm {
                 // exists for the Qualcomm reserve-pool hook, so it's opt-in via
                 // --prepare-lend-mthp-mode, not unconditional for every arm/aarch64 host.
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-                if cfg.prepare_lend_mthp.is_some() && is_pool && backing_prepare_len != 0
-                {
+                if cfg.prepare_lend_mthp.is_some() && is_pool && backing_prepare_len != 0 {
                     // SAFETY: host_addr is a valid mapping of region.size bytes.
                     let prep = unsafe {
-                        mthp::prepare_lend_region(
-                            region.host_addr as *mut u8,
-                            backing_prepare_len,
-                        )
+                        mthp::prepare_lend_region(region.host_addr as *mut u8, backing_prepare_len)
                     };
                     if !prep.populated {
                         // Host-alloc must fail loudly: proceeding to SHARE an unbacked
@@ -863,6 +891,7 @@ impl GunyahVm {
             vm_id,
             pas_id,
             guest_mem,
+            layout_guest_memory_end,
             mem_regions: Arc::new(Mutex::new(BTreeMap::new())),
             mem_slot_gaps: Arc::new(Mutex::new(BinaryHeap::new())),
             pinned_regions: Arc::new(Mutex::new(Vec::new())),
@@ -873,7 +902,11 @@ impl GunyahVm {
         })
     }
 
-    pub fn set_vm_auth_type_to_qcom_trusted_vm(&self, payload_start: GuestAddress, payload_size: u64) -> Result<()> {
+    pub fn set_vm_auth_type_to_qcom_trusted_vm(
+        &self,
+        payload_start: GuestAddress,
+        payload_size: u64,
+    ) -> Result<()> {
         let gunyah_qtvm_auth_arg = gunyah_qtvm_auth_arg {
             vm_id: self.vm_id.expect("VM ID not specified for a QTVM"),
             pas_id: self.pas_id.expect("PAS ID not specified for a QTVM"),
@@ -891,7 +924,10 @@ impl GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            { base::error!("GH-DIAG: GH_VM_ANDROID_SET_AUTH_TYPE failed"); errno_result() }
+            {
+                base::error!("GH-DIAG: GH_VM_ANDROID_SET_AUTH_TYPE failed");
+                errno_result()
+            }
         }
     }
 
@@ -922,7 +958,9 @@ impl GunyahVm {
         // SAFETY:
         // Safe because we know this is a Gunyah VCPU
         let res = unsafe { ioctl(&vcpu, GH_VCPU_MMAP_SIZE) };
-        if res < 0 { base::error!("GH-DIAG: GH_VCPU_MMAP_SIZE failed"); }
+        if res < 0 {
+            base::error!("GH-DIAG: GH_VCPU_MMAP_SIZE failed");
+        }
         if res < 0 {
             return errno_result();
         }
@@ -965,7 +1003,10 @@ impl GunyahVm {
                 .insert(GunyahIrqRoute { irq: label, level });
             Ok(())
         } else {
-            { base::error!("GH-DIAG: GH_VM_ADD_FUNCTION failed"); errno_result() }
+            {
+                base::error!("GH-DIAG: GH_VM_ADD_FUNCTION failed");
+                errno_result()
+            }
         }
     }
 
@@ -987,7 +1028,10 @@ impl GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            { base::error!("GH-DIAG: GH_VM_REMOVE_FUNCTION failed"); errno_result() }
+            {
+                base::error!("GH-DIAG: GH_VM_REMOVE_FUNCTION failed");
+                errno_result()
+            }
         }
     }
 
@@ -1001,6 +1045,7 @@ impl GunyahVm {
             vm_id: self.vm_id,
             pas_id: self.pas_id,
             guest_mem: self.guest_mem.clone(),
+            layout_guest_memory_end: self.layout_guest_memory_end,
             mem_regions: self.mem_regions.clone(),
             mem_slot_gaps: self.mem_slot_gaps.clone(),
             pinned_regions: self.pinned_regions.clone(),
@@ -1023,7 +1068,10 @@ impl GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            { base::error!("GH-DIAG: GH_VM_SET_DTB_CONFIG failed"); errno_result() }
+            {
+                base::error!("GH-DIAG: GH_VM_SET_DTB_CONFIG failed");
+                errno_result()
+            }
         }
     }
 
@@ -1039,7 +1087,10 @@ impl GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            { base::error!("GH-DIAG: GH_VM_ANDROID_SET_FW_CONFIG failed"); errno_result() }
+            {
+                base::error!("GH-DIAG: GH_VM_ANDROID_SET_FW_CONFIG failed");
+                errno_result()
+            }
         }
     }
 
@@ -1067,7 +1118,10 @@ impl GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            { base::error!("GH-DIAG: GH_VM_SET_BOOT_CONTEXT failed"); errno_result() }
+            {
+                base::error!("GH-DIAG: GH_VM_SET_BOOT_CONTEXT failed");
+                errno_result()
+            }
         }
     }
 
@@ -1182,9 +1236,7 @@ impl GunyahVm {
                 };
                 let dst = ho
                     .checked_add(core::mem::offset_of!(abi::ShimHandoff, parcel) as u64)
-                    .and_then(|a| {
-                        a.checked_add(i * core::mem::size_of::<abi::ShimParcel>() as u64)
-                    })
+                    .and_then(|a| a.checked_add(i * core::mem::size_of::<abi::ShimParcel>() as u64))
                     .ok_or_else(|| Error::new(EINVAL))?;
                 // SAFETY: ShimParcel is repr(C) and made of integers; every byte pattern is valid.
                 let bytes = unsafe {
@@ -1261,8 +1313,10 @@ fn watch_shim(mem: GuestMemory, handoff: GuestAddress) {
     std::thread::Builder::new()
         .name("gh_shim_watch".into())
         .spawn(move || {
-            let status_at = handoff.unchecked_add(core::mem::offset_of!(abi::ShimHandoff, status) as u64);
-            let error_at = handoff.unchecked_add(core::mem::offset_of!(abi::ShimHandoff, error) as u64);
+            let status_at =
+                handoff.unchecked_add(core::mem::offset_of!(abi::ShimHandoff, status) as u64);
+            let error_at =
+                handoff.unchecked_add(core::mem::offset_of!(abi::ShimHandoff, error) as u64);
             let probe_at =
                 handoff.unchecked_add(core::mem::offset_of!(abi::ShimHandoff, exec_probe) as u64);
             let msg_at = handoff.unchecked_add(core::mem::offset_of!(abi::ShimHandoff, msg) as u64);
@@ -1289,7 +1343,9 @@ fn watch_shim(mem: GuestMemory, handoff: GuestAddress) {
                                 base::info!("GH-SHIM: window accepted");
                             }
                         }
-                        abi::SHIM_STATUS_DT_DONE => base::info!("GH-SHIM: /memory now names the window"),
+                        abi::SHIM_STATUS_DT_DONE => {
+                            base::info!("GH-SHIM: /memory now names the window")
+                        }
                         abi::SHIM_STATUS_JUMPING => {
                             base::info!("GH-SHIM: handing over to the payload");
                             return;
@@ -1350,7 +1406,10 @@ impl GunyahVm {
                 .next()
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .unwrap_or(2048);
-            let gpa = match gpa_str.strip_prefix("0x").or_else(|| gpa_str.strip_prefix("0X")) {
+            let gpa = match gpa_str
+                .strip_prefix("0x")
+                .or_else(|| gpa_str.strip_prefix("0X"))
+            {
                 Some(hex) => u64::from_str_radix(hex, 16).ok(),
                 None => gpa_str.parse::<u64>().ok(),
             };
@@ -1363,7 +1422,11 @@ impl GunyahVm {
             let region = match MemoryMappingBuilder::new(size as usize).build() {
                 Ok(m) => m,
                 Err(e) => {
-                    base::error!("GH-SHARE-PROBE: gpa={:#x} scratch mmap failed: {:?}", gpa, e);
+                    base::error!(
+                        "GH-SHARE-PROBE: gpa={:#x} scratch mmap failed: {:?}",
+                        gpa,
+                        e
+                    );
                     continue;
                 }
             };
@@ -1577,7 +1640,10 @@ impl GunyahVm {
         // test-only); share_blob uses monotonic labels under this flag so BAR-offset reuse
         // cannot EBUSY against the leaked parcels. Keep the backing region alive too.
         if std::env::var_os("GH_NO_UNSHARE").is_some() {
-            warn!("GUNYAH-UNSHARE-BLOB: label={} SKIPPED (GH_NO_UNSHARE leak-test)", label);
+            warn!(
+                "GUNYAH-UNSHARE-BLOB: label={} SKIPPED (GH_NO_UNSHARE leak-test)",
+                label
+            );
             return Ok(());
         }
         // The guest has unmapped this host-visible blob and (per the virtio-gpu guest driver)
@@ -1631,6 +1697,7 @@ impl Vm for GunyahVm {
             vm_id: self.vm_id,
             pas_id: self.pas_id,
             guest_mem: self.guest_mem.clone(),
+            layout_guest_memory_end: self.layout_guest_memory_end,
             mem_regions: self.mem_regions.clone(),
             mem_slot_gaps: self.mem_slot_gaps.clone(),
             pinned_regions: self.pinned_regions.clone(),
@@ -1720,6 +1787,40 @@ impl Vm for GunyahVm {
         // (driven per vm_accept, symmetric with the attach) before this runs.
         let label = (guest_addr.offset() >> 12) as u32;
         self.unshare_blob(label)
+    }
+
+    // Host-visible blob backing: fold each blob's shmem into a 2MB order-9 folio *before* it is
+    // pinned (formerly gfxstream's HostVisibleFolio; moved here so the GPU backend is
+    // backend-agnostic and gzvm/etc. reuse it). A 2MB-clean blob's later SHARE (share_blob) never
+    // splits a hyp stage-2 block shared with LENT guest RAM -> no EXEC strip. `threshold` /
+    // `exceed-policy` are VMM policy (here); the host-visible VRAM quota is metered on the GPU side.
+    fn prepare_runtime_blob_backing(
+        &mut self,
+        fd: &dyn base::AsRawDescriptor,
+        size: u64,
+    ) -> Result<u64> {
+        // Folio policy is VMM-owned (--runtime-share hugepage-threshold-kb=,exceed-policy=),
+        // read from hv_cfg -- no per-blob arg from the GPU side.
+        if size < self.hv_cfg.folio_threshold_bytes {
+            return Ok(0); // below threshold -> 4K direct-supply path
+        }
+        let rounded = mthp::round_up_2mb(size);
+
+        // SAFETY: fd is a live growable shmem descriptor for this blob (owned by the GPU backend
+        // for the blob's lifetime); folio_back_fd only grows + collapses it.
+        if let Err(e) = unsafe { mthp::folio_back_fd(fd.as_raw_descriptor(), rounded) } {
+            // Reserve/CMA exhausted (or collapse failed): honour the exceed-policy.
+            warn!("GH-FOLIO: folio_back_fd failed ({}); size=0x{:x}", e, size);
+            if self.hv_cfg.folio_oom_on_exceed {
+                return Err(Error::new(e.raw_os_error().unwrap_or(EINVAL)));
+            }
+            return Ok(0); // fallback: leave it on the 4K path
+        }
+        debug!(
+            "GH-FOLIO: blob size=0x{:x} -> 2MB folios rounded=0x{:x}",
+            size, rounded
+        );
+        Ok(rounded)
     }
 
     fn prepare_blob_range(
@@ -1956,7 +2057,10 @@ impl Vm for GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            { base::error!("GH-DIAG: GH_VM_ADD_FUNCTION failed"); errno_result() }
+            {
+                base::error!("GH-DIAG: GH_VM_ADD_FUNCTION failed");
+                errno_result()
+            }
         }
     }
 
@@ -1988,7 +2092,10 @@ impl Vm for GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            { base::error!("GH-DIAG: GH_VM_REMOVE_FUNCTION failed"); errno_result() }
+            {
+                base::error!("GH-DIAG: GH_VM_REMOVE_FUNCTION failed");
+                errno_result()
+            }
         }
     }
 
@@ -2104,13 +2211,24 @@ impl Vcpu for GunyahVcpu {
         // Safe because we know our file is a VCPU fd and we verify the return result.
         let ret = unsafe { ioctl(self, GH_VCPU_RUN) };
         if ret != 0 {
-            return errno_result();
+            let err = Error::last();
+            error!(
+                "GH-DIAG: GH_VCPU_RUN failed: vcpu={} ioctl_ret={} errno={}",
+                self.id,
+                ret,
+                err.errno()
+            );
+            return Err(err);
         }
 
         // SAFETY:
         // Safe because we know we mapped enough memory to hold the gh_vcpu_run struct
         // because the kernel told us how large it is.
         let run = unsafe { &mut *(self.run_mmap.as_ptr() as *mut gh_vcpu_run) };
+        debug!(
+            "GH-DIAG: GH_VCPU_RUN returned: vcpu={} exit_reason={}",
+            self.id, run.exit_reason
+        );
         match run.exit_reason {
             GH_VCPU_EXIT_MMIO => Ok(VcpuExit::Mmio),
             GH_VCPU_EXIT_STATUS => {
@@ -2124,7 +2242,10 @@ impl Vcpu for GunyahVcpu {
                     }),
                     GH_VM_STATUS_GH_VM_STATUS_CRASHED => Ok(VcpuExit::SystemEventCrash),
                     GH_VM_STATUS_GH_VM_STATUS_EXITED => {
-                        info!("exit type {}", status.exit_info.type_);
+                        info!(
+                            "GH-DIAG: vcpu={} exit type {}",
+                            self.id, status.exit_info.type_
+                        );
                         match status.exit_info.type_ {
                             GH_RM_EXIT_TYPE_VM_EXIT => Ok(VcpuExit::SystemEventShutdown),
                             GH_RM_EXIT_TYPE_PSCI_POWER_OFF => Ok(VcpuExit::SystemEventShutdown),
@@ -2135,24 +2256,27 @@ impl Vcpu for GunyahVcpu {
                             GH_RM_EXIT_TYPE_ASYNC_EXT_ABORT => Ok(VcpuExit::SystemEventCrash),
                             GH_RM_EXIT_TYPE_VM_FORCE_STOPPED => Ok(VcpuExit::SystemEventShutdown),
                             r => {
-                                warn!("Unknown exit type: {}", r);
+                                warn!("GH-DIAG: vcpu={} unknown exit type: {}", self.id, r);
                                 Err(Error::new(EINVAL))
                             }
                         }
                     }
                     r => {
-                        warn!("Unknown vm status: {}", r);
+                        warn!("GH-DIAG: vcpu={} unknown vm status: {}", self.id, r);
                         Err(Error::new(EINVAL))
                     }
                 }
             }
             GH_VCPU_EXIT_PAGE_FAULT => {
                 let pf = unsafe { &run.__bindgen_anon_1.page_fault };
-                warn!("page fault at {:#x}, attempt: {}", pf.phys_addr, pf.attempt);
+                warn!(
+                    "GH-DIAG: vcpu={} page fault at {:#x}, attempt: {}",
+                    self.id, pf.phys_addr, pf.attempt
+                );
                 Err(Error::new(-pf.attempt))
             }
             r => {
-                warn!("unknown gh exit reason: {}", r);
+                warn!("GH-DIAG: vcpu={} unknown gh exit reason: {}", self.id, r);
                 Err(Error::new(EINVAL))
             }
         }
@@ -2192,17 +2316,53 @@ impl Vcpu for GunyahVcpu {
         // union field to use.
         let mmio = unsafe { &mut run.__bindgen_anon_1.mmio };
         let address = mmio.phys_addr;
-        let data = &mut mmio.data[..mmio.len as usize];
-        if mmio.is_write != 0 {
+        let len = usize::try_from(mmio.len)
+            .ok()
+            .filter(|&len| len <= mmio.data.len());
+        let Some(len) = len else {
+            mmio.resume_action = GH_VCPU_RESUME_FAULT;
+            error!(
+                "GH-DIAG: MMIO metadata invalid: vcpu={} addr={:#x} len={} write={}",
+                self.id, address, mmio.len, mmio.is_write
+            );
+            return Err(Error::new(EINVAL));
+        };
+
+        let is_write = mmio.is_write != 0;
+        let result = if is_write {
             handle_fn(IoParams {
                 address,
-                operation: IoOperation::Write(data),
+                operation: IoOperation::Write(&mut mmio.data[..len]),
             })
         } else {
             handle_fn(IoParams {
                 address,
-                operation: IoOperation::Read(data),
+                operation: IoOperation::Read(&mut mmio.data[..len]),
             })
+        };
+
+        match result {
+            Ok(()) => {
+                mmio.resume_action = GH_VCPU_RESUME_HANDLED;
+                debug!(
+                    "GH-DIAG: MMIO handled: vcpu={} addr={:#x} len={} write={} action={}",
+                    self.id, address, len, is_write, GH_VCPU_RESUME_HANDLED
+                );
+                Ok(())
+            }
+            Err(err) => {
+                mmio.resume_action = GH_VCPU_RESUME_FAULT;
+                error!(
+                    "GH-DIAG: MMIO handler failed: vcpu={} addr={:#x} len={} write={} errno={} action={}",
+                    self.id,
+                    address,
+                    len,
+                    is_write,
+                    err.errno(),
+                    GH_VCPU_RESUME_FAULT
+                );
+                Err(err)
+            }
         }
     }
 

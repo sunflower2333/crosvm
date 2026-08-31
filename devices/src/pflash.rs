@@ -545,7 +545,7 @@ mod tests {
         // Make sure our status is ready.
         pflash.write(off(offset), &[COMMAND_READ_STATUS]);
         pflash.read(off(offset), &mut got);
-        let want = [STATUS_READY; 4];
+        let want = [STATUS_READY, 0, STATUS_READY, 0];
         assert_eq!(want, got);
     }
 
@@ -563,14 +563,14 @@ mod tests {
         pflash.write(off(offset), &[COMMAND_READ_STATUS]);
         let mut got = [0u8; 4];
         pflash.read(off(offset), &mut got);
-        let want = [STATUS_READY; 4];
+        let want = [STATUS_READY, 0, STATUS_READY, 0];
         assert_eq!(want, got);
 
-        // Make sure we can clear the status properly.
+        // Clearing status retains the device READY bit on every flash lane.
         pflash.write(off(offset), &[COMMAND_CLEAR_STATUS]);
         pflash.write(off(offset), &[COMMAND_READ_STATUS]);
         pflash.read(off(offset), &mut got);
-        let want = [0; 4];
+        let want = [STATUS_READY, 0, STATUS_READY, 0];
         assert_eq!(want, got);
 
         // We implicitly jump back into READ_ARRAY mode after reading the,
@@ -579,7 +579,7 @@ mod tests {
         pflash.read(off(offset), &mut got);
         pflash.write(off(offset), &[COMMAND_READ_STATUS]);
         pflash.read(off(offset), &mut got);
-        let want = [0; 4];
+        let want = [STATUS_READY, 0, STATUS_READY, 0];
         assert_eq!(want, got);
     }
 

@@ -12,6 +12,10 @@ use cros_fdt::FdtNode;
 use libc::ENOENT;
 use libc::ENOTSUP;
 use libc::ENOTTY;
+use libc::EOVERFLOW;
+use resources::compute_gunyah_mmio_layout;
+use resources::compute_gunyah_size_max;
+use resources::GUNYAH_DEFAULT_BAR_ALIGNMENT;
 use snapshot::AnySnapshot;
 use vm_memory::GuestAddress;
 use vm_memory::MemoryRegionPurpose;
@@ -96,21 +100,36 @@ impl VmAArch64 for GunyahVm {
         // stage-2 -> guest SIGBUS on the gfxstream ASG ring. Extend size-max to cover
         // RAM plus the high-MMIO window above it (>= 2 GiB headroom, minimum 4 GiB),
         // keeping the BAR inside the layout.
-        const GIB: u64 = 1 << 30;
         let mut base_address: Option<u64> = None;
-        let mut ram_top: u64 = 0;
+        let mut current_memory_end: u64 = 0;
         let mut firmware_set = false;
         // Lowest IPA crosvm hands to the guest, captured to bound the RM-lowmem fence
         // below (the firmware window when present, else the payload/RAM base).
         let mut firmware_base: Option<u64> = None;
         for region in self.guest_mem.regions() {
-            let region_end = region.guest_addr.offset() + region.size as u64;
-            if region_end > ram_top {
-                ram_top = region_end;
-            }
+            let region_end = match region.guest_addr.offset().checked_add(region.size as u64) {
+                Some(end) => end,
+                None => {
+                    base::error!(
+                        "GH: guest region overflows GPA space: base={:#x} size={:#x}",
+                        region.guest_addr.offset(),
+                        region.size,
+                    );
+                    return Err(cros_fdt::Error::PropertyValueInvalid);
+                }
+            };
+            current_memory_end = current_memory_end.max(region_end);
             match region.options.purpose {
                 MemoryRegionPurpose::GuestMemoryRegion => {
                     // Assume the first GuestMemoryRegion contains the payload.
+                    if base_address.is_none() {
+                        base_address = Some(region.guest_addr.offset());
+                    }
+                }
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                MemoryRegionPurpose::SharedGuestRam => {
+                    // Keep this robust if the boot region's purpose is changed: the first
+                    // statically declared RAM region is still the RM layout base.
                     if base_address.is_none() {
                         base_address = Some(region.guest_addr.offset());
                     }
@@ -129,24 +148,45 @@ impl VmAArch64 for GunyahVm {
             }
         }
 
-        // Keep base-address at the payload region (see comment above). size-max is the
-        // layout *length* from base and must cover, in order of increasing IPA:
-        //   (1) guest RAM [base, ram_top) -- this already includes the GPU pre-alloc pool
-        //       regions, which are appended after RAM as first-class guest_mem regions, and
-        //   (2) the high-MMIO PCI window placed just above RAM (the host-visible
-        //       virtio-gpu BAR needs a stage-2 mapping, else the guest SIGBUSes).
-        // The window top is a deterministic function of ram_top — derive it from the
-        // exact same formula as aarch64 get_system_allocator_config
-        // (gunyah_high_mmio_window_top) rather than a magic headroom. Rounded up to a
-        // GiB, 4 GiB minimum.
+        // `layout_guest_memory_end` is captured before pstore and dynamic PCI BAR aliases are
+        // added. Those aliases are guest-visible mappings inside the already selected aperture,
+        // but treating one of them as the end of RAM would make this formula disagree with the
+        // allocator that placed the BAR in the first place.
+        let ram_top = self.layout_guest_memory_end;
+        if current_memory_end > ram_top {
+            base::info!(
+                "GH: dynamic mappings extend guest-memory end from {:#x} to {:#x}; keeping the \
+                 statically selected layout end",
+                ram_top,
+                current_memory_end,
+            );
+        }
         let base_address = base_address.unwrap_or(0);
         const PLAT_MMIO_SIZE: u64 = 0x800000; // AARCH64_PLATFORM_MMIO_SIZE
-        const BAR_TARGET: u64 = 4 * GIB;
-        let window_base = ram_top + PLAT_MMIO_SIZE;
-        let window_top = window_base.next_multiple_of(BAR_TARGET) + BAR_TARGET + (1u64 << 29);
-        let size_max =
-            core::cmp::max((window_top - base_address).next_multiple_of(GIB), 4 * GIB);
-        base::info!("GH: layout base={:#x} ram_top={:#x} size-max={:#x}", base_address, ram_top, size_max);
+        let layout =
+            compute_gunyah_mmio_layout(ram_top, PLAT_MMIO_SIZE, GUNYAH_DEFAULT_BAR_ALIGNMENT)
+                .ok_or(cros_fdt::Error::PropertyValueInvalid)?;
+        if current_memory_end > layout.high_mmio_top {
+            base::error!(
+                "GH: dynamic mapping ends at {:#x}, beyond high-MMIO top {:#x}",
+                current_memory_end,
+                layout.high_mmio_top,
+            );
+            return Err(cros_fdt::Error::PropertyValueInvalid);
+        }
+        let size_max = compute_gunyah_size_max(base_address, ram_top, layout.high_mmio_top)
+            .ok_or(cros_fdt::Error::PropertyValueInvalid)?;
+        base::info!(
+            "GH: layout base={:#x} ram_top={:#x} platform_end={:#x} high_mmio=[{:#x},{:#x}) \
+             bar_base={:#x} size-max={:#x}",
+            base_address,
+            ram_top,
+            layout.platform_mmio_end,
+            layout.high_mmio_base,
+            layout.high_mmio_top,
+            layout.aligned_bar_base,
+            size_max,
+        );
         memory_node.set_prop("base-address", base_address)?;
         memory_node.set_prop("size-max", size_max)?;
 
@@ -263,9 +303,10 @@ impl VmAArch64 for GunyahVm {
         if let Some(bar_gpa) = std::env::var("CROSVM_DRM2KGSL_BAR_GPA")
             .ok()
             .and_then(|value| {
-                value
-                    .strip_prefix("0x")
-                    .map_or_else(|| value.parse().ok(), |hex| u64::from_str_radix(hex, 16).ok())
+                value.strip_prefix("0x").map_or_else(
+                    || value.parse().ok(),
+                    |hex| u64::from_str_radix(hex, 16).ok(),
+                )
             })
             .and_then(|gpa| gpa.checked_add(2 << 20))
         {
@@ -369,14 +410,49 @@ impl VmAArch64 for GunyahVm {
         // This memory region contains both the DTB and the kernel image,
         // so ensure they are located together.
 
-        let (dtb_mapping, _, dtb_obj_offset) = self
-            .guest_mem
-            .find_region(fdt_address)
-            .map_err(|_| Error::new(ENOENT))?;
+        base::info!(
+            "GH-INIT: payload={:#x} fdt={:#x} fdt_size={:#x}",
+            payload_entry_address.offset(),
+            fdt_address.offset(),
+            fdt_size,
+        );
+        for region in self.guest_mem.regions() {
+            let region_end = region
+                .guest_addr
+                .offset()
+                .checked_add(region.size as u64)
+                .ok_or_else(|| Error::new(EOVERFLOW))?;
+            base::info!(
+                "GH-INIT: region={} purpose={:?} gpa=[{:#x},{:#x}) size={:#x} obj_offset={:#x}",
+                region.index,
+                region.options.purpose,
+                region.guest_addr.offset(),
+                region_end,
+                region.size,
+                region.shm_offset,
+            );
+        }
+
+        let (dtb_mapping, _, dtb_obj_offset) =
+            self.guest_mem.find_region(fdt_address).map_err(|e| {
+                base::error!(
+                    "GH-INIT: FDT lookup failed for {:#x}: {}",
+                    fdt_address.offset(),
+                    e,
+                );
+                Error::new(ENOENT)
+            })?;
         let (payload_mapping, payload_offset, payload_obj_offset) = self
             .guest_mem
             .find_region(payload_entry_address)
-            .map_err(|_| Error::new(ENOENT))?;
+            .map_err(|e| {
+                base::error!(
+                    "GH-INIT: payload lookup failed for {:#x}: {}",
+                    payload_entry_address.offset(),
+                    e,
+                );
+                Error::new(ENOENT)
+            })?;
 
         if !std::ptr::eq(dtb_mapping, payload_mapping) || dtb_obj_offset != payload_obj_offset {
             panic!("DTB and payload are not part of same memory region.");
@@ -393,7 +469,10 @@ impl VmAArch64 for GunyahVm {
             // Trusted VMs.
             for region in self.guest_mem.regions() {
                 if region.guest_addr.offset() == payload_entry_address.offset() {
-                    self.set_vm_auth_type_to_qcom_trusted_vm(payload_entry_address, region.size.try_into().unwrap());
+                    self.set_vm_auth_type_to_qcom_trusted_vm(
+                        payload_entry_address,
+                        region.size.try_into().unwrap(),
+                    );
                     break;
                 }
             }
@@ -403,8 +482,10 @@ impl VmAArch64 for GunyahVm {
 
         // Gunyah sets the PC to the payload entry point for protected VMs without firmware.
         // It needs to be 0 as Gunyah assumes it to be kernel start.
-        if self.hv_cfg.protection_type.isolates_memory() &&
-           !self.hv_cfg.protection_type.runs_firmware() && payload_offset != 0 {
+        if self.hv_cfg.protection_type.isolates_memory()
+            && !self.hv_cfg.protection_type.runs_firmware()
+            && payload_offset != 0
+        {
             panic!("Payload offset must be zero");
         }
 

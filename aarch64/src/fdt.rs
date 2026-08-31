@@ -292,7 +292,9 @@ fn create_pool_node(
     }
     // See "`reg` is the FLOOR" above: the node describes the pre-shared floor, and the window's
     // size rides along beside it when the two differ.
-    let floor = growable.as_ref().map_or(size, |g| g.pre_alloc_size.min(size));
+    let floor = growable
+        .as_ref()
+        .map_or(size, |g| g.pre_alloc_size.min(size));
     node.set_prop("reg", &[gpa, floor])?;
     if floor != size {
         node.set_prop("droidvm,pool-size", size)?;
@@ -558,12 +560,12 @@ fn create_chosen_node(
     }
 
     let mut kaslr_seed_bytes = [0u8; 8];
-    rand::rng().fill_bytes(&mut kaslr_seed_bytes);
+    OsRng.fill_bytes(&mut kaslr_seed_bytes);
     let kaslr_seed = u64::from_le_bytes(kaslr_seed_bytes);
     chosen_node.set_prop("kaslr-seed", kaslr_seed)?;
 
     let mut rng_seed_bytes = [0u8; 256];
-    rand::rng().fill_bytes(&mut rng_seed_bytes);
+    OsRng.fill_bytes(&mut rng_seed_bytes);
     chosen_node.set_prop("rng-seed", &rng_seed_bytes)?;
 
     if let Some((initrd_addr, initrd_size)) = initrd {
@@ -735,7 +737,6 @@ fn create_pci_nodes(
         interrupts.push(GIC_FDT_IRQ_TYPE_SPI);
         interrupts.push(*irq_num);
         interrupts.push(IRQ_TYPE_LEVEL_HIGH);
-
     }
 
     let pci_node = fdt.root_mut().subnode_mut("pci")?;
@@ -925,6 +926,21 @@ fn create_vmwdt_node(fdt: &mut Fdt, vmwdt_cfg: VmWdtConfig, num_cpus: u32) -> Re
     Ok(())
 }
 
+/// Tell a UPL-compatible firmware that crosvm has already assigned PCI resources.
+///
+/// EDK2's UPL parser treats the presence of `options/upl-params/pci-enum-done`
+/// as the contract that BARs in the input tree are final. Without it, the
+/// parser leaves `ResourceAssigned` false and the PCI host bridge may relocate
+/// a BAR after crosvm has installed the corresponding stage-2 mapping.
+fn create_firmware_pci_options_node(fdt: &mut Fdt) -> Result<()> {
+    let options_node = fdt.root_mut().subnode_mut("options")?;
+    let upl_params_node = options_node.subnode_mut("upl-params")?;
+    // Use an explicit value so both UPL parsers and generic FDT tooling can
+    // distinguish this marker from an accidentally empty property.
+    upl_params_node.set_prop("pci-enum-done", 1u32)?;
+    Ok(())
+}
+
 // Add a node path to __symbols__ node of the FDT, so it can be referenced by an overlay.
 fn add_symbols_entry(fdt: &mut Fdt, symbol: &str, path: &str) -> Result<()> {
     // Ensure the path points to a valid node with a defined phandle
@@ -963,6 +979,7 @@ fn add_symbols_entry(fdt: &mut Fdt, symbol: &str, path: &str) -> Result<()> {
 /// * `vmwdt_cfg` - The virtual watchdog configuration
 /// * `dump_device_tree_blob` - Option path to write DTB to
 /// * `vm_generator` - Callback to add additional nodes to DTB. create_vm uses Aarch64Vm::create_fdt
+/// * `firmware_boot` - emit UPL options that preserve crosvm's PCI assignments
 pub fn create_fdt(
     fdt_max_size: usize,
     guest_mem: &GuestMemory,
@@ -1006,6 +1023,7 @@ pub fn create_fdt(
     smbios: &SmbiosOptions,
     pflash_cfg: Option<PflashDtConfig>,
     sbsa_uart_cfg: Option<(u64, u32, bool)>,
+    firmware_boot: bool,
 ) -> Result<()> {
     let mut fdt = Fdt::new(&[]);
     let mut phandles_key_cache = Vec::new();
@@ -1162,7 +1180,9 @@ pub fn create_fdt(
 
     // drm2kgsl's native-context arena: the guest allocates nothing from it -- it holds the host's
     // own msm shmem rings. In the pre-backed BAR path this reserved node hides the host-only arena
-    // from guest RAM while its `reg` describes the actual VirtIO PCI BAR range.
+    // from guest RAM while its `reg` describes the eagerly mapped BAR suffix. The complete BAR
+    // aperture remains in the PCI shared-memory capability; its guard and any unbacked tail are
+    // intentionally not part of the RM memparcel.
     if let Some((gpa, size)) = drm2kgsl_resv {
         let name = if std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some() {
             "gpu_blob_reserved"
@@ -1209,6 +1229,9 @@ pub fn create_fdt(
     }
     if let Some(ref pflash_cfg) = pflash_cfg {
         create_pflash_node(&mut fdt, pflash_cfg)?;
+    }
+    if firmware_boot {
+        create_firmware_pci_options_node(&mut fdt)?;
     }
     create_vmwdt_node(&mut fdt, vmwdt_cfg, num_cpus)?;
     if is_kvm {
@@ -1292,10 +1315,26 @@ mod tests {
 
         let node = fdt.get_node("/pflash@90000000").unwrap();
         assert_eq!(node.get_prop::<String>("compatible").unwrap(), "cfi-flash");
-        assert_eq!(node.get_prop::<Vec<u64>>("reg").unwrap(), [config.base, config.size]);
-        assert_eq!(node.get_prop::<u32>("erase-size").unwrap(), config.block_size);
+        assert_eq!(
+            node.get_prop::<Vec<u64>>("reg").unwrap(),
+            [config.base, config.size]
+        );
+        assert_eq!(
+            node.get_prop::<u32>("erase-size").unwrap(),
+            config.block_size
+        );
         assert!(node.get_prop::<()>("no-unaligned-direct-access").is_some());
         assert_eq!(node.get_prop::<String>("status").unwrap(), "okay");
+    }
+
+    #[test]
+    fn firmware_pci_options_mark_resources_assigned() {
+        let mut fdt = Fdt::new(&[]);
+
+        create_firmware_pci_options_node(&mut fdt).unwrap();
+
+        let node = fdt.get_node("/options/upl-params").unwrap();
+        assert_eq!(node.get_prop::<u32>("pci-enum-done"), Some(1));
     }
 
     #[test]

@@ -81,10 +81,12 @@ use kernel_loader::LoadedKernel;
 use minijail::Minijail;
 use remain::sorted;
 use resources::address_allocator::AddressAllocator;
+use resources::compute_gunyah_mmio_layout;
 use resources::AddressRange;
 use resources::MmioType;
 use resources::SystemAllocator;
 use resources::SystemAllocatorConfig;
+use resources::GUNYAH_DEFAULT_BAR_ALIGNMENT;
 use sync::Condvar;
 use sync::Mutex;
 use thiserror::Error;
@@ -244,16 +246,36 @@ const AARCH64_VMWDT_IRQ: u32 = 31;
 
 const AARCH64_SIMPLEFB_FIXED_ADDR: u64 = 0x50000000;
 
-/// Exclusive top of the Gunyah 64-bit PCI MMIO window, a deterministic function of the
-/// end of guest RAM (`plat_mmio_base`). This is the single source of truth for the
-/// window top: `get_system_allocator_config` sizes the window with it, and the GPU pool
-/// region is placed immediately ABOVE it (a reserved-memory node INSIDE the window makes
-/// the guest's pci-host-generic bridge fail its window claim and kills virtio-blk).
-/// `gunyah/aarch64.rs` derives `size-max` from the same formula (kept in sync there).
-fn gunyah_high_mmio_window_top(plat_mmio_base: u64) -> u64 {
-    let base = plat_mmio_base + AARCH64_PLATFORM_MMIO_SIZE;
-    const BAR_TARGET: u64 = 4u64 << 30; // 4 GiB host-visible BAR headroom
-    base.next_multiple_of(BAR_TARGET) + BAR_TARGET + (1u64 << 29)
+// The first folio of the drm2kgsl BAR is intentionally left unmapped.  It keeps a guest access
+// to the BAR header/guard from being confused with the host-owned control arena; the remaining
+// bytes are backed by the arena memfd and are the only range that Gunyah can reserve.
+const DRM2KGSL_BAR_BASE_GUARD: u64 = 2 << 20;
+
+/// Return the exact guest range backed by the pre-start drm2kgsl BAR mapping.
+///
+/// `bar_size` is the complete PCI aperture while `arena_size` is the source mapping supplied to
+/// `prepare_shared_memory_region_at_offset()`.  The source starts after the guard, so its length
+/// is `arena_size - guard`; it is not necessarily the whole BAR tail when the aperture is larger
+/// than the arena.  Keep all arithmetic checked because these values originate in environment
+/// metadata captured while the PCI allocator is still being assembled.
+fn drm2kgsl_prebacked_bar_reservation(
+    bar_gpa: u64,
+    bar_size: u64,
+    arena_size: u64,
+) -> Option<(u64, u64)> {
+    if arena_size <= DRM2KGSL_BAR_BASE_GUARD || arena_size > bar_size {
+        return None;
+    }
+
+    let suffix_gpa = bar_gpa.checked_add(DRM2KGSL_BAR_BASE_GUARD)?;
+    let suffix_size = arena_size.checked_sub(DRM2KGSL_BAR_BASE_GUARD)?;
+    let suffix_end = suffix_gpa.checked_add(suffix_size)?;
+    let bar_end = bar_gpa.checked_add(bar_size)?;
+    if suffix_end > bar_end {
+        return None;
+    }
+
+    Some((suffix_gpa, suffix_size))
 }
 
 /// Compute the page-aligned framebuffer data size for simplefb.
@@ -684,12 +706,8 @@ fn main_memory_size(components: &VmComponents, hypervisor: &(impl Hypervisor + ?
             main_memory_size -= size;
         }
         if let Some(ref sfb) = components.simplefb {
-            main_memory_size -= get_simplefb_size(
-                sfb,
-                components.memory_size,
-                components.swiotlb,
-                hypervisor,
-            );
+            main_memory_size -=
+                get_simplefb_size(sfb, components.memory_size, components.swiotlb, hypervisor);
         }
     }
     // The pools, when they are asked to come out of the VM rather than out of the host on top of
@@ -1123,45 +1141,62 @@ impl arch::LinuxArch for AArch64 {
         let plat_mmio_base = vm.get_memory().end_addr().offset();
         let plat_mmio_size = AARCH64_PLATFORM_MMIO_SIZE;
 
-        let (high_mmio_base, high_mmio_size) = if matches!(
-            vm.hypervisor_kind(),
-            HypervisorKind::Gunyah
-        ) {
-            // Gunyah only establishes guest stage-2 mappings for IPAs within the VM's IPA
-            // layout [base-address, base-address + size-max) declared in gunyah-vm-config
-            // (see GunyahVm::create_fdt). base-address is PHYS_MEM_START (it also locates the
-            // guest kernel), so the host-visible virtio-gpu BAR must sit ABOVE RAM and below
-            // the layout top — not in the normal >4GiB high-MMIO window (outside the layout)
-            // nor below PHYS_MEM_START. A BAR outside the layout is accepted by the SHARE
-            // ioctl but never gets a working stage-2 entry, so the guest SIGBUSes on access.
-            //
-            // Place the 64-bit PCI MMIO window immediately above the platform MMIO region
-            // (i.e. just above guest RAM). Size the window for a 4 GiB host-visible BAR:
-            // PCI requires size-aligned BAR placement, so the window must reach the next
-            // 4 GiB boundary above its base plus the BAR itself, plus slack for the other
-            // 64-bit BARs. gunyah size-max headroom is raised to match (see
-            // hypervisor/src/gunyah/aarch64.rs create_fdt).
-            let base = plat_mmio_base + plat_mmio_size;
-            let window_top = gunyah_high_mmio_window_top(plat_mmio_base);
-            base::warn!(
-                "GUNYAH-HIGHMMIO: base={:#x} top={:#x} size={:#x} (plat_mmio_base={:#x})",
-                base, window_top, window_top - base, plat_mmio_base
-            );
-            (base, window_top - base)
-        } else {
-            // Place the 64-bit PCI MMIO window above 4GiB so firmware does not see a
-            // single aperture that straddles the 32-bit boundary.
-            let high_mmio_base = (plat_mmio_base + plat_mmio_size).max(1u64 << 32);
-            let high_mmio_size = guest_phys_end
-                .checked_sub(high_mmio_base)
-                .unwrap_or_else(|| {
+        let (high_mmio_base, high_mmio_size) =
+            if matches!(vm.hypervisor_kind(), HypervisorKind::Gunyah) {
+                // Gunyah only establishes guest stage-2 mappings for IPAs within the VM's IPA
+                // layout [base-address, base-address + size-max) declared in gunyah-vm-config
+                // (see GunyahVm::create_fdt). base-address is PHYS_MEM_START (it also locates the
+                // guest kernel), so the host-visible virtio-gpu BAR must sit ABOVE RAM and below
+                // the layout top — not in the normal >4GiB high-MMIO window (outside the layout)
+                // nor below PHYS_MEM_START. A BAR outside the layout is accepted by the SHARE
+                // ioctl but never gets a working stage-2 entry, so the guest SIGBUSes on access.
+                //
+                // Place the 64-bit PCI MMIO window immediately above the platform MMIO region
+                // (i.e. just above guest RAM). Size the window for a 4 GiB host-visible BAR:
+                // PCI requires size-aligned BAR placement, so the window must reach the next
+                // 4 GiB boundary above its base plus the BAR itself, plus slack for the other
+                // 64-bit BARs. The checked helper is also used by Gunyah's FDT producer.
+                let layout = compute_gunyah_mmio_layout(
+                    plat_mmio_base,
+                    plat_mmio_size,
+                    GUNYAH_DEFAULT_BAR_ALIGNMENT,
+                )
+                .expect("Gunyah high-MMIO layout overflowed");
+                if layout.high_mmio_top > guest_phys_end {
                     panic!(
-                        "guest_phys_end {:#x} < high_mmio_base {:#x}",
-                        guest_phys_end, high_mmio_base,
+                        "Gunyah high-MMIO top {:#x} exceeds guest physical address space {:#x}",
+                        layout.high_mmio_top, guest_phys_end,
                     );
-                });
-            (high_mmio_base, high_mmio_size)
-        };
+                }
+                base::warn!(
+                    "GUNYAH-HIGHMMIO: base={:#x} top={:#x} size={:#x} bar_base={:#x} \
+                 (guest_memory_end={:#x}, platform_end={:#x})",
+                    layout.high_mmio_base,
+                    layout.high_mmio_top,
+                    layout.high_mmio_size(),
+                    layout.aligned_bar_base,
+                    layout.guest_memory_end,
+                    layout.platform_mmio_end,
+                );
+                (layout.high_mmio_base, layout.high_mmio_size())
+            } else {
+                // Place the 64-bit PCI MMIO window above 4GiB so firmware does not see a
+                // single aperture that straddles the 32-bit boundary.
+                let platform_mmio_end = plat_mmio_base
+                    .checked_add(plat_mmio_size)
+                    .expect("platform MMIO address overflowed");
+                let high_mmio_base = platform_mmio_end.max(1u64 << 32);
+                let high_mmio_size =
+                    guest_phys_end
+                        .checked_sub(high_mmio_base)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "guest_phys_end {:#x} < high_mmio_base {:#x}",
+                                guest_phys_end, high_mmio_base,
+                            );
+                        });
+                (high_mmio_base, high_mmio_size)
+            };
         SystemAllocatorConfig {
             io: None,
             low_mmio: arch_memory_layout.pci_mem,
@@ -1282,8 +1317,7 @@ impl arch::LinuxArch for AArch64 {
                         // pseudo-unprotected mode that is the window, which starts above the boot
                         // region rather than at the bottom of the address space.
                         let initrd_max_size =
-                            (AARCH64_PHYS_MEM_START + main_memory_size)
-                                .saturating_sub(initrd_addr);
+                            (AARCH64_PHYS_MEM_START + main_memory_size).saturating_sub(initrd_addr);
                         let initrd_addr = GuestAddress(initrd_addr);
                         let initrd_size =
                             arch::load_image(&mem, &mut initrd_file, initrd_addr, initrd_max_size)
@@ -1438,25 +1472,24 @@ impl arch::LinuxArch for AArch64 {
             _amls,
             _gpe_scope_amls,
             pre_mapped_memory_regions,
-        ) =
-            arch::generate_pci_root(
-                pci_devices,
-                irq_chip.as_irq_chip_mut(),
-                mmio_bus.clone(),
-                GuestAddress(arch_memory_layout.pci_cam.start),
-                12,
-                io_bus.clone(),
-                system_allocator,
-                &mut vm,
-                // Reserve the top two SPIs for the fixed GPIO/VMWDT interrupts
-                // (AARCH64_GPIO_IRQ / AARCH64_VMWDT_IRQ) so the dynamically
-                // allocated virtio-pci IRQs can't collide with them.
-                (devices::AARCH64_GIC_NR_SPIS - AARCH64_IRQ_BASE - 2) as usize,
-                None,
-                #[cfg(feature = "swap")]
-                swap_controller,
-            )
-            .map_err(Error::CreatePciRoot)?;
+        ) = arch::generate_pci_root(
+            pci_devices,
+            irq_chip.as_irq_chip_mut(),
+            mmio_bus.clone(),
+            GuestAddress(arch_memory_layout.pci_cam.start),
+            12,
+            io_bus.clone(),
+            system_allocator,
+            &mut vm,
+            // Reserve the top two SPIs for the fixed GPIO/VMWDT interrupts
+            // (AARCH64_GPIO_IRQ / AARCH64_VMWDT_IRQ) so the dynamically
+            // allocated virtio-pci IRQs can't collide with them.
+            (devices::AARCH64_GIC_NR_SPIS - AARCH64_IRQ_BASE - 2) as usize,
+            None,
+            #[cfg(feature = "swap")]
+            swap_controller,
+        )
+        .map_err(Error::CreatePciRoot)?;
 
         let pci_root = Arc::new(Mutex::new(pci));
         let pci_bus = Arc::new(Mutex::new(PciConfigMmio::new(pci_root.clone(), 12)));
@@ -1673,19 +1706,16 @@ impl arch::LinuxArch for AArch64 {
 
         let mut pci_ranges: Vec<fdt::PciRange> = Vec::new();
 
-        let mut add_pci_ranges = |
-            alloc: &AddressAllocator,
-            space: fdt::PciAddressSpace,
-            prefetchable: bool,
-        | {
-            pci_ranges.extend(alloc.pools().iter().map(|range| fdt::PciRange {
-                space,
-                bus_address: range.start,
-                cpu_physical_address: range.start,
-                size: range.len().unwrap(),
-                prefetchable,
-            }));
-        };
+        let mut add_pci_ranges =
+            |alloc: &AddressAllocator, space: fdt::PciAddressSpace, prefetchable: bool| {
+                pci_ranges.extend(alloc.pools().iter().map(|range| fdt::PciRange {
+                    space,
+                    bus_address: range.start,
+                    cpu_physical_address: range.start,
+                    size: range.len().unwrap(),
+                    prefetchable,
+                }));
+            };
 
         add_pci_ranges(
             system_allocator.mmio_allocator(MmioType::Low),
@@ -1697,6 +1727,49 @@ impl arch::LinuxArch for AArch64 {
             fdt::PciAddressSpace::Memory64,
             true,
         );
+
+        // Keep the host allocator view and the ranges emitted to the guest side by side in the
+        // log. This is especially useful for a BAR whose size forces a 4 GiB alignment: a range
+        // that starts below 4 GiB can make firmware choose a different base than crosvm did.
+        for (index, range) in pci_ranges.iter().enumerate() {
+            base::info!(
+                "GH-PCI: FDT range={} space={:#x} bus={:#x} cpu={:#x} size={:#x} prefetchable={}",
+                index,
+                range.space as u32,
+                range.bus_address,
+                range.cpu_physical_address,
+                range.size,
+                range.prefetchable,
+            );
+        }
+        let high_pools = system_allocator
+            .mmio_allocator(MmioType::High)
+            .pools()
+            .to_vec();
+        for (index, range) in high_pools.iter().enumerate() {
+            base::info!(
+                "GH-PCI: high allocator pool={} base={:#x} size={:#x}",
+                index,
+                range.start,
+                range.len().unwrap_or(0),
+            );
+        }
+        let bar2 = system_allocator
+            .mmio_allocator(MmioType::High)
+            .find_pci_bar(2)
+            .or_else(|| {
+                system_allocator
+                    .mmio_allocator(MmioType::Low)
+                    .find_pci_bar(2)
+            });
+        if let Some((alloc, range)) = bar2 {
+            base::info!(
+                "GH-PCI: BAR2 alloc={:?} base={:#x} size={:#x}",
+                alloc,
+                range.start,
+                range.len().unwrap_or(0),
+            );
+        }
 
         let (bat_control, bat_mmio_base_and_irq) = match bat_type {
             Some(BatteryType::Goldfish) => {
@@ -1731,8 +1804,18 @@ impl arch::LinuxArch for AArch64 {
         // For Gunyah: placed in RAM range, shared via set_user_memory_region + SHM node.
         // A reserved-memory no-map node prevents the kernel from using it as regular RAM.
         if let Some(ref sfb) = components.simplefb {
-            let fb_size_aligned = get_simplefb_size(sfb, components.memory_size, components.swiotlb, vm.get_hypervisor());
-            let fb_addr = get_simplefb_addr(sfb, components.memory_size, components.swiotlb, vm.get_hypervisor());
+            let fb_size_aligned = get_simplefb_size(
+                sfb,
+                components.memory_size,
+                components.swiotlb,
+                vm.get_hypervisor(),
+            );
+            let fb_addr = get_simplefb_addr(
+                sfb,
+                components.memory_size,
+                components.swiotlb,
+                vm.get_hypervisor(),
+            );
             let bpp: u32 = match sfb.format.as_str() {
                 "a8r8g8b8" | "x8r8g8b8" | "a8b8g8r8" => 4,
                 "r8g8b8" => 3,
@@ -1820,15 +1903,9 @@ impl arch::LinuxArch for AArch64 {
                     let gpa = region.guest_addr.offset();
                     // gfxstream consumer (host-visible sub-allocator, when in gfx pre-alloc mode).
                     std::env::set_var("GFXSTREAM_POOL_FD", fd.to_string());
-                    std::env::set_var(
-                        "GFXSTREAM_POOL_FD_OFFSET",
-                        region.shm_offset.to_string(),
-                    );
+                    std::env::set_var("GFXSTREAM_POOL_FD_OFFSET", region.shm_offset.to_string());
                     std::env::set_var("GFXSTREAM_POOL_GPA", format!("{:#x}", gpa));
-                    std::env::set_var(
-                        "GFXSTREAM_POOL_SIZE",
-                        (region.size as u64).to_string(),
-                    );
+                    std::env::set_var("GFXSTREAM_POOL_SIZE", (region.size as u64).to_string());
                     base::warn!(
                         "GPU-POOL: GpuPool region gpa={:#x} size={:#x} fd={} off={:#x} \
                          (blessed by GunyahVm::new)",
@@ -1869,8 +1946,7 @@ impl arch::LinuxArch for AArch64 {
                 if region.options.purpose == vm_memory::MemoryRegionPurpose::Drm2KgslPool {
                     let fd = region.shm.as_raw_descriptor();
                     let gpa = region.guest_addr.offset();
-                    let bar_prebacked =
-                        std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some();
+                    let bar_prebacked = std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some();
                     std::env::set_var("CROSVM_DRM2KGSL_ARENA_FD", fd.to_string());
                     std::env::set_var(
                         "CROSVM_DRM2KGSL_ARENA_FD_OFFSET",
@@ -1883,7 +1959,10 @@ impl arch::LinuxArch for AArch64 {
                     if !bar_prebacked {
                         std::env::set_var("CROSVM_DRM2KGSL_ARENA_GPA", format!("{:#x}", gpa));
                     }
-                    std::env::set_var("CROSVM_DRM2KGSL_ARENA_SIZE", (region.size as u64).to_string());
+                    std::env::set_var(
+                        "CROSVM_DRM2KGSL_ARENA_SIZE",
+                        (region.size as u64).to_string(),
+                    );
                     if bar_prebacked {
                         base::warn!(
                             "GPU-POOL: Drm2KgslPool host-only backing size={:#x} fd={} off={:#x} \
@@ -1896,20 +1975,49 @@ impl arch::LinuxArch for AArch64 {
                         // Keep the host-only arena out of guest RAM and reserve the complete BAR
                         // range in the DT. vm_control records that range while installing the
                         // eager suffix mapping, before this FDT pass runs.
-                        let bar_gpa = std::env::var("CROSVM_DRM2KGSL_BAR_GPA")
-                            .ok()
-                            .and_then(|value| {
-                                value
-                                    .strip_prefix("0x")
-                                    .map_or_else(|| value.parse().ok(), |hex| u64::from_str_radix(hex, 16).ok())
-                            });
+                        let bar_gpa =
+                            std::env::var("CROSVM_DRM2KGSL_BAR_GPA")
+                                .ok()
+                                .and_then(|value| {
+                                    value.strip_prefix("0x").map_or_else(
+                                        || value.parse().ok(),
+                                        |hex| u64::from_str_radix(hex, 16).ok(),
+                                    )
+                                });
                         let bar_size = std::env::var("CROSVM_DRM2KGSL_BAR_SIZE")
                             .ok()
                             .and_then(|value| value.parse::<u64>().ok());
                         match (bar_gpa, bar_size) {
-                            (Some(gpa), Some(size)) => drm2kgsl_resv = Some((gpa, size)),
+                            (Some(bar_gpa), Some(bar_size)) => {
+                                match drm2kgsl_prebacked_bar_reservation(
+                                    bar_gpa,
+                                    bar_size,
+                                    region.size as u64,
+                                ) {
+                                    Some((suffix_gpa, suffix_size)) => {
+                                        base::info!(
+                                            "GPU-POOL: reserving mapped BAR suffix gpa={:#x} \
+                                             size={:#x} (bar={:#x}+{:#x}, arena={:#x})",
+                                            suffix_gpa,
+                                            suffix_size,
+                                            bar_gpa,
+                                            bar_size,
+                                            region.size,
+                                        );
+                                        drm2kgsl_resv = Some((suffix_gpa, suffix_size));
+                                    }
+                                    None => base::error!(
+                                        "GPU-POOL: invalid prebacked BAR metadata: \
+                                         bar={:#x}+{:#x}, arena={:#x}, guard={:#x}",
+                                        bar_gpa,
+                                        bar_size,
+                                        region.size,
+                                        DRM2KGSL_BAR_BASE_GUARD,
+                                    ),
+                                }
+                            }
                             _ => base::error!(
-                                 "GPU-POOL: prebacked drm2kgsl BAR metadata is missing; \
+                                "GPU-POOL: prebacked drm2kgsl BAR metadata is missing; \
                                  guarded guest BAR mapping will be unavailable"
                             ),
                         }
@@ -1935,10 +2043,7 @@ impl arch::LinuxArch for AArch64 {
                     let gpa = region.guest_addr.offset();
                     std::env::set_var("VENUS_POOL_FD", fd.to_string());
                     std::env::set_var("VENUS_POOL_FD_OFFSET", region.shm_offset.to_string());
-                    std::env::set_var(
-                        "VENUS_POOL_HOST_VA",
-                        (region.host_addr as u64).to_string(),
-                    );
+                    std::env::set_var("VENUS_POOL_HOST_VA", (region.host_addr as u64).to_string());
                     std::env::set_var("VENUS_POOL_GPA", format!("{:#x}", gpa));
                     std::env::set_var("VENUS_POOL_SIZE", (region.size as u64).to_string());
                     base::warn!(
@@ -2006,8 +2111,18 @@ impl arch::LinuxArch for AArch64 {
                     _ => 4,
                 };
                 let stride = sfb.width * bpp;
-                let fb_addr = get_simplefb_addr(sfb, components.memory_size, components.swiotlb, vm.get_hypervisor());
-                let fb_alloc = get_simplefb_size(sfb, components.memory_size, components.swiotlb, vm.get_hypervisor());
+                let fb_addr = get_simplefb_addr(
+                    sfb,
+                    components.memory_size,
+                    components.swiotlb,
+                    vm.get_hypervisor(),
+                );
+                let fb_alloc = get_simplefb_size(
+                    sfb,
+                    components.memory_size,
+                    components.swiotlb,
+                    vm.get_hypervisor(),
+                );
                 fdt::SimplefbDtConfig {
                     addr: fb_addr,
                     size: fb_alloc,
@@ -2027,6 +2142,7 @@ impl arch::LinuxArch for AArch64 {
             &components.smbios,
             pflash_cfg,
             sbsa_uart_cfg,
+            has_bios,
         )
         .map_err(Error::CreateFdt)?;
 
@@ -2060,7 +2176,7 @@ impl arch::LinuxArch for AArch64 {
         };
 
         vm.init_arch(entry, fdt_address, fdt_max_size.try_into().unwrap())
-        .map_err(Error::InitVmError)?;
+            .map_err(Error::InitVmError)?;
 
         let vm_request_tubes = vec![vmwdt_host_tube, vcpufreq_host_tube];
 
@@ -2395,8 +2511,7 @@ impl AArch64 {
             return Err(Error::PflashTooLarge(size, AARCH64_PFLASH_MAX_SIZE));
         }
 
-        let pflash = Pflash::new(Box::new(pflash_image), block_size)
-            .map_err(Error::PflashSetup)?;
+        let pflash = Pflash::new(Box::new(pflash_image), block_size).map_err(Error::PflashSetup)?;
         let base = AARCH64_PFLASH_BASE;
 
         mmio_bus
@@ -2580,6 +2695,44 @@ impl AArch64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drm2kgsl_prebacked_bar_reservation_uses_mapped_suffix() {
+        assert_eq!(
+            drm2kgsl_prebacked_bar_reservation(0xe100_0000, 8 << 20, 8 << 20),
+            Some((0xe120_0000, 6 << 20))
+        );
+    }
+
+    #[test]
+    fn drm2kgsl_prebacked_bar_reservation_ignores_unmapped_bar_tail() {
+        // A larger PCI aperture is valid, but only the arena-backed suffix is a Gunyah
+        // memparcel.  The unbacked tail must not be advertised in reserved-memory.
+        assert_eq!(
+            drm2kgsl_prebacked_bar_reservation(0xe100_0000, 16 << 20, 8 << 20),
+            Some((0xe120_0000, 6 << 20))
+        );
+    }
+
+    #[test]
+    fn drm2kgsl_prebacked_bar_reservation_rejects_small_arena() {
+        assert_eq!(
+            drm2kgsl_prebacked_bar_reservation(0xe100_0000, 8 << 20, DRM2KGSL_BAR_BASE_GUARD),
+            None
+        );
+    }
+
+    #[test]
+    fn drm2kgsl_prebacked_bar_reservation_rejects_overflow() {
+        assert_eq!(
+            drm2kgsl_prebacked_bar_reservation(u64::MAX - 0x1000, 8 << 20, 8 << 20),
+            None
+        );
+        assert_eq!(
+            drm2kgsl_prebacked_bar_reservation(1, u64::MAX, u64::MAX),
+            None
+        );
+    }
 
     #[test]
     fn vcpu_init_unprotected_kernel() {

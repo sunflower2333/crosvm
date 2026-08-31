@@ -378,6 +378,9 @@ pub struct PciConfiguration {
     writable_bits: [u32; NUM_CONFIGURATION_REGISTERS], // writable bits for each register.
     bar_used: [bool; NUM_BAR_REGS],
     bar_configs: [Option<PciBarConfiguration>; NUM_BAR_REGS],
+    // A locked BAR cannot move, but it still has to answer the standard all-ones size probe.
+    bar_address_locked: [bool; NUM_BAR_REGS],
+    bar_probe: [bool; NUM_BAR_REGS],
     // Contains the byte offset and size of the last capability.
     last_capability: Option<(usize, usize)>,
     capability_configs: BTreeMap<usize, Box<dyn PciCapConfig>>,
@@ -398,6 +401,10 @@ pub struct PciConfigurationSerialized {
     writable_bits: [u32; NUM_CONFIGURATION_REGISTERS],
     bar_used: [bool; NUM_BAR_REGS],
     bar_configs: [Option<PciBarConfiguration>; NUM_BAR_REGS],
+    #[serde(default)]
+    bar_address_locked: [bool; NUM_BAR_REGS],
+    #[serde(default)]
+    bar_probe: [bool; NUM_BAR_REGS],
     last_capability: Option<(usize, usize)>,
 }
 
@@ -530,6 +537,8 @@ impl PciConfiguration {
             writable_bits,
             bar_used: [false; NUM_BAR_REGS],
             bar_configs: [None; NUM_BAR_REGS],
+            bar_address_locked: [false; NUM_BAR_REGS],
+            bar_probe: [false; NUM_BAR_REGS],
             last_capability: None,
             capability_configs: BTreeMap::new(),
             mmio_mapping: None,
@@ -560,6 +569,9 @@ impl PciConfiguration {
         offset: u64,
         data: &[u8],
     ) -> Option<Box<dyn PciCapConfigWriteResult>> {
+        if self.handle_locked_bar_write(reg_idx, offset, data) {
+            return None;
+        }
         let reg_offset = reg_idx * 4 + offset as usize;
         match data.len() {
             1 => self.write_byte(reg_offset, data[0]),
@@ -749,6 +761,123 @@ impl PciConfiguration {
         Ok(config.bar_idx)
     }
 
+    /// Prevent a BAR's address registers from being rewritten by the guest.
+    ///
+    /// Some device mappings are installed at VM creation and cannot be moved after the
+    /// hypervisor has established their stage-2 mapping.  Such devices can lock the address
+    /// after `add_pci_bar`; the BAR type/prefetch bits remain read-only as usual, while the
+    /// address itself is reported unchanged for all subsequent config-space accesses.
+    pub fn lock_bar_address(&mut self, bar_num: PciBarIndex) -> Result<()> {
+        let config = self
+            .bar_configs
+            .get(bar_num)
+            .and_then(|config| *config)
+            .ok_or(Error::BarInvalid(bar_num))?;
+        let reg_idx = config.reg_index();
+        let address_mask = match config.region_type {
+            PciBarRegionType::IoRegion => BAR_IO_ADDR_MASK,
+            PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
+                BAR_MEM_ADDR_MASK
+            }
+        };
+        self.writable_bits[reg_idx] &= !address_mask;
+        if config.region_type == PciBarRegionType::Memory64BitRegion {
+            self.writable_bits[reg_idx + 1] = 0;
+        }
+        self.bar_address_locked[bar_num] = true;
+        Ok(())
+    }
+
+    /// Handle config writes for a BAR whose host mapping cannot be relocated. Firmware still
+    /// probes BAR size by writing all ones, so expose the usual size mask temporarily while
+    /// retaining the allocated address for bus-range bookkeeping and host access.
+    fn handle_locked_bar_write(&mut self, reg_idx: usize, offset: u64, data: &[u8]) -> bool {
+        let Some((bar_num, _)) =
+            self.bar_configs
+                .iter()
+                .enumerate()
+                .find_map(|(bar_num, config)| {
+                    let config = config.as_ref()?;
+                    if !self.bar_address_locked[bar_num] {
+                        return None;
+                    }
+                    let low = config.reg_index();
+                    if reg_idx == low {
+                        Some((bar_num, false))
+                    } else if config.is_64bit_memory() && reg_idx == low + 1 {
+                        Some((bar_num, true))
+                    } else {
+                        None
+                    }
+                })
+        else {
+            return false;
+        };
+
+        if offset == 0
+            && data.len() == 4
+            && u32::from_le_bytes(data.try_into().unwrap()) == u32::MAX
+        {
+            if !self.bar_probe[bar_num] {
+                self.bar_probe[bar_num] = true;
+                self.write_locked_bar_probe(bar_num);
+            }
+        } else {
+            self.bar_probe[bar_num] = false;
+            self.restore_locked_bar_address(bar_num);
+        }
+        true
+    }
+
+    fn write_locked_bar_probe(&mut self, bar_num: PciBarIndex) {
+        let Some(config) = self.bar_configs[bar_num] else {
+            return;
+        };
+        let reg_idx = config.reg_index();
+        let lower_bits = if config.is_io() {
+            config.region_type as u32
+        } else {
+            config.region_type as u32 | config.prefetchable as u32
+        };
+        self.do_write(
+            reg_idx,
+            (!(config.size - 1) as u32
+                & if config.is_io() {
+                    BAR_IO_ADDR_MASK
+                } else {
+                    BAR_MEM_ADDR_MASK
+                })
+                | lower_bits,
+        );
+        if config.is_64bit_memory() {
+            self.do_write(reg_idx + 1, (!((config.size - 1) >> 32)) as u32);
+        }
+    }
+
+    fn restore_locked_bar_address(&mut self, bar_num: PciBarIndex) {
+        let Some(config) = self.bar_configs[bar_num] else {
+            return;
+        };
+        let reg_idx = config.reg_index();
+        let lower_bits = if config.is_io() {
+            config.region_type as u32
+        } else {
+            config.region_type as u32 | config.prefetchable as u32
+        };
+        let address_mask = if config.is_io() {
+            BAR_IO_ADDR_MASK
+        } else {
+            BAR_MEM_ADDR_MASK
+        };
+        self.do_write(
+            reg_idx,
+            (config.address() as u32 & address_mask) | lower_bits,
+        );
+        if config.is_64bit_memory() {
+            self.do_write(reg_idx + 1, (config.address() >> 32) as u32);
+        }
+    }
+
     /// Returns an iterator of the currently configured base address registers.
     #[allow(dead_code)] // TODO(dverkamp): remove this once used
     pub fn get_bars(&self) -> PciBarIter {
@@ -792,10 +921,16 @@ impl PciConfiguration {
             BAR0_REG + bar_num
         };
 
-        let bar_type = match self.get_bar_type(bar_num) {
-            Some(t) => t,
+        let config = match self.bar_configs.get(bar_num).and_then(|config| *config) {
+            Some(config) => config,
             None => return 0,
         };
+
+        if self.bar_address_locked[bar_num] {
+            return config.address();
+        }
+
+        let bar_type = config.region_type;
 
         match bar_type {
             PciBarRegionType::IoRegion => u64::from(self.registers[bar_idx] & BAR_IO_ADDR_MASK),
@@ -912,6 +1047,8 @@ impl PciConfiguration {
             writable_bits: self.writable_bits,
             bar_used: self.bar_used,
             bar_configs: self.bar_configs,
+            bar_address_locked: self.bar_address_locked,
+            bar_probe: self.bar_probe,
             last_capability: self.last_capability,
         })
         .context("failed to serialize PciConfiguration")
@@ -924,6 +1061,8 @@ impl PciConfiguration {
         self.writable_bits = deser.writable_bits;
         self.bar_used = deser.bar_used;
         self.bar_configs = deser.bar_configs;
+        self.bar_address_locked = deser.bar_address_locked;
+        self.bar_probe = deser.bar_probe;
         self.last_capability = deser.last_capability;
         // Restore everything via do_write to avoid writing to the header type register
         // and clobbering the multi-function device bit, as that bit is managed by the
@@ -1346,6 +1485,76 @@ mod tests {
             })
         );
         assert_eq!(bar_iter.next(), None);
+    }
+
+    #[test]
+    fn lock_pci_bar_address_rejects_guest_reprogramming() {
+        let mut cfg = PciConfiguration::new(
+            0x1234,
+            0x5678,
+            PciClassCode::MultimediaController,
+            &PciMultimediaSubclass::AudioController,
+            Some(&TestPI::Test),
+            PciHeaderType::Device,
+            0xABCD,
+            0x2468,
+            0,
+        );
+
+        cfg.add_pci_bar(
+            PciBarConfiguration::new(
+                2,
+                0x1000,
+                PciBarRegionType::Memory64BitRegion,
+                PciBarPrefetchable::Prefetchable,
+            )
+            .set_address(0x1_0000_2000),
+        )
+        .expect("add_pci_bar failed");
+        cfg.lock_bar_address(2).expect("lock_bar_address failed");
+
+        cfg.write_reg(4 + 2, 0, &0xDEAD_B000u32.to_le_bytes());
+        cfg.write_reg(4 + 3, 0, &0x0000_0002u32.to_le_bytes());
+
+        assert_eq!(cfg.get_bar_addr(2), 0x1_0000_2000);
+    }
+
+    #[test]
+    fn lock_pci_bar_address_answers_64bit_size_probe() {
+        let mut cfg = PciConfiguration::new(
+            0x1234,
+            0x5678,
+            PciClassCode::MultimediaController,
+            &PciMultimediaSubclass::AudioController,
+            Some(&TestPI::Test),
+            PciHeaderType::Device,
+            0xABCD,
+            0x2468,
+            0,
+        );
+        let address = 0x1_0100_0000;
+        let size = 0x0080_0000;
+        cfg.add_pci_bar(
+            PciBarConfiguration::new(
+                2,
+                size,
+                PciBarRegionType::Memory64BitRegion,
+                PciBarPrefetchable::Prefetchable,
+            )
+            .set_address(address),
+        )
+        .expect("add_pci_bar failed");
+        cfg.lock_bar_address(2).expect("lock_bar_address failed");
+
+        cfg.write_reg(BAR0_REG + 2, 0, &u32::MAX.to_le_bytes());
+        assert_eq!(cfg.read_reg(BAR0_REG + 2), 0xff80_000c);
+        assert_eq!(cfg.read_reg(BAR0_REG + 3), 0xffff_ffff);
+        assert_eq!(cfg.get_bar_addr(2), address);
+
+        cfg.write_reg(BAR0_REG + 2, 0, &(address as u32).to_le_bytes());
+        assert_eq!(cfg.read_reg(BAR0_REG + 2), 0x0100_000c);
+        assert_eq!(cfg.read_reg(BAR0_REG + 3), 0x0000_0001);
+        assert_eq!(cfg.get_bar_addr(2), address);
     }
 
     #[test]

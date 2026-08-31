@@ -11,6 +11,7 @@ use anyhow::anyhow;
 use anyhow::Context;
 use base::debug;
 use base::error;
+use base::info;
 use base::trace;
 use base::AsRawDescriptor;
 use base::AsRawDescriptors;
@@ -816,14 +817,27 @@ impl PciDevice for VirtioPciDevice {
         allocate_device_bars(
             self,
             |size: u64, alloc: Alloc, alloc_option: &AllocOptions| {
-                resources
+                if std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some() {
+                    info!(
+                        "GPU-BAR-ALLOC: device={} request size={:#x} alloc={:?} options={:?}",
+                        device_type, size, alloc, alloc_option,
+                    );
+                }
+                let allocated = resources
                     .allocate_mmio(
                         size,
                         alloc,
                         format!("virtio-{}-custom_bar", device_type),
                         alloc_option,
                     )
-                    .map_err(|e| PciDeviceError::IoAllocationFailed(size, e))
+                    .map_err(|e| PciDeviceError::IoAllocationFailed(size, e))?;
+                if std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some() {
+                    info!(
+                        "GPU-BAR-ALLOC: device={} result address={:#x} size={:#x}",
+                        device_type, allocated, size,
+                    );
+                }
+                Ok(allocated)
             },
         )
     }
@@ -1174,10 +1188,34 @@ where
                 .align(config.size()),
         )?;
         let config = config.set_address(device_addr);
+        if std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some() {
+            info!(
+                "GPU-BAR-CONFIG: device={} bar={} address={:#x} size={:#x} 64bit={} prefetchable={}",
+                virtio_pci_device.device.device_type(),
+                config.bar_index(),
+                config.address(),
+                config.size(),
+                config.is_64bit_memory(),
+                config.is_prefetchable(),
+            );
+        }
         let _device_bar = virtio_pci_device
             .config_regs
             .add_pci_bar(config)
             .map_err(|e| PciDeviceError::IoRegistrationFailed(device_addr, e))?;
+        if std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some()
+            && config.bar_index() == SHMEM_BAR_NUM
+        {
+            virtio_pci_device
+                .config_regs
+                .lock_bar_address(config.bar_index())
+                .map_err(|e| PciDeviceError::IoRegistrationFailed(device_addr, e))?;
+            info!(
+                "GPU-BAR-CONFIG: locked prebacked shared-memory BAR={} at {:#x}",
+                config.bar_index(),
+                device_addr,
+            );
+        }
         ranges.push(BarRange {
             addr: device_addr,
             size: config.size(),
@@ -1199,6 +1237,18 @@ where
         virtio_pci_device
             .device
             .set_shared_memory_region(shmem_region);
+        if std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some() {
+            for bar in virtio_pci_device.config_regs.get_bars() {
+                info!(
+                    "GPU-BAR-CONFIG: final bar={} address={:#x} size={:#x} 64bit={} prefetchable={}",
+                    bar.bar_index(),
+                    bar.address(),
+                    bar.size(),
+                    bar.is_64bit_memory(),
+                    bar.is_prefetchable(),
+                );
+            }
+        }
     }
 
     Ok(ranges)
@@ -1634,10 +1684,16 @@ impl SharedMemoryMapper for VmRequester {
     }
 
     fn remove_mapping(&mut self, offset: u64) -> anyhow::Result<()> {
-        let id = self.mappings.remove(&offset).context("invalid offset")?;
+        let id = *self.mappings.get(&offset).context("invalid offset")?;
         self.vm_memory_client
             .unregister_memory(id)
-            .context("unregister_memory failed")
+            .context("unregister_memory failed")?;
+        // Keep the bookkeeping entry until the hypervisor confirms the
+        // unregister.  A failed unregister is retryable; removing it first
+        // would turn the next UNMAP into an "invalid offset" and leak the
+        // mapping permanently.
+        self.mappings.remove(&offset);
+        Ok(())
     }
 
     fn as_raw_descriptor(&self) -> Option<RawDescriptor> {

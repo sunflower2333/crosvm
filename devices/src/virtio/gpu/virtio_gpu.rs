@@ -19,6 +19,8 @@ use std::time::Instant;
 use anyhow::Context;
 use base::error;
 use base::info;
+#[cfg(unix)]
+use base::AsRawDescriptor;
 use base::linux::MemoryMappingBuilderUnix;
 use base::FromRawDescriptor;
 use base::IntoRawDescriptor;
@@ -119,6 +121,68 @@ fn drm2kgsl_bar_range_is_valid(
 fn pool_offset_to_wire(pool_offset: u64) -> Option<u32> {
     u32::try_from(pool_offset).ok()
 }
+
+/// Log the first bytes of the descriptor source used for a pre-backed native
+/// control BAR mapping. This is intentionally diagnostic-only: the descriptor
+/// remains owned by the source and the read does not alter its file position.
+#[cfg(unix)]
+fn diag_log_native_control_source(source: Option<&VmMemorySource>, guest_offset: u64) {
+    if std::env::var("CROSVM_DRM2KGSL_DIAG").map_or(true, |value| value != "0") {
+        let Some(VmMemorySource::Descriptor {
+            descriptor,
+            offset,
+            size,
+        }) = source
+        else {
+            base::info!(
+                "GPU-MAPBLOB: native control source is not a descriptor (guest_offset={:#x})",
+                guest_offset,
+            );
+            return;
+        };
+
+        let mut bytes = [0u8; 16];
+        let representable = (*offset as libc::off_t) >= 0
+            && (*offset as libc::off_t as u64) == *offset;
+        let read = if representable && *size >= bytes.len() as u64 {
+            // SAFETY: `bytes` is writable for its full length and the descriptor
+            // is borrowed for the duration of this call.
+            unsafe {
+                libc::pread(
+                    descriptor.as_raw_descriptor(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                    *offset as libc::off_t,
+                )
+            }
+        } else {
+            -1
+        };
+        let words = [
+            u32::from_ne_bytes(bytes[0..4].try_into().unwrap()),
+            u32::from_ne_bytes(bytes[4..8].try_into().unwrap()),
+            u32::from_ne_bytes(bytes[8..12].try_into().unwrap()),
+            u32::from_ne_bytes(bytes[12..16].try_into().unwrap()),
+        ];
+        base::info!(
+            "GPU-MAPBLOB: native control source fd={} guest_offset={:#x} file_offset={:#x} size={:#x} read={} representable={} words={:08x}/{:08x}/{:08x}/{:08x}",
+            descriptor.as_raw_descriptor(),
+            guest_offset,
+            offset,
+            size,
+            read,
+            representable,
+            words[0],
+            words[1],
+            words[2],
+            words[3],
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn diag_log_native_control_source(_source: Option<&VmMemorySource>, _guest_offset: u64) {}
+
 // A guest-pool blob must be at least this large to be retained as a possible scanout source (its
 // udmabuf duped for direct display import in `try_import_resource_to_display`). Real scanouts are
 // multi-MiB; gating on size keeps us from holding an extra fd for every small guest BO (which can
@@ -1273,6 +1337,10 @@ pub struct VirtioGpu {
     scanouts_updated: Arc<AtomicBool>,
     cursor_scanout: VirtioGpuScanout,
     mapper: Arc<Mutex<Option<Box<dyn SharedMemoryMapper>>>>,
+    // Keep a clone of the active guest memory so a device reset can release any
+    // growable-pool grants held by guest-backed blobs after the renderer drops
+    // its resources.  GuestMemory is Arc-backed, so this does not duplicate RAM.
+    guest_memory: Option<GuestMemory>,
     rutabaga: Rutabaga,
     resources: Map<u32, VirtioGpuResource>,
     external_blob: bool,
@@ -1416,6 +1484,7 @@ impl VirtioGpu {
             scanouts_updated: display_event,
             cursor_scanout,
             mapper,
+            guest_memory: None,
             rutabaga,
             resources: Default::default(),
             external_blob,
@@ -2075,6 +2144,23 @@ impl VirtioGpu {
         let mut pool_iovecs: Option<Vec<(usize, usize)>> = None;
         let mut pool_refs: Option<Vec<(GuestAddress, usize)>> = None;
 
+        // CREATE_GUEST_HANDLE is the host-backed half of HOST3D_GUEST.  A
+        // BLOB_MEM_GUEST resource never calls the renderer's get_blob() hook,
+        // so parking a dma-buf for that combination would leave an fd pending
+        // until context teardown and would not create a GPU object.
+        if resource_create_blob.blob_flags & VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE != 0
+            && (resource_create_blob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST
+                || vecs.is_empty())
+        {
+            base::error!(
+                "GUEST-ALLOC: invalid CREATE_GUEST_HANDLE blob res={} mem={} nvecs={}",
+                resource_id,
+                resource_create_blob.blob_mem,
+                vecs.len(),
+            );
+            return Err(ErrInvalidParameter);
+        }
+
         if resource_create_blob.blob_flags & VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE != 0 {
             // debug!, like the GPU-MAPBLOB traces below: this fires once per blob creation,
             // which is hundreds per desktop session and thousands under a benchmark.
@@ -2213,6 +2299,27 @@ impl VirtioGpu {
     /// When sandboxing is enabled, external_blob is set and opaque fds must be mapped in the
     /// hypervisor process by Vulkano using metadata provided by Rutabaga::vulkan_info().
     pub fn resource_map_blob(&mut self, resource_id: u32, offset: u64) -> VirtioGpuResult {
+        // A second MAP_BLOB without an intervening UNMAP would overwrite the
+        // old hypervisor mapping and leak either the mapping slot or a renderer
+        // CPU map.  Keep the operation fail-closed so the guest must reconcile
+        // the first mapping before asking for another one.
+        {
+            let resource = self
+                .resources
+                .get(&resource_id)
+                .ok_or(ErrInvalidResourceId)?;
+            if resource.shmem_offset.is_some()
+                || resource.pool_offset.is_some()
+                || resource.prebacked_bar
+            {
+                base::error!(
+                    "GPU-MAPBLOB: res={} already has an active mapping",
+                    resource_id
+                );
+                return Err(ErrInvalidParameter);
+            }
+        }
+
         // PRE-ALLOC, either renderer: a pool-resident blob is already in the guest's stage-2
         // (its pool was SHARE-blessed at boot). Don't runtime-SHARE anything and don't touch the
         // BAR -- just tell the guest its pool byte offset. It maps pool_gpa + offset directly
@@ -2275,12 +2382,16 @@ impl VirtioGpu {
                     );
                     ErrUnspec
                 })?;
+                let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
                 let resource = self
                     .resources
                     .get_mut(&resource_id)
                     .ok_or(ErrInvalidResourceId)?;
                 resource.pool_offset = Some(pool_offset);
-                let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+                resource.transition_display_import(
+                    &mut self.display.borrow_mut(),
+                    DisplayImportState::Unknown,
+                );
                 base::debug!(
                     "GPU-MAPBLOB: res={} POOL-resident offset={:#x} (no SHARE)",
                     resource_id,
@@ -2433,11 +2544,21 @@ impl VirtioGpu {
             }
         };
 
+        if native_control_blob {
+            diag_log_native_control_source(source.as_ref(), offset);
+        }
+
         let prot = match map_info & RUTABAGA_MAP_ACCESS_MASK {
             RUTABAGA_MAP_ACCESS_READ => Protection::read(),
             RUTABAGA_MAP_ACCESS_WRITE => Protection::write(),
             RUTABAGA_MAP_ACCESS_RW => Protection::read_write(),
-            _ => return Err(ErrUnspec),
+            _ => {
+                if resource.rutabaga_external_mapping {
+                    let _ = self.rutabaga.unmap(resource_id);
+                    resource.rutabaga_external_mapping = false;
+                }
+                return Err(ErrUnspec);
+            }
         };
 
         let cache = if cfg!(feature = "noncoherent-dma")
@@ -2472,6 +2593,10 @@ impl VirtioGpu {
                     prot,
                     e
                 );
+                if resource.rutabaga_external_mapping {
+                    let _ = self.rutabaga.unmap(resource_id);
+                    resource.rutabaga_external_mapping = false;
+                }
                 return Err(ErrUnspec);
             }
         };
@@ -2514,6 +2639,11 @@ impl VirtioGpu {
             return Ok(OkNoData);
         }
 
+        if resource.rutabaga_external_mapping {
+            self.rutabaga.unmap(resource_id)?;
+            resource.rutabaga_external_mapping = false;
+        }
+
         let shmem_offset = resource.shmem_offset.ok_or(ErrUnspec)?;
         self.mapper
             .lock()
@@ -2522,11 +2652,6 @@ impl VirtioGpu {
             .remove_mapping(shmem_offset)
             .map_err(|_| ErrUnspec)?;
         resource.shmem_offset = None;
-
-        if resource.rutabaga_external_mapping {
-            self.rutabaga.unmap(resource_id)?;
-            resource.rutabaga_external_mapping = false;
-        }
 
         Ok(OkNoData)
     }
@@ -2767,8 +2892,20 @@ impl VirtioGpu {
                 resource.transition_display_import(&mut display, DisplayImportState::Unknown);
             }
         }
-        self.resources.clear();
         self.rutabaga.reset().context("failed to reset rutabaga")?;
+        // The renderer has now released every backend resource, so it is safe
+        // to drop the VMM's references on growable-pool ranges.  Keep the
+        // GuestMemory clone across reset for the next activation; it is the
+        // same VM RAM and is replaced on resume if the transport supplies a
+        // new handle.
+        if let Some(mem) = self.guest_memory.clone() {
+            for resource in self.resources.values_mut() {
+                if let Some(refs) = resource.pool_refs.take() {
+                    mem.pool_unref_iovecs(&refs[..]);
+                }
+            }
+        }
+        self.resources.clear();
         Ok(())
     }
 
@@ -2819,6 +2956,7 @@ impl VirtioGpu {
     }
 
     pub fn resume(&mut self, mem: &GuestMemory) -> anyhow::Result<()> {
+        self.guest_memory = Some(mem.clone());
         if let Some(snapshot) = self.deferred_snapshot_load.take() {
             assert!(self.scanouts.keys().eq(snapshot.scanouts.keys()));
             for (i, s) in snapshot.scanouts.into_iter() {

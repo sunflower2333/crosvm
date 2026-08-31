@@ -3226,4 +3226,44 @@ mod tests {
             None
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_source_offset_maps_expected_file_bytes() {
+        use std::io::Write;
+
+        let mut file = tempfile::tempfile().expect("create descriptor fixture");
+        file.write_all(&[0xa5; 4096])
+            .expect("write descriptor prefix");
+        let expected = [
+            0x2000_0001u32,
+            0x2000_0002u32,
+            0x2000_0003u32,
+            0x2000_0004u32,
+        ];
+        for word in expected {
+            file.write_all(&word.to_ne_bytes())
+                .expect("write descriptor header");
+        }
+
+        let source = VmMemorySource::Descriptor {
+            descriptor: file.into(),
+            offset: 4096,
+            size: 16,
+        };
+        let (mapping, size, _) = source
+            .map_without_gralloc(Protection::read())
+            .expect("map descriptor fixture");
+        assert_eq!(size, 16);
+
+        // SAFETY: `mapping` owns a readable 16-byte mapping for this assertion.
+        let mapped = unsafe { std::slice::from_raw_parts(mapping.as_ptr(), 16) };
+        for (index, word) in expected.iter().enumerate() {
+            let start = index * 4;
+            assert_eq!(
+                u32::from_ne_bytes(mapped[start..start + 4].try_into().unwrap()),
+                *word
+            );
+        }
+    }
 }

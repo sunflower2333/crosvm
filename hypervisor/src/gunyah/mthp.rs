@@ -42,9 +42,7 @@ const MADV_POPULATE_READ: i32 = 22;
 
 // ── mTHP sizes to enable ────────────────────────────────────────────────────
 
-static MTHP_SIZES: &[&str] = &[
-    "16kB", "32kB", "64kB", "128kB", "256kB", "512kB", "1024kB",
-];
+static MTHP_SIZES: &[&str] = &["16kB", "32kB", "64kB", "128kB", "256kB", "512kB", "1024kB"];
 
 // ── collapse cascade table ──────────────────────────────────────────────────
 
@@ -55,12 +53,36 @@ struct CollapseLevel {
 }
 
 static COLLAPSE_LEVELS: &[CollapseLevel] = &[
-    CollapseLevel { size: 2 * 1024 * 1024, order: 9, name: "2MB" },
-    CollapseLevel { size: 1024 * 1024, order: 8, name: "1MB" },
-    CollapseLevel { size: 512 * 1024, order: 7, name: "512KB" },
-    CollapseLevel { size: 256 * 1024, order: 6, name: "256KB" },
-    CollapseLevel { size: 128 * 1024, order: 5, name: "128KB" },
-    CollapseLevel { size: 64 * 1024, order: 4, name: "64KB" },
+    CollapseLevel {
+        size: 2 * 1024 * 1024,
+        order: 9,
+        name: "2MB",
+    },
+    CollapseLevel {
+        size: 1024 * 1024,
+        order: 8,
+        name: "1MB",
+    },
+    CollapseLevel {
+        size: 512 * 1024,
+        order: 7,
+        name: "512KB",
+    },
+    CollapseLevel {
+        size: 256 * 1024,
+        order: 6,
+        name: "256KB",
+    },
+    CollapseLevel {
+        size: 128 * 1024,
+        order: 5,
+        name: "128KB",
+    },
+    CollapseLevel {
+        size: 64 * 1024,
+        order: 4,
+        name: "64KB",
+    },
 ];
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -152,7 +174,11 @@ pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResu
     }
 
     // Request THPs for the whole region
-    let ret = libc::madvise(host_addr as *mut libc::c_void, size as usize, libc::MADV_HUGEPAGE);
+    let ret = libc::madvise(
+        host_addr as *mut libc::c_void,
+        size as usize,
+        libc::MADV_HUGEPAGE,
+    );
     info!(
         "GH: MADV_HUGEPAGE: {}",
         if ret == 0 { "OK" } else { "FAILED" }
@@ -275,8 +301,11 @@ pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResu
             if order_map[mi] == 0 {
                 let off = mi as u64 * MAP_UNIT;
                 let ptr = host_addr.add(off as usize);
-                let ret =
-                    libc::madvise(ptr as *mut libc::c_void, MAP_UNIT as usize, MADV_POPULATE_WRITE);
+                let ret = libc::madvise(
+                    ptr as *mut libc::c_void,
+                    MAP_UNIT as usize,
+                    MADV_POPULATE_WRITE,
+                );
                 if ret != 0 {
                     let npages = MAP_UNIT / 4096;
                     for pg in 0..npages {
@@ -328,8 +357,11 @@ pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResu
     // cannot serve a page returns an error here instead of silently leaving a hole
     // that only surfaces as a SIGBUS on first guest/host touch. Safe (no crash risk)
     // unlike a manual read/write touch of memory that might not be backed.
-    let verify_ret =
-        libc::madvise(host_addr as *mut libc::c_void, size as usize, MADV_POPULATE_READ);
+    let verify_ret = libc::madvise(
+        host_addr as *mut libc::c_void,
+        size as usize,
+        MADV_POPULATE_READ,
+    );
     let populated = verify_ret == 0;
     if populated {
         info!("GH: verify (MADV_POPULATE_READ): OK, region fully backed");
@@ -615,10 +647,7 @@ pub fn compute_lend_chunks(total_size: u64, prep: Option<&LendPrepResult>) -> Ve
             }
         }
 
-        info!(
-            "GH: THP-aware split done: {} LEND slots",
-            chunks.len()
-        );
+        info!("GH: THP-aware split done: {} LEND slots", chunks.len());
     } else {
         // Fallback: fixed 256 MB chunks
         let num = (total_size + LEND_CHUNK_SIZE - 1) / LEND_CHUNK_SIZE;

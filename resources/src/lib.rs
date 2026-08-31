@@ -19,8 +19,15 @@ pub use crate::system_allocator::SystemAllocatorConfig;
 
 pub mod address_allocator;
 mod address_range;
+mod gunyah_layout;
 mod pci_address;
 mod system_allocator;
+
+pub use crate::gunyah_layout::{
+    checked_align_up, compute_gunyah_mmio_layout, compute_gunyah_size_max, GunyahMmioLayout,
+    GUNYAH_DEFAULT_BAR_ALIGNMENT, GUNYAH_HIGH_MMIO_MIN_BASE, GUNYAH_HIGH_MMIO_SLACK,
+    GUNYAH_SIZE_MAX_GRANULARITY, GUNYAH_SIZE_MAX_MINIMUM,
+};
 
 /// Used to tag SystemAllocator allocations.
 #[derive(Debug, Eq, PartialEq, Hash, Copy, Clone, Serialize, Deserialize)]
