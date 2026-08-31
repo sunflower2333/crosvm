@@ -19,6 +19,12 @@ use serde_keyvalue::FromKeyValues;
 
 use super::*;
 use crate::crosvm::config::Config;
+#[cfg(any(feature = "vnc", feature = "android_display"))]
+use crate::crosvm::config::DisplayScreen;
+#[cfg(feature = "vnc")]
+use crate::crosvm::config::DEFAULT_VNC_HOST;
+#[cfg(feature = "vnc")]
+use crate::crosvm::config::DEFAULT_VNC_PORT;
 
 pub struct GpuCacheInfo<'a> {
     directory: Option<&'a str>,
@@ -122,6 +128,10 @@ pub fn get_gpu_cache_info<'a>(
     }
 }
 
+/// `vnc_input` carries what a VNC exporter bound to `gpu-0` injects into: this screen's own
+/// absolute pointer and keyboard. Built by the caller, because the virtio-input devices behind them
+/// go into the same device list as this one and only the caller holds it. Empty on every other
+/// configuration -- no VNC binding on this screen, a `view-only=true` one, or a native exporter.
 pub fn create_gpu_device(
     cfg: &Config,
     exit_evt_wrtube: &SendTube,
@@ -130,9 +140,7 @@ pub fn create_gpu_device(
     render_server_fd: Option<SafeDescriptor>,
     has_vfio_gfx_device: bool,
     event_devices: Vec<EventDevice>,
-    // Frames from the VMM's simplefb bridge, presented through this device's display whenever
-    // the guest is not driving it itself. See `ExternalScanout`.
-    external_scanout: Option<Arc<virtio::ExternalScanout>>,
+    #[cfg(feature = "vnc")] vnc_input: gpu_display::VncBindingInput,
 ) -> DeviceResult {
     let is_sandboxed = cfg.jail_config.is_some();
     let mut gpu_params = cfg.gpu_parameters.clone().unwrap();
@@ -154,11 +162,9 @@ pub fn create_gpu_device(
         gpu_params.snapshot_scratch_path = Some(Path::new("/tmpfs-gpu-snapshot").to_path_buf());
     }
 
-    // DroidVM: plumb the gfxstream-consumed knobs to the in-process backend as env, set here
-    // before the GPU/jail process forks so they are inherited and read on the first blob create.
-    // (The folio *policy* lives on `--runtime-share` / hv_cfg and is applied VMM-side in
-    // prepare_runtime_blob_backing; the VRAM quota is metered GPU-side. gfxstream no longer reads
-    // any GFXSTREAM_VRAM_* env.)
+    // DroidVM: plumb gfxstream's host-allocation knobs to the in-process renderer before the
+    // GPU/jail process forks. They describe how gfxstream backs the fresh shmem it allocates and
+    // hands to the host Vulkan driver; generic VM memory registration never reads them.
     //
     // Only when gfxstream is the renderer. One binary carries both backends and the drm2kgsl
     // native context runs through virglrenderer, where every name below is dead weight -- and
@@ -166,25 +172,46 @@ pub fn create_gpu_device(
     // anyone debugging one.
     #[cfg(feature = "gfxstream")]
     if gpu_params.mode == devices::virtio::GpuMode::ModeGfxstream {
-        // Fusion size gate (CMDLINE_V2 v3): exported only when fusion routing is enabled
-        // (udmabuf=false + vram-limit defined and != 0); the pool's own existence is signalled
-        // separately via GFXSTREAM_POOL_FD (--pre-alloc gfx-mb). Absent/0 => no gate.
-        if !gpu_params.udmabuf && gpu_params.vram_limit.map_or(false, |n| n != 0) {
+        // Presence is the dynamic-VRAM switch. A value of 0 is an unmetered configuration, not
+        // "off"; absence is what keeps this renderer allocation policy disabled.
+        let host_dynamic = !gpu_params.udmabuf && gpu_params.vram_limit.is_some();
+        // All of these have a consumer only for gfxstream host-alloc with dynamic VRAM enabled.
+        if host_dynamic {
             env::set_var(
                 "GFXSTREAM_POOL_BLOB_MAX_KB",
                 gpu_params.pool_blob_max_kb.unwrap_or(4096).to_string(),
             );
-        }
-        // Runtime-share budget capacity for gfxstream's host-side VK_EXT_memory_budget fill
-        // (read from this env in on_vkGetPhysicalDeviceMemoryProperties2): the runtime-share
-        // side of the host-visible heap is capped by vram-limit. -1 (unlimited-but-defined)
-        // exports a sentinel above any heap size so gfxstream's own clamp to the emulated
-        // host-visible heap governs. Unset (0 / guest-alloc) => gfxstream leaves the driver
-        // budget untouched.
-        match gpu_params.vram_limit {
-            Some(n) if n > 0 => env::set_var("GFXSTREAM_VRAM_BUDGET_MB", n.to_string()),
-            Some(-1) => env::set_var("GFXSTREAM_VRAM_BUDGET_MB", "1048576"), // 1 TiB sentinel
-            _ => {}
+            let limit_mb = match gpu_params.vram_limit {
+                Some(n) if n > 0 => n.to_string(),
+                // Explicitly unlimited: use a sentinel above any emulated heap. gfxstream still
+                // clamps the value it reports to the guest heap size.
+                _ => "1048576".to_string(), // 1 TiB
+            };
+            env::set_var("GFXSTREAM_VRAM_LIMIT_MB", &limit_mb);
+            env::set_var("GFXSTREAM_VRAM_BUDGET_MB", limit_mb);
+            env::set_var(
+                "GFXSTREAM_VRAM_FOLIO_THRESHOLD_KB",
+                gpu_params.vram_folio_threshold_kb.unwrap_or(1024).to_string(),
+            );
+            env::set_var(
+                "GFXSTREAM_VRAM_EXCEED_POLICY",
+                match gpu_params.vram_exceed_policy {
+                    Some(devices::virtio::gpu::VramExceedPolicy::Oom) => "oom",
+                    _ => "fallback",
+                },
+            );
+        } else {
+            // Do not let a launcher environment opt guest-alloc or static host-alloc into a
+            // renderer policy that belongs exclusively to dynamic host-alloc.
+            for name in [
+                "GFXSTREAM_POOL_BLOB_MAX_KB",
+                "GFXSTREAM_VRAM_LIMIT_MB",
+                "GFXSTREAM_VRAM_BUDGET_MB",
+                "GFXSTREAM_VRAM_FOLIO_THRESHOLD_KB",
+                "GFXSTREAM_VRAM_EXCEED_POLICY",
+            ] {
+                env::remove_var(name);
+            }
         }
         // Guest-alloc pool partition: the host-owned slice serving all gfx host-alloc requests
         // (ASG rings etc.). Only meaningful with udmabuf=true; consumed by gfxstream in the
@@ -241,42 +268,58 @@ pub fn create_gpu_device(
         virtio::DisplayBackend::Stub,
     ];
 
+    // This device provides one screen, `gpu-0`, so it takes the one exporter bound to that screen
+    // and nothing else. An exporter bound to `simplefb` belongs to the simplefb device's screen,
+    // which presents on its own display and is no part of this.
+    //
+    // `display_backends` remains an ordered try-in-turn list, but the two entries that used to
+    // race for the front of it can no longer both be here: config rejects two exporters on one
+    // screen, so at most one of the two inserts below runs. The list is a fallback chain again
+    // (Wayland/X/Stub), not a silent winner-takes-all -- which is what it was when
+    // `insert(0, Android)` followed by `insert(0, VncTcp)` put VNC in front and left
+    // `AServiceManager_addService` uncalled, so the app's native display waited on a binder that
+    // was never registered.
+    //
+    // The exporter also carries this binding's transport ceiling, collected alongside the backend
+    // it belongs to. At most one of the two arms below runs (config rejects two exporters on one
+    // screen), so there is exactly one answer here, and no binding at all means the default: take
+    // whatever gets negotiated.
+    #[cfg(any(feature = "vnc", feature = "android_display"))]
+    let mut transport_cap = crate::crosvm::config::TransportCap::Auto;
+
     #[cfg(feature = "android_display")]
-    if let Some(service_name) = &cfg.android_display_service {
-        // The GPU device owns this sink even when `--simplefb` is also configured: it registers
-        // the one ICrosvmAndroidDisplayService the app hands its Surface to, and the simplefb
-        // bridge feeds its frames through the same device (ExternalScanout) instead of opening a
-        // second display under the same name. Two registrations under one name is what made the
-        // app's Surface go to whichever producer won the race, with the loser drawing into
-        // nothing for the rest of the VM's life.
-        display_backends.insert(0, virtio::DisplayBackend::Android(service_name.to_string()));
+    if let Some(service) = cfg.android_display_service_for(DisplayScreen::Gpu0) {
+        display_backends.insert(0, virtio::DisplayBackend::Android(service.name.clone()));
+        transport_cap = service.transport_cap;
     }
 
     #[cfg(feature = "vnc")]
-    if let Some(ref vnc_cfg) = cfg.vnc_server {
-        {
-            // Taken even with `--simplefb`, for the same reason as the Android sink above: there
-            // is one display and the GPU device owns it, with the bridge feeding its frames in
-            // through ExternalScanout. This used to stand down for simplefb, from when the bridge
-            // presented on its own -- leaving nobody to open the VNC server once the bridge
-            // started handing frames over instead.
-            let host = vnc_cfg.host.as_deref().unwrap_or("0.0.0.0");
-            let port = vnc_cfg.port.unwrap_or(5900);
-            let addr = format!("{}:{}", host, port);
-            let (w, h) = cfg
-                .display_input_width
-                .zip(cfg.display_input_height)
-                .unwrap_or((1280, 720));
-            // Pointer input mode. Default (no `input=` given) keeps the original
-            // multi-touch behavior. `input=tablet` (alias `mouse`) opts into the added
-            // absolute-coordinate pointer with mouse button/wheel semantics (qemu
-            // usb-tablet equivalent).
-            let touch_input = super::vnc_touch_input(vnc_cfg.input.as_deref());
-            display_backends.insert(
-                0,
-                virtio::DisplayBackend::VncTcp(addr, w, h, vnc_cfg.password.clone(), touch_input),
-            );
-        }
+    if let Some(vnc_cfg) = cfg.vnc_server_for(DisplayScreen::Gpu0) {
+        let host = vnc_cfg.host.as_deref().unwrap_or(DEFAULT_VNC_HOST);
+        let port = vnc_cfg.port.unwrap_or(DEFAULT_VNC_PORT);
+        let addr = format!("{}:{}", host, port);
+        let (w, h) = cfg
+            .display_input_width
+            .zip(cfg.display_input_height)
+            .unwrap_or((1280, 720));
+        display_backends.insert(
+            0,
+            virtio::DisplayBackend::VncTcp {
+                addr,
+                width: w,
+                height: h,
+                password: vnc_cfg.password.clone(),
+                // Resolved from the ceiling here rather than inside the sink, because the ceiling
+                // belongs to the binding and one sink serves several of them. A binding capped
+                // below `gpu-hw` builds no broker at all, so a client that asks for encoding 50
+                // there is served pixels and told nothing -- which is what an old server looks
+                // like, and what the app is written to fall back from.
+                hw_encode: vnc_cfg.h264_enabled(),
+                // This screen's own devices, parked for whichever `build` call opens the sink.
+                vnc_input: std::sync::Arc::new(sync::Mutex::new(vnc_input)),
+            },
+        );
+        transport_cap = vnc_cfg.transport_cap;
     }
 
     // Use the unnamed socket for GPU display screens.
@@ -287,7 +330,8 @@ pub fn create_gpu_device(
         );
     }
 
-    let dev = virtio::Gpu::new(
+    #[allow(unused_mut)]
+    let mut dev = virtio::Gpu::new(
         exit_evt_wrtube
             .try_clone()
             .context("failed to clone tube")?,
@@ -300,8 +344,11 @@ pub fn create_gpu_device(
         virtio::base_features(cfg.protection_type),
         &cfg.wayland_socket_paths,
         cfg.gpu_cgroup_path.as_ref(),
-        external_scanout,
     );
+    #[cfg(any(feature = "vnc", feature = "android_display"))]
+    if !transport_cap.allows_gpu_copy() {
+        dev.cap_transport_to_cpu();
+    }
 
     let jail = if let Some(jail_config) = cfg.jail_config.as_ref() {
         let mut config = SandboxConfig::new(jail_config, "gpu_device");

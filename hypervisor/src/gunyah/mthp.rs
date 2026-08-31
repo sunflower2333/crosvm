@@ -388,95 +388,8 @@ fn clean_dcache_to_poc(host_addr: *mut u8, size: usize) {
 #[cfg(not(target_arch = "aarch64"))]
 fn clean_dcache_to_poc(_host_addr: *mut u8, _size: usize) {}
 
-/// Round `v` up to the next multiple of the 2MB folio size.
-pub fn round_up_2mb(v: u64) -> u64 {
-    (v + THP_SIZE - 1) & !(THP_SIZE - 1)
-}
-
-/// Back a host-visible blob's shmem `fd` with 2MB order-9 folios (Task B, backend side).
-///
-/// Grows the memfd to `rounded` (a 2MB multiple) so a whole huge folio can be allocated for the
-/// blob, then drives `MADV_COLLAPSE` over a fresh 2MB-*aligned* view of the fd. The collapse
-/// migrates the file's page-cache pages into 2MB-aligned huge folios; every other mapping of the
-/// same offsets (gfxstream's, and the later runtime-SHARE view) is repointed to those folios by
-/// rmap, so the eventual SHARE pins one contiguous 2MB run per folio and its SCM-assign never
-/// splits a hyp block shared with LENT guest RAM (the exec-strip). Growing the file is safe for
-/// gfxstream's existing mapping at the original size, and this must run BEFORE gfxstream creates
-/// the udmabuf (whose pin would block the collapse) -- which is exactly when the
-/// prepare-blob-backing callback fires.
-///
-/// # Safety
-/// `fd` must be a live, growable (unsealed) shmem/memfd descriptor.
-pub unsafe fn folio_back_fd(fd: i32, rounded: u64) -> std::io::Result<()> {
-    let err = || std::io::Error::last_os_error();
-    if libc::ftruncate(fd, rounded as libc::off_t) != 0 {
-        return Err(err());
-    }
-    let len = rounded as usize;
-    let thp = THP_SIZE as usize;
-
-    // Reserve len+2MB anonymously, carve a 2MB-aligned window, MAP_FIXED the fd there so the
-    // collapse's PMD boundaries line up with the file's huge-page boundaries (file offset 0 at a
-    // 2MB-aligned VA). Trim the head/tail slack.
-    let base = libc::mmap(
-        std::ptr::null_mut(),
-        len + thp,
-        libc::PROT_NONE,
-        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-        -1,
-        0,
-    );
-    if base == libc::MAP_FAILED {
-        return Err(err());
-    }
-    let base_u = base as usize;
-    let aligned = (base_u + thp - 1) & !(thp - 1);
-    let mapped = libc::mmap(
-        aligned as *mut libc::c_void,
-        len,
-        libc::PROT_READ | libc::PROT_WRITE,
-        libc::MAP_SHARED | libc::MAP_FIXED,
-        fd,
-        0,
-    );
-    if mapped == libc::MAP_FAILED {
-        let e = err();
-        libc::munmap(base, len + thp);
-        return Err(e);
-    }
-    // Trim slack around the fixed mapping.
-    if aligned > base_u {
-        libc::munmap(base, aligned - base_u);
-    }
-    let tail_start = aligned + len;
-    let tail_end = base_u + len + thp;
-    if tail_end > tail_start {
-        libc::munmap(tail_start as *mut libc::c_void, tail_end - tail_start);
-    }
-
-    let _ = libc::madvise(mapped, len, libc::MADV_HUGEPAGE);
-    let windows = rounded / THP_SIZE;
-    for w in 0..windows {
-        let ptr = (mapped as *mut u8).add((w * THP_SIZE) as usize) as *mut libc::c_void;
-        if libc::madvise(ptr, THP_SIZE as usize, MADV_POPULATE_WRITE) != 0 {
-            let npages = THP_SIZE / 4096;
-            for pg in 0..npages {
-                let p = (ptr as *mut u8).add((pg * 4096) as usize);
-                std::ptr::write_volatile(p, std::ptr::read_volatile(p));
-            }
-        }
-        let _ = libc::madvise(ptr, THP_SIZE as usize, MADV_COLLAPSE);
-    }
-    libc::munmap(mapped, len);
-    Ok(())
-}
-
 /// Fold `[offset, offset+len)` of an already-sized fd into 2 MiB folios, leaving the rest of the
 /// file untouched.
-///
-/// [`folio_back_fd`] cannot be used for a growable pool: it ftruncates and collapses the WHOLE
-/// file, and a pool's file is the whole declared window. Doing that would populate the part the
-/// guest has not asked for, which is precisely the memory the design exists to not allocate.
 ///
 /// The alignment dance is the same and for the same reason: MADV_COLLAPSE on a file mapping only
 /// forms a PMD when the virtual address and the file offset are congruent mod 2 MiB, so the fd is
@@ -486,11 +399,13 @@ pub unsafe fn folio_back_fd(fd: i32, rounded: u64) -> std::io::Result<()> {
 /// failure shows up much later as an order-5 kcalloc failing under fragmentation.
 ///
 /// Returns Ok even when individual collapses fail -- the caller gets 4 KiB backing, which works
-/// but is expensive, and `verify` below is how a caller finds out.
+/// but is expensive. How much of the range really came back as 2 MiB folios is in the returned
+/// [`FolioCoverage`], which a caller who cannot live with a degraded range checks and a caller who
+/// only wanted the cheap shape ignores.
 ///
 /// # Safety
 /// `fd` must be a live shmem descriptor at least `offset + len` bytes long.
-pub unsafe fn folio_back_range(fd: i32, offset: u64, len: u64) -> std::io::Result<()> {
+pub unsafe fn folio_back_range(fd: i32, offset: u64, len: u64) -> std::io::Result<FolioCoverage> {
     let err = || std::io::Error::last_os_error();
     if offset % THP_SIZE != 0 || len % THP_SIZE != 0 || len == 0 {
         return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
@@ -543,9 +458,34 @@ pub unsafe fn folio_back_range(fd: i32, offset: u64, len: u64) -> std::io::Resul
         libc::munmap(tail_start as *mut libc::c_void, tail_end - tail_start);
     }
 
-    let _ = libc::madvise(mapped, l, libc::MADV_HUGEPAGE);
-    for w in 0..(len / THP_SIZE) {
-        let ptr = (mapped as *mut u8).add((w * THP_SIZE) as usize) as *mut libc::c_void;
+    let coverage = fold_mapped_range(mapped as *mut u8, len);
+    libc::munmap(mapped, l);
+    coverage
+}
+
+/// Fold an already-mapped shmem range into 2 MiB folios, one window at a time.
+///
+/// This is the actual work [`folio_back_range`] does; it is separate because the mapping does not
+/// always have to be made. A caller that already holds a mapping whose virtual address is congruent
+/// with its file offset mod 2 MiB -- guest RAM's own region mapping, and the framebuffer's -- can
+/// fold it in place, and gets something the fd-window version cannot give: the range is left
+/// POPULATED IN THAT MAPPING. Through a temporary mapping the folios end up in the page cache and
+/// the caller's own page tables stay empty, so anything that reads the caller's address space
+/// afterwards -- the pin probe, most of all -- sees an absent page and says so.
+///
+/// `MADV_HUGEPAGE` first, because `shmem_enabled` is `advise` on these phones: without it the fault
+/// below allocates 4 KiB pages and there is nothing for the reserve's order-9 hook to intercept.
+///
+/// # Safety
+/// `base` must point at a live shared shmem mapping of at least `len` bytes, 2 MiB-aligned and
+/// congruent with its file offset mod 2 MiB.
+pub unsafe fn fold_mapped_range(base: *mut u8, len: u64) -> std::io::Result<FolioCoverage> {
+    let err = || std::io::Error::last_os_error();
+    let _ = libc::madvise(base as *mut libc::c_void, len as usize, libc::MADV_HUGEPAGE);
+    let windows = len / THP_SIZE;
+    let mut collapsed = 0u64;
+    for w in 0..windows {
+        let ptr = base.add((w * THP_SIZE) as usize) as *mut libc::c_void;
         if libc::madvise(ptr, THP_SIZE as usize, MADV_POPULATE_WRITE) != 0 {
             let e = err();
             match e.raw_os_error() {
@@ -561,16 +501,58 @@ pub unsafe fn folio_back_range(fd: i32, offset: u64, len: u64) -> std::io::Resul
                 // Out of memory is the caller's business, and it must not be answered by the
                 // hand-fault loop: a write fault that cannot allocate raises SIGBUS, which kills
                 // the VMM instead of failing one grant.
-                _ => {
-                    libc::munmap(mapped, l);
-                    return Err(e);
-                }
+                _ => return Err(e),
             }
         }
-        let _ = libc::madvise(ptr, THP_SIZE as usize, MADV_COLLAPSE);
+        if libc::madvise(ptr, THP_SIZE as usize, MADV_COLLAPSE) == 0 {
+            collapsed += 1;
+        }
     }
-    libc::munmap(mapped, l);
-    Ok(())
+    Ok(FolioCoverage { windows, collapsed })
+}
+
+/// How much of a range [`folio_back_range`] was asked about came back as 2 MiB folios.
+///
+/// `collapsed` counts the windows whose `MADV_COLLAPSE` returned success, which includes the ones
+/// the populate above had already faulted in as a huge folio -- collapsing an already-huge range
+/// succeeds trivially, and on a healthy reserve that is what every window does.
+///
+/// This says nothing about WHERE those folios came from. `MADV_COLLAPSE` asks for an order-9
+/// allocation; the gh_hugepage reserve hook intercepts order-9 and serves it from the pool, but
+/// when the pool is empty the buddy allocator answers instead and the folio can be movable or in
+/// CMA. So complete coverage is necessary and not sufficient for "the host can leave these pages
+/// alone", and a caller who needs that has to ask the pin probe as well.
+pub struct FolioCoverage {
+    /// 2 MiB windows in the range.
+    pub windows: u64,
+    /// How many of them are 2 MiB folios.
+    pub collapsed: u64,
+}
+
+impl FolioCoverage {
+    /// Whether every 2 MiB of the range is a 2 MiB folio. An empty range is not complete: there is
+    /// nothing there to have succeeded.
+    pub fn is_complete(&self) -> bool {
+        self.windows > 0 && self.collapsed == self.windows
+    }
+
+    /// Bytes that came back as 2 MiB folios.
+    pub fn covered_bytes(&self) -> u64 {
+        self.collapsed * THP_SIZE
+    }
+
+    /// Bytes asked about.
+    pub fn total_bytes(&self) -> u64 {
+        self.windows * THP_SIZE
+    }
+
+    /// Coverage as the percentage the mTHP phases print.
+    pub fn pct(&self) -> f64 {
+        if self.windows == 0 {
+            return 0.0;
+        }
+        self.collapsed as f64 * 100.0 / self.windows as f64
+    }
 }
 
 /// An individual chunk to LEND, produced by [`compute_lend_chunks`].

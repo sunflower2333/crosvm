@@ -94,9 +94,10 @@ use crate::crosvm::config::parse_pflash_parameters;
 use crate::crosvm::config::parse_serial_options;
 use crate::crosvm::config::parse_touch_device_option;
 use crate::crosvm::config::parse_vhost_user_fs_option;
+#[cfg(feature = "android_display")]
+use crate::crosvm::config::AndroidDisplayServiceConfig;
 use crate::crosvm::config::BatteryConfig;
 use crate::crosvm::config::PreAllocConfig;
-use crate::crosvm::config::RuntimeShareConfig;
 use crate::crosvm::config::CpuOptions;
 use crate::crosvm::config::DtboOption;
 use crate::crosvm::config::Executable;
@@ -918,6 +919,13 @@ fn vnc_server_from_str(s: &str) -> Result<VncConfig, String> {
     from_key_values(s)
 }
 
+/// Parse an Android display service option. `name` is the first field of the struct, so a bare
+/// service name parses as `name=<that>` and the older form of this option keeps working unchanged.
+#[cfg(feature = "android_display")]
+fn android_display_service_from_str(s: &str) -> Result<AndroidDisplayServiceConfig, String> {
+    from_key_values(s)
+}
+
 /// User-specified configuration for the `crosvm run` command.
 ///
 /// All fields of this structure MUST be either an `Option` or a `Vec` of their type. Arguments of
@@ -987,10 +995,30 @@ pub struct RunCommand {
     pub acpi_table: Vec<PathBuf>,
 
     #[cfg(feature = "android_display")]
-    #[argh(option, arg_name = "NAME")]
-    #[merge(strategy = overwrite_option)]
-    /// name that the Android display backend will be registered to the service manager.
-    pub android_display_service: Option<String>,
+    #[argh(
+        option,
+        arg_name = "NAME[,screen=SCREEN]",
+        from_str_fn(android_display_service_from_str)
+    )]
+    #[serde(default)]
+    #[merge(strategy = append)]
+    /// name that the Android display backend will be registered to
+    /// the service manager, and the screen whose frames it shows.
+    /// May be given once per screen.
+    ///     name=NAME - service manager name (the `name=` may be
+    ///         omitted, so a bare NAME is still accepted).
+    ///     screen=SCREEN - "gpu-0" (virtio-gpu scanout 0) or
+    ///         "simplefb". Defaults to gpu-0 when a GPU device is
+    ///         configured, otherwise simplefb.
+    ///     transport-cap=CAP - ceiling on how the frame gets here,
+    ///         never a request: "auto" (default), "cpu", "gpu" or
+    ///         "gpu-hw". Only the first three change anything on
+    ///         this exporter -- the hardware encoder belongs to the
+    ///         VNC sink and this one presents instead.
+    /// Examples:
+    ///   --android-display-service droidvm_disp_1
+    ///   --android-display-service name=win_fb,screen=simplefb
+    pub android_display_service: Vec<AndroidDisplayServiceConfig>,
 
     #[argh(option)]
     #[serde(skip)] // TODO(b/255223604)
@@ -1605,8 +1633,9 @@ pub struct RunCommand {
     /// virtio-input device
     /// TYPE is an input device type, and OPTIONS are key=value
     /// pairs specific to the device type:
+    ///     absolute-mouse[path=PATH,width=W,height=H,name=N]
     ///     evdev[path=PATH]
-    ///     keyboard[path=PATH]
+    ///     keyboard[path=PATH,name=N]
     ///     mouse[path=PATH]
     ///     multi-touch[path=PATH,width=W,height=H,name=N]
     ///     rotary[path=PATH]
@@ -2171,18 +2200,6 @@ pub struct RunCommand {
     /// comma-separated list of CPUs or CPU ranges to run VCPUs on. (e.g. 0,1-3,5) (default: none)
     pub rt_cpus: Option<CpuSet>,
 
-    #[argh(option, arg_name = "hugepage-threshold-kb=KB,exceed-policy=fallback|oom")]
-    #[serde(skip)]
-    #[merge(strategy = overwrite_option)]
-    /// VMM-side runtime dynamic-memory (SHARE) backing policy. General VMM feature; only Gunyah
-    /// protected acts on it (others no-op). Kept separate from `--prepare-lend-mthp-mode` (the
-    /// boot-time LEND knob). Possible keys:
-    ///     hugepage-threshold-kb=<KB> - allocations >= this fold into a 2MB order-9 folio so their
-    ///       runtime SHARE is stage-2/exec clean; smaller stay 4K (default 0 = all folio-backed)
-    ///     exceed-policy=fallback|oom - when the reserved-hugepage supply is exhausted: drop to 4K
-    ///       (fallback, default) or fail with ENOMEM (oom)
-    pub runtime_share: Option<RuntimeShareConfig>,
-
     #[argh(option, arg_name = "PATH")]
     #[serde(skip)] // TODO(b/255223604)
     #[merge(strategy = append)]
@@ -2277,11 +2294,16 @@ pub struct RunCommand {
     ///     type=(stdout,syslog,sink,file) - Where to route the
     ///        serial device.
     ///        Platform-specific options:
-    ///        On Unix: 'unix' (datagram) and 'unix-stream' (stream)
+    ///        On Unix: 'unix' (datagram), 'unix-stream' (stream),
+    ///        'pty' (allocate a pseudo-terminal; crosvm keeps the
+    ///        master and path= optionally becomes a symlink to the
+    ///        slave), and 'dev' (open the existing character device
+    ///        at path=, e.g. a USB gadget serial port /dev/ttyGSn,
+    ///        raw and non-blocking)
     ///        On Windows: 'namedpipe'
-    ///     hardware=(serial,virtio-console,debugcon) - Which type of
-    ///        serial hardware to emulate. Defaults to 8250 UART
-    ///        (serial).
+    ///     hardware=(serial,virtio-console,debugcon,sbsa) - Which
+    ///        type of serial hardware to emulate. Defaults to 8250
+    ///        UART (serial); sbsa is an ARM SBSA/PL011-subset UART.
     ///     name=NAME - Console Port Name, used for virtio-console
     ///        as a tag for identification within the guest.
     ///     num=(1,2,3,4) - Serial Device Number. If not provided,
@@ -2391,6 +2413,11 @@ pub struct RunCommand {
     ///        in case the when the host not allowing write to
     ///        /proc/<pid>/attr/fscreate, or guest directory does
     ///        not care about the security context.
+    ///     supp_gids=GIDS - Supplementary groups for the device
+    ///         process, comma- or space-separated. Empty (default)
+    ///         drops all of them. Honoured only with sandboxing
+    ///         off: the sandboxed path runs in a user namespace
+    ///         that forbids setgroups(2).
     ///     Options uid and gid are useful when the crosvm process
     ///     has no CAP_SETGID/CAP_SETUID but an identity mapping of
     ///     the current user/group between the VM and the host is
@@ -2413,7 +2440,7 @@ pub struct RunCommand {
     /// for testing purposes.
     pub simple_media_device: Option<bool>,
 
-    #[argh(option, arg_name = "width=WIDTH,height=HEIGHT[,format=FORMAT]")]
+    #[argh(option, arg_name = "width=WIDTH,height=HEIGHT[,format=FORMAT][,poll-hz=N]")]
     #[serde(skip)]
     #[merge(strategy = overwrite_option)]
     /// configure a simple framebuffer device exposed via device tree.
@@ -2422,6 +2449,9 @@ pub struct RunCommand {
     ///     width=WIDTH - framebuffer width in pixels
     ///     height=HEIGHT - framebuffer height in pixels
     ///     format=FORMAT - pixel format (default: a8r8g8b8)
+    ///     poll-hz=N - times a second the host looks for a new
+    ///     picture; this framebuffer signals nothing, so this is
+    ///     the whole of what decides a frame rate (default: 30)
     pub simplefb: Option<SimplefbConfig>,
 
     #[argh(
@@ -2806,8 +2836,10 @@ pub struct RunCommand {
     /// Possible key values:
     ///     capture=(false,true) - Disable/enable audio capture.
     ///         Default is false.
-    ///     backend=(null,file,[cras]) - Which backend to use for
-    ///         virtio-snd.
+    ///     backend=(null,file,[cras],[aaudio]) - Which backend to
+    ///         use for virtio-snd. Note that the default is null,
+    ///         i.e. silence: an aaudio build still needs
+    ///         backend=aaudio spelled out.
     ///     client_type=(crosvm,arcvm,borealis) - Set specific
     ///         client type for cras backend. Default is crosvm.
     ///     socket_type=(legacy,unified) Set specific socket type
@@ -2823,17 +2855,69 @@ pub struct RunCommand {
     ///         streams per device.
     ///     num_input_streams=INT - Set number of input PCM streams
     ///         per device.
+    ///     output_device_config=[[KEY=VAL,..],..] - Per output PCM
+    ///         device settings, one [] per device.
+    ///     input_device_config=[[KEY=VAL,..],..] - Same for input
+    ///         PCM devices.
+    ///         Keys: effects=[..] (cras), device_id=INT (aaudio:
+    ///         the AudioDeviceInfo id to pin that PCM device to,
+    ///         0 = let the platform route it).
+    ///     underrun=(silence,hold) - What to play when the guest
+    ///         has not queued a period in time. silence is the
+    ///         upstream behaviour and the default; hold continues
+    ///         the previous audio instead, which hides short holes
+    ///         at the cost of inventing samples.
+    ///     guest_outstanding_packets=INT - Hint to the guest for
+    ///         how many periods to keep in flight. 0 (default)
+    ///         leaves it to the driver. Fewer means less latency
+    ///         and more underruns.
+    ///     guest_period_bytes=INT - Hint to the guest for the
+    ///         preferred period size. 0 (default) = no preference.
+    ///     uid=INT - Run this device's backend in its own
+    ///         process under this uid, as --shared-dir and
+    ///         --pmem-ext2 already do for theirs. On Android a
+    ///         stream opened by uid 0 is silenced by the platform,
+    ///         so a crosvm running as root has to put its audio
+    ///         somewhere else. Unlike the sandbox's uid this is a
+    ///         real host uid and applies whether or not sandboxing
+    ///         is on. Unset (default) keeps the device in-process.
+    ///     gid=INT - Group for that process. Defaults to uid.
+    ///     supp_gids=[INT,..] - Supplementary groups for it.
+    ///         Empty (default) drops all of them.
     pub virtio_snd: Vec<SndParameters>,
 
     #[cfg(feature = "vnc")]
     #[argh(option, arg_name = "CONFIG", from_str_fn(vnc_server_from_str))]
     #[serde(skip)]
-    #[merge(strategy = overwrite_option)]
-    /// start a VNC server for remote display access.
+    #[merge(strategy = append)]
+    /// start a VNC server for remote display access. May be given
+    /// once per screen.
+    ///     host=HOST - address to listen on (default 0.0.0.0).
+    ///     port=PORT - port to listen on (default 5900).
+    ///     password=PASSWORD - require this password.
+    ///     view-only=BOOL - false (default) gives this binding an
+    ///         absolute pointer and a keyboard of its own, named
+    ///         for the screen it serves, and injects this server's
+    ///         RFB events into them; true builds neither and drops
+    ///         RFB pointer/key events. The retired `input=` key is
+    ///         refused, not ignored: it named a VM-global pointer
+    ///         set that no longer exists.
+    ///     screen=SCREEN - "gpu-0" (virtio-gpu scanout 0) or
+    ///         "simplefb". Defaults to gpu-0 when a GPU device is
+    ///         configured, otherwise simplefb.
+    ///     transport-cap=CAP - ceiling on how the frame gets here,
+    ///         never a request: "auto" (default, whatever the two
+    ///         ends negotiate), "cpu" (refuse dmabuf import),
+    ///         "gpu" (Vulkan blit, no hardware encoder) or
+    ///         "gpu-hw" (also allow the hardware H.264 encoder,
+    ///         served on this same port to clients that ask for
+    ///         RFB encoding 50).
     /// Examples:
     ///   --vnc-server port=5900
     ///   --vnc-server host=127.0.0.1,port=5900,password=secret
-    pub vnc_server: Option<VncConfig>,
+    ///   --vnc-server port=5901,screen=simplefb
+    ///   --vnc-server port=5900,transport-cap=gpu-hw
+    pub vnc_server: Vec<VncConfig>,
 
     #[argh(option, arg_name = "cid=CID[,device=VHOST_DEVICE]")]
     #[serde(default)]
@@ -3087,9 +3171,10 @@ impl TryFrom<RunCommand> for super::config::Config {
             }
 
             if serial_params.earlycon {
-                // Only SerialHardware::Serial supports earlycon= currently.
+                // Serial (uart8250) and Sbsa (pl011) may carry earlycon. For Sbsa the
+                // Linux earlycon= string is skipped in get_serial_cmdline; Windows uses ACPI.
                 match serial_params.hardware {
-                    SerialHardware::Serial => {}
+                    SerialHardware::Serial | SerialHardware::Sbsa => {}
                     _ => {
                         return Err(super::config::invalid_value_err(
                             serial_params.hardware.to_string(),
@@ -3446,7 +3531,7 @@ impl TryFrom<RunCommand> for super::config::Config {
             cfg.virtio_input.extend(
                 cmd.keyboard
                     .into_iter()
-                    .map(|path| InputDeviceOption::Keyboard { path }),
+                    .map(|path| InputDeviceOption::Keyboard { path, name: None }),
             )
         }
 
@@ -3552,32 +3637,6 @@ impl TryFrom<RunCommand> for super::config::Config {
                     .extend(cmd.gpu_display.into_iter().map(|p| p.0));
             }
 
-            #[cfg(feature = "android_display")]
-            {
-                // Accept the service for any display producer, not just virtio-gpu: simplefb has
-                // no --gpu at all, and dropping the value here silently left it presenting to VNC
-                // instead of the app's Surface.
-                let gpu_has_display = cfg
-                    .gpu_parameters
-                    .as_ref()
-                    .is_some_and(|p| !p.display_params.is_empty());
-                // Read simplefb off `cmd`: cfg.simplefb is only assigned further down this
-                // function, so checking it here would always see None.
-                if gpu_has_display || cmd.simplefb.is_some() {
-                    cfg.android_display_service = cmd.android_display_service;
-                }
-            }
-
-            #[cfg(feature = "vnc")]
-            {
-                cfg.vnc_server = cmd.vnc_server;
-                if cfg.vnc_server.is_some() {
-                    cfg.display_window_keyboard = true;
-                    cfg.display_window_mouse = true;
-                    log::info!("VNC: auto-enabled display_window_keyboard and display_window_mouse");
-                }
-            }
-
             #[cfg(windows)]
             if let Some(gpu_parameters) = &cfg.gpu_parameters {
                 let num_displays = gpu_parameters.display_params.len();
@@ -3594,6 +3653,31 @@ impl TryFrom<RunCommand> for super::config::Config {
                 cfg.gpu_cgroup_path = cmd.gpu_cgroup_path;
                 cfg.gpu_server_cgroup_path = cmd.gpu_server_cgroup_path;
             }
+        }
+
+        // Exporters bind to screens, and a screen can come from the GPU device or from simplefb,
+        // so these no longer live inside the `gpu` block that used to decide whether to keep them.
+        // Every entry is carried through as given; whether the screen it names exists is settled
+        // once, in `validate_config`, which is the only place that can see all the display devices
+        // at once. Dropping a value here instead is what left a configured display service
+        // unregistered with nothing said about it, and the app waiting on a binder forever.
+        #[cfg(feature = "android_display")]
+        {
+            cfg.android_display_service = cmd.android_display_service;
+        }
+
+        #[cfg(feature = "vnc")]
+        {
+            // No `display_window_*` here any more, deliberately. Those flags build the VM-GLOBAL
+            // display-window device set, and turning them on for VNC is what gave a two-screen VM
+            // one touchscreen and one tablet that both servers injected into -- each normalizing
+            // against its own framebuffer, so the guest saw two screens' coordinates arrive on one
+            // device with nothing to tell them apart. A VNC binding's pointer is now its own
+            // per-screen device (`--vnc-server input=tablet`), and the keyboard is one device every
+            // source writes into, so there is nothing left here for a display window to provide.
+            // The flags themselves still work for whoever passes them: they are the X11 display
+            // window's, and that path is untouched.
+            cfg.vnc_server = cmd.vnc_server;
         }
 
         #[cfg(all(unix, feature = "net"))]
@@ -3788,7 +3872,6 @@ impl TryFrom<RunCommand> for super::config::Config {
         }
 
         cfg.battery_config = cmd.battery;
-        cfg.runtime_share = cmd.runtime_share;
         cfg.simplefb = cmd.simplefb;
         #[cfg(all(target_arch = "x86_64", unix))]
         {

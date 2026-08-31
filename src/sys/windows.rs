@@ -400,8 +400,13 @@ fn create_multi_touch_device(
 
 #[cfg(feature = "gpu")]
 fn create_mouse_device(cfg: &Config, event_pipe: StreamChannel, idx: u32) -> DeviceResult {
-    let dev = virtio::input::new_mouse(idx, event_pipe, virtio::base_features(cfg.protection_type))
-        .exit_context(Exit::InputDeviceNew, "failed to set up input device")?;
+    let dev = virtio::input::new_mouse(
+        idx,
+        event_pipe,
+        /* name= */ None,
+        virtio::base_features(cfg.protection_type),
+    )
+    .exit_context(Exit::InputDeviceNew, "failed to set up input device")?;
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
         jail: None,
@@ -700,6 +705,7 @@ fn create_virtio_input_event_devices(
     let dev = virtio::input::new_keyboard(
         /* idx= */ 0,
         keyboard_pipe,
+        /* name= */ None,
         virtio::base_features(cfg.protection_type),
     )
     .exit_context(Exit::InputDeviceNew, "failed to set up input device")?;
@@ -2079,9 +2085,6 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         hv_cfg: hypervisor::Config {
             protection_type: cfg.protection_type,
             prepare_lend_mthp: cfg.prepare_lend_mthp,
-            // Gunyah-only folio policy; not applicable on Windows hypervisors.
-            folio_threshold_bytes: 0,
-            folio_oom_on_exceed: false,
         },
         vm_image,
         android_fstab: cfg

@@ -57,9 +57,135 @@ use libc::EOVERFLOW;
 use libc::O_CLOEXEC;
 use libc::O_RDWR;
 use sync::Mutex;
+use vm_memory::FramebufferPrep;
+use vm_memory::MemoryRegionInformation;
 use vm_memory::MemoryRegionPurpose;
 
 use crate::*;
+
+/// Give the `SharedFramebuffer` region the pool-style preparation the LEND'd regions get, and say
+/// whether what came back can be handed to something that will hold references on it.
+///
+/// This region is the one SHARE'd region nothing populates at boot. That is deliberate and it used
+/// to be free: the guest ioremap_wc()s it, the host bridge reads it, and each side's first touch
+/// faulted in an ordinary 4 KiB shmem page. Those faults are order-0, and the gh_hugepage reserve
+/// only hooks order-9 -- so every page of this region came from the buddy allocator, `__GFP_MOVABLE`,
+/// and under pressure landed in CMA. The CPU bridge survives that, because nothing holds a
+/// long-lived reference and gunyah's fault-time `FOLL_LONGTERM` pin is free to migrate the page out
+/// of CMA before mapping it. The GPU bridge does not: GKI 6.6's udmabuf takes its pages with
+/// `shmem_read_mapping_page`, which is a reference and not a pin, and a referenced page cannot be
+/// migrated. The guest then faults, the pin has nowhere to move the page to, and the vcpu dies of
+/// `page fault at <gpa>, attempt: -12` about eighty milliseconds after `transport=gpu-blit`.
+///
+/// The ordering is the whole fix. Populate and collapse the region to 2 MiB folios HERE -- before
+/// vcpus run, before the bridge exists, before anything can reference a page -- and the order-9
+/// allocations go through the reserve's hook, so the pages arrive pool-served and non-movable and
+/// stay where they are. Nothing later has to move anything, so nothing later can fail to.
+///
+/// What this deliberately does NOT do is the rest of `prepare_lend_region`. No mlock: this region
+/// is not LENT, the host keeps its mapping, and the folios are already unmigratable for the reason
+/// above. No dcache clean to PoC: that exists because the LEND path writes guest RAM through a
+/// cacheable mapping that a non-coherent GPU then reads; here the region's only writer before boot
+/// is this populate, and the guest maps it write-combining and owns it from GH_VM_START on. No LEND
+/// chunking: there is no parcel to split, this stays a single whole-region SHARE.
+///
+/// The folding happens through the region's OWN mapping rather than a temporary one, and that is
+/// not an optimisation. A collapse driven through a mapping that is then unmapped leaves the folios
+/// in the page cache and this process's page tables empty, so every later reader of the region --
+/// the pin probe first among them -- finds an absent page and cannot tell a prepared region from an
+/// untouched one. Folding in place leaves the range populated in the mapping everything else uses.
+///
+/// `MADV_COLLAPSE` on a file mapping only forms a PMD where the virtual address and the file offset
+/// are congruent mod 2 MiB, so that is checked rather than assumed -- misaligned, it would quietly
+/// return 0% coverage instead of an explanation. The region is 2 MiB-granular by construction
+/// (`get_simplefb_size` rounds the framebuffer up under a 2 MiB-aligned swiotlb base) and its
+/// mapping is 2 MiB-aligned by request (`MemoryRegionOptions::align`, as the pools do it), so the
+/// check is a guard on those two facts rather than a coin toss.
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+fn prepare_shared_framebuffer(
+    region: &MemoryRegionInformation<'_>,
+    mthp_enabled: bool,
+) -> FramebufferPrep {
+    const THP_SIZE: u64 = 2 << 20;
+    let size = region.size as u64;
+    let gpa = region.guest_addr.offset();
+    let hva = region.host_addr as u64;
+
+    let prepared = if !mthp_enabled {
+        // The reserve pool is a Qualcomm-phone thing and so is this preparation; the same gate the
+        // LEND and pool paths use. Without it the collapse below would allocate order-9 from the
+        // buddy allocator, which is where movable folios come from -- exactly what we are avoiding.
+        Err("--prepare-lend-mthp-mode is not set, so there is no reserve pool to be served from"
+            .to_string())
+    } else if size == 0 || size % THP_SIZE != 0 || hva % THP_SIZE != region.shm_offset % THP_SIZE {
+        Err(format!(
+            "the region is not 2 MiB-foldable (size={size:#x} hva={hva:#x} \
+             offset-in-memfd={:#x}): a PMD needs the address and the file offset congruent mod \
+             2 MiB",
+            region.shm_offset,
+        ))
+    } else {
+        // SAFETY: `host_addr` is this process's live shared mapping of the region -- `size` bytes
+        // of the guest memfd at `shm_offset` -- and the branch above has established that it is
+        // 2 MiB-granular and congruent. Nothing else has touched these pages yet: no vcpu is
+        // running and the bridge that will read them does not exist.
+        match unsafe { mthp::fold_mapped_range(region.host_addr as *mut u8, size) } {
+            Ok(coverage) => Ok(coverage),
+            Err(e) => Err(format!("folding the region into 2 MiB folios failed: {e}")),
+        }
+    };
+
+    let (coverage, verdict) = match prepared {
+        Err(why) => ("n/a".to_string(), FramebufferPrep::NotPoolBacked(why)),
+        Ok(c) => {
+            let coverage = format!(
+                "{} / {} MB ({:.1}%)",
+                c.covered_bytes() >> 20,
+                c.total_bytes() >> 20,
+                c.pct(),
+            );
+            if !c.is_complete() {
+                // Partial coverage is the original roulette with better odds, and better odds are
+                // not what the GPU path needs: one 4 KiB page left in CMA anywhere in the region
+                // is one guest fault away from the same -12.
+                let why = format!("only {coverage} of the region came back as 2 MiB folios");
+                (coverage, FramebufferPrep::NotPoolBacked(why))
+            } else {
+                // Complete coverage says the folios are order-9. It does NOT say the reserve
+                // served them: with an empty pool the buddy allocator answers the same order-9
+                // request and can hand back a movable folio, and `MADV_COLLAPSE` returns success
+                // either way. The probe is the orthogonal question -- where did these pages land --
+                // and it is the one the guest's fault will really be asking.
+                match pin::probe_settled(hva, size) {
+                    pin::Settled::Yes => (coverage, FramebufferPrep::PoolBacked),
+                    pin::Settled::No(why) => (coverage, FramebufferPrep::NotPoolBacked(why)),
+                    pin::Settled::Unknown => (
+                        coverage,
+                        FramebufferPrep::NotPoolBacked(
+                            "/dev/gh_pinprobe is absent (no gh_hugepage_reserve.ko providing it), \
+                             so where the folios came from cannot be established"
+                                .to_string(),
+                        ),
+                    ),
+                }
+            }
+        }
+    };
+
+    match &verdict {
+        FramebufferPrep::PoolBacked => info!(
+            "GH-FB: === framebuffer folio coverage: {coverage} at gpa={gpa:#x} hva={hva:#x} -- \
+             pool-served, the GPU transport may window these pages ==="
+        ),
+        FramebufferPrep::NotPoolBacked(why) => warn!(
+            "GH-FB: === framebuffer folio coverage: {coverage} at gpa={gpa:#x} hva={hva:#x} -- \
+             NOT pool-served: {why}; the simplefb bridge stays on the CPU path ==="
+        ),
+        // Built above, never returned.
+        FramebufferPrep::Unclaimed => (),
+    }
+    verdict
+}
 
 pub struct Gunyah {
     gunyah: SafeDescriptor,
@@ -613,6 +739,20 @@ impl GunyahVm {
                     continue;
                 }
 
+                // The framebuffer, prepared at the same early-boot moment as everything else that
+                // has to come out of the reserve pool: after the LEND phases, before the pin probe
+                // that follows (so it measures prepared memory rather than faulting the region in
+                // itself), before the SHARE, and long before any consumer exists. A failure here is
+                // never fatal -- the CPU bridge is the unconditional floor and works on 4 KiB pages
+                // wherever they landed -- so the outcome is recorded rather than returned, and the
+                // one thing that reads it is the GPU transport that cannot survive being wrong.
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                if region.options.purpose == MemoryRegionPurpose::SharedFramebuffer {
+                    let prep =
+                        prepare_shared_framebuffer(&region, cfg.prepare_lend_mthp.is_some());
+                    guest_mem.set_framebuffer_prep(prep);
+                }
+
                 // A growable pool is declared to the guest whole but SHARE'd only in part: the
                 // remainder is filled in at runtime as the guest asks for it. `boot_share_len`
                 // is that prefix, and it is the region's full size for everything that is not a
@@ -1033,7 +1173,7 @@ impl GunyahVm {
                         Error::new(EINVAL)
                     })?;
                 // exec: the payload runs from here.
-                let handle = self.share_blob(at, Box::new(mapping), false, true)?;
+                let handle = self.share_blob(at, Box::new(mapping), None, 0, false, true)?;
                 let parcel = abi::ShimParcel {
                     handle,
                     reserved: 0,
@@ -1231,7 +1371,7 @@ impl GunyahVm {
             let pattern: Vec<u8> = gpa.to_le_bytes().repeat(512);
             let _ = region.write_slice(&pattern, 0);
 
-            match self.share_blob(GuestAddress(gpa), Box::new(region), false, false) {
+            match self.share_blob(GuestAddress(gpa), Box::new(region), None, 0, false, false) {
                 Ok(handle) => base::error!(
                     "GH-SHARE-PROBE: gpa={:#x} size={:#x} => SHARED handle={:#x} \
                      (accept it in the guest with gunyah_guest_mem_accept)",
@@ -1258,6 +1398,8 @@ impl GunyahVm {
         &self,
         guest_addr: GuestAddress,
         mem_region: Box<dyn MappedRegion>,
+        source_descriptor: Option<RawDescriptor>,
+        source_offset: u64,
         read_only: bool,
         exec: bool,
     ) -> Result<u32> {
@@ -1306,6 +1448,53 @@ impl GunyahVm {
         // gunyah VM fd is passed as a request field rather than as the ioctl target.
         let share_dev = File::open("/dev/gunyah_share")
             .map_err(|e| Error::new(e.raw_os_error().unwrap_or(EINVAL)))?;
+
+        // Driver-exported DMA-BUFs may mmap as VM_PFNMAP/VM_MIXEDMAP. GUP is required to reject
+        // those VMAs, so let gunyah_share hold a DMA-BUF attachment and build the memparcel from
+        // the exporter's sg-table. ENOTTY means either an older module or an ordinary descriptor
+        // such as a pool memfd; those retain the existing VA/GUP behavior below.
+        if let Some(dmabuf_fd) = source_descriptor {
+            let mut dmabuf = ghsm_share_dmabuf {
+                vm_fd: self.vm.as_raw_descriptor(),
+                dmabuf_fd,
+                label,
+                flags,
+                mem_handle: 0,
+                reserved: 0,
+                guest_phys_addr: guest_addr.offset(),
+                memory_size: size,
+                dmabuf_offset: source_offset,
+            };
+            // SAFETY: the ioctl synchronously imports descriptors owned by this process and
+            // writes mem_handle into `dmabuf`. Both fds remain valid for the whole call.
+            let ret = unsafe { ioctl_with_mut_ref(&share_dev, GHSM_SHARE_DMABUF, &mut dmabuf) };
+            if ret == 0 {
+                self.blob_regions.lock().insert(label, mem_region);
+                debug!(
+                    "GUNYAH-SHARE-DMABUF: gpa={:#x} size={:#x} offset={:#x} label={} handle={:#x}",
+                    guest_addr.offset(),
+                    size,
+                    source_offset,
+                    label,
+                    dmabuf.mem_handle,
+                );
+                return Ok(dmabuf.mem_handle);
+            }
+            let err = Error::last();
+            if err.errno() != libc::ENOTTY {
+                error!(
+                    "GUNYAH-SHARE-DMABUF: gpa={:#x} size={:#x} offset={:#x} FAILED: {}",
+                    guest_addr.offset(),
+                    size,
+                    source_offset,
+                    err,
+                );
+                return Err(err);
+            }
+            debug!(
+                "GUNYAH-SHARE-DMABUF: descriptor is not a DMA-BUF (or module is old); falling back to VA/GUP"
+            );
+        }
 
         let mut blob = ghsm_share_blob {
             vm_fd: self.vm.as_raw_descriptor(),
@@ -1490,6 +1679,8 @@ impl Vm for GunyahVm {
         &mut self,
         guest_addr: GuestAddress,
         mem_region: Box<dyn MappedRegion>,
+        source_descriptor: Option<RawDescriptor>,
+        source_offset: u64,
         read_only: bool,
         _cache: MemCacheType,
         _accept: crate::VmAccept,
@@ -1499,19 +1690,15 @@ impl Vm for GunyahVm {
         // (the SHARE is reclaimed by label = gpa>>12, not a slot). `vm_accept` selects WHO drives
         // the guest accept (Off -> caller/virtio-gpu; Sync/Async -> in-VM module via transport);
         // that routing happens above this layer, so nothing to branch on here.
-        // Host-visible GPU blobs are data-only. EDK2 preload is promoted to ordinary OS RAM after
-        // firmware accepts it, so its stage-2 mapping must permit executable stage-1 mappings.
-        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-        let exec = self.guest_mem.regions().any(|region| {
-            region.options.purpose == MemoryRegionPurpose::Edk2PreloadPool
-                && guest_addr
-                    .offset()
-                    .checked_sub(region.guest_addr.offset())
-                    .is_some_and(|offset| offset < region.size as u64)
-        });
-        #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
-        let exec = false;
-        let handle = self.share_blob(guest_addr, mem_region, read_only, exec)?;
+        // Host-visible blobs are data: rings, buffers, framebuffers. Nothing executes from them.
+        let handle = self.share_blob(
+            guest_addr,
+            mem_region,
+            source_descriptor,
+            source_offset,
+            read_only,
+            false,
+        )?;
         Ok((0, Some(handle)))
     }
 
@@ -1535,37 +1722,6 @@ impl Vm for GunyahVm {
         self.unshare_blob(label)
     }
 
-    // Host-visible blob backing: fold each blob's shmem into a 2MB order-9 folio *before* it is
-    // pinned (formerly gfxstream's HostVisibleFolio; moved here so the GPU backend is
-    // backend-agnostic and gzvm/etc. reuse it). A 2MB-clean blob's later SHARE (share_blob) never
-    // splits a hyp stage-2 block shared with LENT guest RAM -> no EXEC strip. `threshold` /
-    // `exceed-policy` are VMM policy (here); the host-visible VRAM quota is metered on the GPU side.
-    fn prepare_runtime_blob_backing(
-        &mut self,
-        fd: &dyn base::AsRawDescriptor,
-        size: u64,
-    ) -> Result<u64> {
-        // Folio policy is VMM-owned (--runtime-share hugepage-threshold-kb=,exceed-policy=),
-        // read from hv_cfg -- no per-blob arg from the GPU side.
-        if size < self.hv_cfg.folio_threshold_bytes {
-            return Ok(0); // below threshold -> 4K direct-supply path
-        }
-        let rounded = mthp::round_up_2mb(size);
-
-        // SAFETY: fd is a live growable shmem descriptor for this blob (owned by the GPU backend
-        // for the blob's lifetime); folio_back_fd only grows + collapses it.
-        if let Err(e) = unsafe { mthp::folio_back_fd(fd.as_raw_descriptor(), rounded) } {
-            // Reserve/CMA exhausted (or collapse failed): honour the exceed-policy.
-            warn!("GH-FOLIO: folio_back_fd failed ({}); size=0x{:x}", e, size);
-            if self.hv_cfg.folio_oom_on_exceed {
-                return Err(Error::new(e.raw_os_error().unwrap_or(EINVAL)));
-            }
-            return Ok(0); // fallback: leave it on the 4K path
-        }
-        debug!("GH-FOLIO: blob size=0x{:x} -> 2MB folios rounded=0x{:x}", size, rounded);
-        Ok(rounded)
-    }
-
     fn prepare_blob_range(
         &mut self,
         fd: &dyn base::AsRawDescriptor,
@@ -1580,6 +1736,7 @@ impl Vm for GunyahVm {
         // SAFETY: fd is the pool region's shmem descriptor, alive for the VM's lifetime, and
         // folio_back_range only fallocates and collapses within [offset, offset+size).
         unsafe { mthp::folio_back_range(fd.as_raw_descriptor(), offset, size) }
+            .map(|_coverage| ())
             .map_err(|e| Error::new(e.raw_os_error().unwrap_or(EINVAL)))
     }
 

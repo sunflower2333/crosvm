@@ -119,7 +119,6 @@ fn drm2kgsl_bar_range_is_valid(
 fn pool_offset_to_wire(pool_offset: u64) -> Option<u32> {
     u32::try_from(pool_offset).ok()
 }
-
 // A guest-pool blob must be at least this large to be retained as a possible scanout source (its
 // udmabuf duped for direct display import in `try_import_resource_to_display`). Real scanouts are
 // multi-MiB; gating on size keeps us from holding an extra fd for every small guest BO (which can
@@ -171,6 +170,36 @@ fn note_flush_route(outcome: &str) {
     let set = seen.get_or_insert_with(Default::default);
     if set.insert(outcome.to_string()) {
         base::warn!("FLUSH-ROUTE: {outcome}");
+    }
+}
+
+fn probe_transfer_read(resource_id: u32, counter: &mut u64, bytes: &[u8]) {
+    *counter = counter.wrapping_add(1);
+    if *counter % 64 != 1 {
+        return;
+    }
+    let probe = &bytes[..4096.min(bytes.len())];
+    // Count only color channels: XRGB frames commonly carry 0xff in every fourth byte, which
+    // would make an all-black frame look non-zero.
+    let rgb_nz = probe
+        .chunks_exact(4)
+        .flat_map(|pixel| &pixel[..3])
+        .filter(|byte| **byte != 0)
+        .count();
+    let head: Vec<String> = probe[..16.min(probe.len())]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    scanout_trace_write(format_args!(
+        "flush.transfer_read.probe res={} rgb_nonzero={} head=[{}]",
+        resource_id,
+        rgb_nz,
+        head.join(" ")
+    ));
+    if rgb_nz == 0 {
+        note_flush_route("transfer_read: readback is black");
+    } else {
+        note_flush_route("transfer_read: readback has color");
     }
 }
 
@@ -349,6 +378,11 @@ struct VirtioGpuScanout {
     parent_surface_id: Option<u32>,
 
     surface_id: Option<u32>,
+    // The scanout id half of the same fact `parent_surface_id` records: which scanout this cursor
+    // is currently overlayed onto. Snapshot/restore has always read it, but nothing ever wrote it
+    // -- it stayed None for the device's whole life, so a restored cursor came back parented to
+    // nothing. It is written where the parenting actually happens (`update_scanout_resource`), and
+    // it is what `move_cursor` compares the guest's scanout_id against to notice a crossing.
     parent_scanout_id: Option<u32>,
 
     resource_id: Option<NonZeroU32>,
@@ -449,6 +483,10 @@ impl VirtioGpuScanout {
         assert_eq!(self.display_params, snapshot.display_params);
 
         self.resource_id = snapshot.resource_id;
+        // The parent the caller just resolved `parent_surface_id` from. Now that the field decides
+        // whether a MOVE_CURSOR is a crossing, a restored cursor that claims no parent would make
+        // the guest's next move look like one.
+        self.parent_scanout_id = snapshot.parent_scanout_id;
         if snapshot.has_surface {
             self.create_surface(display, parent_surface_id, None)?;
         } else {
@@ -632,8 +670,9 @@ impl VirtioGpuScanout {
         // SurfaceFlinger RenderEngine (Skia-GL) cannot import our guest-blob dmabuf, the import
         // "succeeds" at the crosvm boundary but the frame never composites -- and crosvm, which
         // no longer owns the bytes, cannot correct it. The CPU-copy path below produces a plain
-        // RGBA_8888 window buffer that every RenderEngine accepts and whose bytes crosvm fully
-        // controls (swizzle, format). The app selects this per device via GPU_DISPLAY_COPY_MODE;
+        // RGBA_8888 window buffer that every RenderEngine accepts and whose layout crosvm fully
+        // controls at the producer-to-sink edge. The app selects this per device via
+        // GPU_DISPLAY_COPY_MODE;
         // `zero`/`auto` keep the fast path. See display_copy_mode().
         if matches!(self.scanout_type, SurfaceType::Scanout)
             && display_copy_mode() != DisplayCopyMode::ForceCpu
@@ -690,13 +729,6 @@ impl VirtioGpuScanout {
                 note_flush_route("pool: display buffer busy, frame dropped");
                 return Ok(OkNoData);
             }
-            let fb = match display.framebuffer_region(surface_id, 0, 0, self.width, self.height) {
-                Some(fb) => fb,
-                None => {
-                    note_flush_route("pool: no framebuffer region for the surface");
-                    return Err(ErrUnspec);
-                }
-            };
             // Gather the (possibly fragmented) pool run segments into a contiguous staging buffer.
             let segs = resource.pool_scanout_iovecs.as_ref().unwrap();
             let total: usize = segs.iter().map(|&(_, l)| l).sum();
@@ -718,9 +750,10 @@ impl VirtioGpuScanout {
                         "pool scanout res={} needs {:?} bytes but the blob gathers {}",
                         resource.resource_id, last_row_end, total
                     );
-                    // The window buffer is locked (framebuffer_region above): release it, or
-                    // every later lock fails and the display is dead for the rest of the VM.
-                    display.flip(surface_id);
+                    // No flip to release a window buffer here any more: the lock is taken inside
+                    // present_frame, which this path never reaches. It used to be taken before the
+                    // check, and leaving it held was what killed the display for the rest of the
+                    // VM's life.
                     return Err(ErrUnspec);
                 }
             }
@@ -732,8 +765,6 @@ impl VirtioGpuScanout {
                 self.flush_staging[off..off + len].copy_from_slice(src);
                 off += len;
             }
-            let fb_stride = fb.stride() as usize;
-            let fb_slice = fb.as_volatile_slice();
             // Whether the pool actually holds a frame. `transfer_read` has had this probe for a
             // while and reports colour, but that is a different branch on a different resource --
             // nothing has ever looked at the bytes this branch copies, so "the host can read the
@@ -746,7 +777,8 @@ impl VirtioGpuScanout {
             if gpu_diag_enabled()
                 && (self.pool_probe_counter <= 3 || self.pool_probe_counter % 64 == 0)
             {
-                // Read the RAW guest bytes (RGBX) before the R<->B swizzle below.
+                // Read the raw guest bytes before the display edge performs any required
+                // conversion.
                 let staging = &self.flush_staging[..total];
                 let probe = &staging[src_offset.min(staging.len())..];
                 let probe = &probe[..4096.min(probe.len())];
@@ -759,52 +791,45 @@ impl VirtioGpuScanout {
                     .iter()
                     .map(|b| format!("{b:02x}"))
                     .collect();
+                // fb_stride is gone from this line: the destination is not fetched here any more,
+                // and locking a window buffer to put a number in a diagnostic would be a worse
+                // trade than losing the number.
                 base::warn!(
-                    "POOL-SCANOUT#{} res={} {}x{} src_stride={} src_off={} fb_stride={} total={} segs={} rgb_nonzero={} head=[{}]",
+                    "POOL-SCANOUT#{} res={} {}x{} src_stride={} src_off={} total={} segs={} rgb_nonzero={} head=[{}]",
                     self.pool_probe_counter,
                     resource.resource_id,
                     self.width,
                     self.height,
                     src_stride,
                     src_offset,
-                    fb_stride,
                     total,
                     segs.len(),
                     rgb_nz,
                     head.join(" "),
                 );
             }
-            // Match the byte order to what every one-copy consumer downstream assumes: BGRX (the
-            // VNC surface reads XR24, and the Android backend's swapRedBlueInPlace converts BGRX ->
-            // RGBA_8888). Whether a swap is needed depends on the guest's declared scanout fourcc,
-            // NOT a fixed assumption -- the desktop plane declares ABGR8888 (R-first, RGBX byte
-            // order) so it needs the swap, while fbcon declares XRGB8888 (B-first, already BGRX) so
-            // it must NOT be swapped or its colours invert. This mirrors the zero-copy path, which
-            // is fourcc-correct by construction (the fd's fourcc picks the VkFormat). No
-            // scanout_data means the legacy SET_SCANOUT desktop path: default to swapping, the
-            // pre-fourcc behaviour. gfxstream never reaches this branch. Kill-switch:
-            // GPU_POOL_SCANOUT_NO_SWIZZLE=1.
-            let needs_swizzle = match resource.scanout_data.map(|d| d.drm_format.0) {
-                Some(fourcc) => fourcc == DRM_FORMAT_ABGR8888 || fourcc == DRM_FORMAT_XBGR8888,
-                None => true,
+            // Preserve the bytes exactly as the guest produced them. The source fourcc and the
+            // sink framebuffer's fourcc meet in present_frame, which either copies directly or
+            // exchanges red and blue once while copying. A legacy pool resource has no
+            // SET_SCANOUT_BLOB metadata; retain its historical R-first desktop interpretation.
+            let frame = ScanoutFrame {
+                bytes: &self.flush_staging[src_offset.min(total)..total],
+                stride: src_stride as u32,
+                width: self.width,
+                height: self.height,
+                fourcc: resource
+                    .scanout_data
+                    .map(|d| d.drm_format.0)
+                    .unwrap_or(DRM_FORMAT_ABGR8888),
+                damage: Damage::Full,
             };
-            if pool_scanout_swizzle() && needs_swizzle {
-                for px in self.flush_staging[..total].chunks_exact_mut(4) {
-                    px.swap(0, 2);
-                }
+            if matches!(
+                display.present_frame(surface_id, &frame),
+                PresentOutcome::NoFramebuffer
+            ) {
+                note_flush_route("pool: no framebuffer for the surface");
+                return Err(ErrUnspec);
             }
-            let staging = &self.flush_staging[..total];
-            for row in 0..self.height as usize {
-                let s = src_offset + row * src_stride;
-                if s + packed_stride > staging.len() {
-                    break;
-                }
-                fb_slice
-                    .sub_slice(row * fb_stride, packed_stride)
-                    .map_err(|_| ErrUnspec)?
-                    .copy_from(&staging[s..s + packed_stride]);
-            }
-            display.flip(surface_id);
             return Ok(OkNoData);
         }
 
@@ -878,51 +903,49 @@ impl VirtioGpuScanout {
                 let data = resource.scanout_data.unwrap();
                 let src_stride = data.strides[0] as usize;
                 let src_offset = data.offsets[0] as usize;
-                let packed_stride = self.width as usize * 4;
                 let mut display = display.borrow_mut();
                 if display.next_buffer_in_use(surface_id) {
                     return Ok(OkNoData);
                 }
-                let fb = display
-                    .framebuffer_region(surface_id, 0, 0, self.width, self.height)
-                    .ok_or(ErrUnspec)?;
-                let fb_stride = fb.stride() as usize;
-                let fb_slice = fb.as_volatile_slice();
                 // SAFETY: `m` maps at least `map_size` bytes of the exported dmabuf; we read within.
                 let src = unsafe { std::slice::from_raw_parts(m.as_ptr() as *const u8, m.size()) };
                 strace!(
-                    "flush.blob.copy.begin src_len={} src_stride={} src_off={} fb_stride={} rows={}",
+                    "flush.blob.copy.begin src_len={} src_stride={} src_off={} rows={}",
                     src.len(),
                     src_stride,
                     src_offset,
-                    fb_stride,
                     self.height,
                 );
-                let mut copy_result: VirtioGpuResult = Ok(OkNoData);
-                for row in 0..self.height as usize {
-                    let s = src_offset + row * src_stride;
-                    if s + packed_stride > src.len() {
-                        break;
-                    }
-                    match fb_slice.sub_slice(row * fb_stride, packed_stride) {
-                        Ok(dst) => dst.copy_from(&src[s..s + packed_stride]),
-                        Err(_) => {
-                            copy_result = Err(ErrUnspec);
-                            break;
-                        }
-                    }
-                }
+                let frame = ScanoutFrame {
+                    bytes: &src[src_offset.min(src.len())..],
+                    stride: src_stride as u32,
+                    width: self.width,
+                    height: self.height,
+                    fourcc: data.drm_format.0,
+                    damage: Damage::Full,
+                };
+                let outcome = display.present_frame(surface_id, &frame);
                 strace!("flush.blob.copy.end");
-                // Always release the locked window buffer, even when the copy failed above.
-                display.flip(surface_id);
                 strace!("flush.blob.flip.end");
-                return copy_result;
+                return match outcome {
+                    PresentOutcome::Flipped => Ok(OkNoData),
+                    PresentOutcome::NoFramebuffer => Err(ErrUnspec),
+                };
             }
         }
 
         // Import failed, fall back to a copy.
         strace!("flush.transfer_read.branch res={}", resource.resource_id);
         note_flush_route("transfer_read: rutabaga readback into the framebuffer");
+        // transfer_read returns the resource's own format. Prefer the renderer's Resource3DInfo,
+        // because SET_SCANOUT_BLOB describes the scanout view while the resource creation format
+        // is what selected gfxstream's readColorBuffer output layout.
+        let transfer_fourcc = rutabaga
+            .query(resource.resource_id)
+            .ok()
+            .map(|query| query.drm_fourcc)
+            .or_else(|| resource.scanout_data.map(|data| data.drm_format.0))
+            .unwrap_or(DRM_FORMAT_XRGB8888);
         let mut display = display.borrow_mut();
 
         // Prevent overwriting a buffer that is currently being used by the compositor.
@@ -943,7 +966,7 @@ impl VirtioGpuScanout {
         let readback: VirtioGpuResult = (|| {
             let packed_stride = self.width as usize * 4;
             let fb_stride = fb.stride() as usize;
-            if fb_stride == packed_stride {
+            if fb_stride == packed_stride && fb.can_copy_direct_from(transfer_fourcc) {
                 let mut transfer = Transfer3D::new_2d(0, 0, self.width, self.height, 0);
                 transfer.stride = fb.stride();
                 let fb_slice = fb.as_volatile_slice();
@@ -954,46 +977,16 @@ impl VirtioGpuScanout {
                     },
                 );
                 rutabaga.transfer_read(0, resource.resource_id, transfer, Some(buf))?;
-                // Whether the readback produced anything, every 64th frame: a black display can mean
-                // the copy went to the wrong place or that these bytes were zero to begin with, and
-                // nothing else distinguishes the two.
-                self.flush_probe_counter = self.flush_probe_counter.wrapping_add(1);
-                if self.flush_probe_counter % 64 == 1 {
-                    let probe = unsafe {
-                        std::slice::from_raw_parts(
-                            fb_slice.as_mut_ptr() as *const u8,
-                            4096.min(fb_slice.size()),
-                        )
-                    };
-                    // Count only the color channels: XRGB frames carry 0xff in every fourth byte,
-                    // which made an all-black frame read as "25% nonzero" and pass for content.
-                    let rgb_nz = probe
-                        .chunks_exact(4)
-                        .flat_map(|px| &px[..3])
-                        .filter(|b| **b != 0)
-                        .count();
-                    let head: Vec<String> = probe[..16.min(probe.len())]
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect();
-                    strace!(
-                        "flush.transfer_read.probe res={} rgb_nonzero={} head=[{}]",
-                        resource.resource_id,
-                        rgb_nz,
-                        head.join(" ")
-                    );
-                    if rgb_nz == 0 {
-                        note_flush_route("transfer_read: readback is black");
-                    } else {
-                        note_flush_route("transfer_read: readback has color");
-                    }
-                }
+                // SAFETY: transfer_read just initialized this locked framebuffer memory.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(fb_slice.as_mut_ptr() as *const u8, fb_slice.size())
+                };
+                probe_transfer_read(resource.resource_id, &mut self.flush_probe_counter, bytes);
             } else {
-                // The window buffer rows are padded (gralloc stride alignment), and the readback
-                // backend writes tightly-packed rows no matter what Transfer3D::stride says (observed
-                // with gfxstream at widths whose row size isn't aligned, e.g. 1440x900) -- every row
-                // lands progressively shifted and the image smears. Read into a packed staging buffer
-                // and re-stride into the window buffer by row.
+                // Staging is needed when gralloc pads rows (gfxstream writes packed rows despite
+                // Transfer3D::stride) or when producer and sink have different channel order. In
+                // the latter case copy_from_frame combines the re-stride and R/B exchange instead
+                // of following the copy with a second full-frame pass in the Android backend.
                 let mut transfer = Transfer3D::new_2d(0, 0, self.width, self.height, 0);
                 transfer.stride = packed_stride as u32;
                 let size = packed_stride * self.height as usize;
@@ -1007,13 +1000,15 @@ impl VirtioGpuScanout {
                     transfer,
                     Some(IoSliceMut::new(staging)),
                 )?;
-                let fb_slice = fb.as_volatile_slice();
-                for row in 0..self.height as usize {
-                    fb_slice
-                        .sub_slice(row * fb_stride, packed_stride)
-                        .map_err(|_| ErrUnspec)?
-                        .copy_from(&staging[row * packed_stride..][..packed_stride]);
-                }
+                probe_transfer_read(resource.resource_id, &mut self.flush_probe_counter, staging);
+                fb.copy_from_frame(&ScanoutFrame {
+                    bytes: staging,
+                    stride: packed_stride as u32,
+                    width: self.width,
+                    height: self.height,
+                    fourcc: transfer_fourcc,
+                    damage: Damage::Full,
+                });
             }
 
             Ok(OkNoData)
@@ -1289,26 +1284,7 @@ pub struct VirtioGpu {
     /// Deliberately NOT snapshot'd: a fence outstanding across a snapshot degrades to the
     /// synchronous completion the pre-fence code always had.
     pending_flip_fence: Option<base::SafeDescriptor>,
-    /// The guest has a scanout bound to a resource, i.e. it intends to display through this
-    /// device. Set by SET_SCANOUT, cleared when the guest unbinds it or resets the device.
-    guest_scanout_bound: bool,
-    /// When the guest last actually presented (RESOURCE_FLUSH on a scanout resource).
-    last_guest_present: Option<Instant>,
-    /// A guest that bound a scanout and then went quiet for this long is treated as having
-    /// stopped displaying, so another source (`ExternalScanout`) may take over. Long enough that
-    /// an idle desktop -- which still presents its blinking cursor every second or so -- never
-    /// crosses it.
-    guest_idle_grace: Duration,
-    /// An external source has painted since the guest last did.
-    external_had_display: bool,
 }
-
-/// First takeover: the guest bound a scanout but has shown nothing for this long.
-const GUEST_IDLE_GRACE: Duration = Duration::from_secs(5);
-/// After the guest has taken the display back from an external source once, be much more
-/// reluctant to hand it over again -- that pattern is a slow guest, not a dead one, and swapping
-/// back and forth is worse than being late.
-const GUEST_IDLE_GRACE_AFTER_RECLAIM: Duration = Duration::from_secs(30);
 
 // Only the 2D mode is supported. Notes on `VirtioGpu` fields:
 //
@@ -1370,18 +1346,6 @@ fn gpu_diag_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("GFXSTREAM_DIAG").map_or(false, |v| !v.is_empty() && v != "0")
-    })
-}
-
-/// Master kill-switch for the pool-direct-read R<->B swap. The swap itself is applied per-frame
-/// only when the scanout's declared fourcc is R-first (see the call site) -- a drm2kgsl desktop
-/// scanout arrives RGBX (ABGR8888) and must land BGRX for the one-copy consumers, while fbcon's
-/// XRGB8888 is already BGRX and is left alone. This returns whether the swap is permitted at all;
-/// GPU_POOL_SCANOUT_NO_SWIZZLE=1 disables it globally for regression bisects.
-fn pool_scanout_swizzle() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("GPU_POOL_SCANOUT_NO_SWIZZLE").map_or(true, |v| v.is_empty() || v == "0")
     })
 }
 
@@ -1459,10 +1423,6 @@ impl VirtioGpu {
             udmabuf_driver,
             deferred_snapshot_load: None,
             pending_flip_fence: None,
-            guest_scanout_bound: false,
-            last_guest_present: None,
-            guest_idle_grace: GUEST_IDLE_GRACE,
-            external_had_display: false,
             snapshot_scratch_directory,
         })
     }
@@ -1665,6 +1625,19 @@ impl VirtioGpu {
             }
         }
 
+        // Disabling a scanout takes down whatever was overlayed on it. Until now the cursor layer
+        // only ever came down when the guest volunteered UPDATE_CURSOR with resource_id 0, which is
+        // goodwill rather than a guarantee: a guest that shows a pointer and then simply stops
+        // driving virtio-gpu (an OS handover to a driver that scans out some other way) left the
+        // last cursor image floating over the frozen last frame, because releasing the surface only
+        // drops crosvm's handle -- neither sink tears down what the viewer sees. Say it at the
+        // device's own edge instead, while the surface still exists to carry the message, and in
+        // the same two steps update_cursor's resource_id==0 arm uses.
+        if resource_id == 0 && self.cursor_scanout.parent_scanout_id == Some(scanout_id) {
+            self.cursor_scanout.set_cursor_visible(&self.display, false)?;
+            self.update_scanout_resource(SurfaceType::Cursor, None, scanout_id, None, 0)?;
+        }
+
         let r = self.update_scanout_resource(
             SurfaceType::Scanout,
             Some(scanout_rect),
@@ -1672,92 +1645,8 @@ impl VirtioGpu {
             scanout_data,
             resource_id,
         );
-        // Binding a resource to a scanout is the guest saying "I display through this device".
-        // It is a state, not an event, which is what makes it a usable owner signal: it holds
-        // while the guest is merely idle, and only a guest that unbinds (or resets) gives it up.
-        if r.is_ok() {
-            self.guest_scanout_bound = resource_id != 0;
-            if resource_id != 0 {
-                self.last_guest_present = Some(Instant::now());
-            }
-        }
         strace!("set_scanout.exit ok={}", r.is_ok());
         r
-    }
-
-    /// Whether the guest is the one putting a picture on the display right now.
-    ///
-    /// True while it has a scanout bound and has presented within the grace period. A guest that
-    /// never binds one (Windows: no virtio-gpu driver, it only writes the firmware framebuffer)
-    /// is never the owner, so the simplefb bridge can have the display from the start.
-    pub fn guest_owns_display(&self) -> bool {
-        if !self.guest_scanout_bound {
-            return false;
-        }
-        match self.last_guest_present {
-            Some(t) => t.elapsed() < self.guest_idle_grace,
-            None => true,
-        }
-    }
-
-    /// Presents a frame that did not come from the guest's virtio-gpu driver -- the VMM's simplefb
-    /// bridge. Does nothing while the guest owns the display.
-    ///
-    /// Reuses scanout 0's surface: there is only one Surface to draw on, and this is what keeps
-    /// the two sources from fighting over it (they are both this thread).
-    pub fn present_external(
-        &mut self,
-        width: u32,
-        height: u32,
-        stride: u32,
-        data: &[u8],
-    ) -> VirtioGpuResult {
-        if self.guest_owns_display() {
-            return Ok(OkNoData);
-        }
-        let scanout = self.scanouts.get_mut(&0).ok_or(ErrInvalidScanoutId)?;
-        if scanout.surface_id.is_none() {
-            let rect = virtio_gpu_rect {
-                x: Le32::from(0),
-                y: Le32::from(0),
-                width: Le32::from(width),
-                height: Le32::from(height),
-            };
-            scanout.create_surface(&self.display, None, Some(rect))?;
-        }
-        let surface_id = match scanout.surface_id {
-            Some(id) => id,
-            None => return Err(ErrUnspec),
-        };
-
-        let mut display = self.display.borrow_mut();
-        if display.next_buffer_in_use(surface_id) {
-            // The compositor still holds the last buffer; dropping this frame is right -- the
-            // bridge will offer another one in 33 ms.
-            return Ok(OkNoData);
-        }
-        let copy_height = std::cmp::min(height, scanout.height);
-        let fb = display
-            .framebuffer_region(surface_id, 0, 0, scanout.width, copy_height)
-            .ok_or(ErrUnspec)?;
-        let fb_stride = fb.stride() as usize;
-        let src_stride = stride as usize;
-        let row_bytes = std::cmp::min(fb_stride, src_stride);
-        let fb_slice = fb.as_volatile_slice();
-        for row in 0..copy_height as usize {
-            let src = row * src_stride;
-            if src + row_bytes > data.len() {
-                break;
-            }
-            fb_slice
-                .sub_slice(row * fb_stride, row_bytes)
-                .map_err(|_| ErrUnspec)?
-                .copy_from(&data[src..src + row_bytes]);
-        }
-        display.flip(surface_id);
-        drop(display);
-        self.external_had_display = true;
-        Ok(OkNoData)
     }
 
     /// If the resource is the scanout resource, flush it to the display.
@@ -1787,22 +1676,16 @@ impl VirtioGpu {
 
         for scanout in self.scanouts.values_mut() {
             if scanout.resource_id == resource_id {
-                if self.external_had_display {
-                    // The guest is presenting again after an external source had the display:
-                    // give it back at once, but raise the bar for handing it over a second time.
-                    // Swapping back and forth costs a surface reconfigure and a visible jump
-                    // each way, so a slow guest must not be able to trigger it repeatedly.
-                    self.external_had_display = false;
-                    self.guest_idle_grace = GUEST_IDLE_GRACE_AFTER_RECLAIM;
-                }
-                self.last_guest_present = Some(Instant::now());
                 scanout.flush(&self.display, resource, &mut self.rutabaga)?;
                 // A zero-copy flip may leave a completion fence on the surface: a sync_file that
                 // signals when the display's async blit has finished READING the flipped buffer.
                 // Park it for the frontend, which defers this RESOURCE_FLUSH's virtio fence until
                 // it fires -- that is what orders the guest's next render into this dmabuf against
-                // the blit. The CPU-copy paths (VNC, CpuFallback) never reach flip_to and leave
-                // this None, keeping their synchronous completion.
+                // the blit. A CpuFallback resource never reaches flip_to at all, and the VNC sink
+                // reaches it but has finished reading the source before returning, so both leave
+                // this None and keep their synchronous completion. That the VNC sink leaves it None
+                // is deliberate and load-bearing: a fence from a network sink would gate the
+                // guest's vblank on whoever happens to be watching (plan §7).
                 if let Some(id) = scanout.surface_id {
                     if let Some(fence) = self.display.borrow_mut().take_flip_completion_fence(id) {
                         self.pending_flip_fence = Some(fence);
@@ -1880,10 +1763,47 @@ impl VirtioGpu {
         self.flush_resource(resource_id)
     }
 
-    /// Moves the cursor's position to the given coordinates.
-    pub fn move_cursor(&mut self, _scanout_id: u32, x: i32, y: i32) -> VirtioGpuResult {
+    /// Moves the cursor's position to the given coordinates, on the given scanout.
+    ///
+    /// MOVE_CURSOR is the whole message a guest sends while the pointer travels with an unchanged
+    /// image, crossing between scanouts included -- so the scanout_id it carries is the only notice
+    /// the device gets that the single cursor surface now belongs somewhere else. Dropping it left
+    /// the surface parented to the scanout of the last UPDATE_CURSOR while wearing coordinates
+    /// meant for a different one: the pointer draws on the wrong screen, or at an offset on the
+    /// right one, and nothing reports an error.
+    pub fn move_cursor(&mut self, scanout_id: u32, x: i32, y: i32) -> VirtioGpuResult {
         if gpu_diag_enabled() {
-            base::warn!("CURSOR-MOVE: pos=({},{})", x, y);
+            base::warn!("CURSOR-MOVE: scanout={} pos=({},{})", scanout_id, x, y);
+        }
+        // Re-parent through the exact call update_cursor makes, so the two paths cannot describe
+        // the move differently. A single-scanout guest never reaches it: scanout_id is 0 forever
+        // and the cursor is already parented to 0, leaving position + commit as the whole of this
+        // function, as before.
+        //
+        // Only for a cursor that is actually somewhere -- a surface on screen and a live resource
+        // behind it. Re-parenting means building a new surface for the image to be flushed into,
+        // so with either missing there is nothing to move and every call below would be a
+        // surface-gated no-op anyway; asking for the move with a resource the guest has already
+        // unref'd would turn one into an error response instead.
+        if self.cursor_scanout.surface_id.is_some()
+            && self.cursor_scanout.parent_scanout_id != Some(scanout_id)
+        {
+            let cursor_resource_id = self
+                .cursor_scanout
+                .resource_id
+                .map(|id| id.get())
+                .filter(|id| self.resources.contains_key(id));
+            if let Some(resource_id) = cursor_resource_id {
+                self.update_scanout_resource(
+                    SurfaceType::Cursor, None, scanout_id, None, resource_id)?;
+                self.cursor_scanout.set_cursor_visible(&self.display, true)?;
+                // The new surface is empty until something writes the cursor image into it, and a
+                // move carries no image of its own. Push the resource the cursor already has, the
+                // same flush update_cursor ends on. (Its hotspot does not come along: MOVE_CURSOR
+                // has no hotspot field, and only VNC's RFB cursor uses one -- it keeps the last
+                // one it was given, server-wide, until the next UPDATE_CURSOR restates it.)
+                self.flush_resource(resource_id)?;
+            }
         }
         self.cursor_scanout.set_position(&self.display, x, y)?;
         self.cursor_scanout.commit(&self.display)?;
@@ -2726,6 +2646,12 @@ impl VirtioGpu {
             }
 
             scanout.resource_id = None;
+            // A cursor with no surface is overlayed onto nothing, and saying so keeps
+            // `parent_scanout_id` an answer to "where is the cursor now" rather than "where was it
+            // last" -- which is what both `move_cursor` and the scanout-disable edge ask it.
+            if matches!(scanout_type, SurfaceType::Cursor) {
+                scanout.parent_scanout_id = None;
+            }
             return Ok(OkNoData);
         }
 
@@ -2744,6 +2670,11 @@ impl VirtioGpu {
                         Some(scanout_parent_surface_id),
                         scanout_rect,
                     )?;
+                    // The parenting just happened (or was already in force -- create_surface is a
+                    // no-op when the parent is unchanged); record which scanout it was against.
+                    // Not recorded when the parent scanout has no surface of its own, because then
+                    // the cursor was not re-parented and still hangs off whatever it hung off.
+                    scanout.parent_scanout_id = Some(scanout_id);
                 }
             }
             SurfaceType::Scanout => {
@@ -2793,14 +2724,6 @@ impl VirtioGpu {
     /// over from another one (UEFI firmware -> OS) recreate resource ids from scratch -- rutabaga
     /// rejects a duplicate resource id otherwise.
     pub fn reset(&mut self) -> anyhow::Result<()> {
-        // A device reset is the guest handing the display back -- the firmware finishing, or an
-        // OS taking over from it. Whether the new guest wants to display through this device is
-        // its own decision, made by binding a scanout; until it does, another source may have the
-        // display immediately rather than after the idle grace period. This is the moment a
-        // Windows guest (no virtio-gpu driver, so it never binds one) hands over to the simplefb
-        // bridge for good.
-        self.guest_scanout_bound = false;
-        self.last_guest_present = None;
         for scanout in self.scanouts.values_mut() {
             scanout.resource_id = None;
             // Drop the previous guest's surface: update_scanout_resource() only recreates a
@@ -2825,7 +2748,18 @@ impl VirtioGpu {
                 scanout.height = height;
             }
         }
+        // Hide before releasing, and not instead of it: `release_surface` drops crosvm's handle to
+        // the surface, which at neither sink is what removes the pointer from the screen. The
+        // Android surface is never destroy_android_surface'd (the app keeps the cursor Surface and
+        // the last buffer posted to it), and `VncCursorSurface` has no Drop, so the composited
+        // pointer and the RFB cursor both outlive it. Both sinks do act on the hide -- the Android
+        // one parks the layer at CURSOR_HIDDEN_POS, VNC clears fb.cursor.visible and sends
+        // rfbSetCursor(NULL) -- but only while the surface is still here to be told.
+        self.cursor_scanout
+            .set_cursor_visible(&self.display, false)
+            .map_err(|e| anyhow::anyhow!("gpu reset: failed to hide the cursor: {}", e))?;
         self.cursor_scanout.resource_id = None;
+        self.cursor_scanout.parent_scanout_id = None;
         self.cursor_scanout.release_surface(&self.display);
         {
             let mut display = self.display.borrow_mut();

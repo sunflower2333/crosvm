@@ -3,7 +3,6 @@
 // found in the LICENSE file.
 
 mod edid;
-mod external_scanout;
 mod parameters;
 mod protocol;
 mod snapshot;
@@ -16,7 +15,6 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -53,12 +51,12 @@ use base::VmEventType;
 use base::WaitContext;
 use base::WorkerThread;
 use data_model::*;
-pub use external_scanout::ExternalScanout;
 pub use gpu_display::EventDevice;
 use gpu_display::*;
 use hypervisor::MemCacheType;
 pub use parameters::AudioDeviceMode;
 pub use parameters::GpuParameters;
+pub use parameters::VramExceedPolicy;
 use rutabaga_gfx::*;
 use serde::Deserialize;
 use serde::Serialize;
@@ -310,8 +308,16 @@ fn build(
     udmabuf: bool,
     #[cfg(windows)] gpu_display_wait_descriptor_ctrl_wr: SendTube,
     snapshot_scratch_directory: Option<PathBuf>,
+    dmabuf_import_capped: bool,
 ) -> Option<VirtioGpu> {
+    // `display_backends` is a try-in-turn chain, so a backend declining is how it is meant to
+    // work, not a fault: `--gpu` on an Android host carries an X entry that no Android host has
+    // ever been able to open. Reporting each refusal at error level as it happened made the
+    // ordinary case read as a failure -- "failed to open display: unsupported by the
+    // implementation" on every single boot -- while saying nothing about what did open. Collect
+    // them instead and report once, below, where the outcome is known.
     let mut display_opt = None;
+    let mut declined: Vec<String> = Vec::new();
     for display_backend in display_backends {
         match display_backend.build(
             #[cfg(windows)]
@@ -322,20 +328,49 @@ fn build(
                 .expect("failed to clone wait context ctrl channel"),
         ) {
             Ok(c) => {
-                display_opt = Some(c);
+                display_opt = Some((display_backend, c));
                 break;
             }
-            Err(e) => error!("failed to open display: {}", e),
+            Err(e) => declined.push(format!("{}: {}", display_backend.name(), e)),
         };
     }
 
-    let display = match display_opt {
+    let (chosen, mut display) = match display_opt {
         Some(d) => d,
         None => {
-            error!("failed to open any displays");
+            error!("failed to open any display backend ({})", declined.join("; "));
             return None;
         }
     };
+
+    // The ceiling the exporter bound to this device's screen was configured with. Applied before
+    // anything asks the display what it can do, so `try_import_resource_to_display`'s probe sees a
+    // display that refuses dmabufs and caches `CpuFallback` on the first resource, exactly as it
+    // does against a sink that genuinely has no GPU half.
+    if dmabuf_import_capped {
+        info!("gpu: transport capped to cpu copy on this screen (transport-cap=cpu)");
+        display.cap_transport_to_cpu();
+    }
+
+    // One line, and it names the outcome rather than the attempts. Landing on the stub is the
+    // case worth spelling out: it is what a GPU device does when no exporter is bound to its
+    // screen, which is a legitimate configuration -- the picture is somebody else's, the simplefb
+    // screen's or nobody's -- and it used to be indistinguishable from a broken display. Whatever
+    // was declined on the way is carried in the same line so a bound exporter that failed to open
+    // still reports its reason here.
+    let declined = if declined.is_empty() {
+        String::new()
+    } else {
+        format!(" (after {})", declined.join("; "))
+    };
+    match chosen {
+        DisplayBackend::Stub => info!(
+            "gpu: no exporter opened this device's screen; rendering to the stub display, where \
+             frames are discarded{}",
+            declined
+        ),
+        _ => info!("gpu: display backend {} opened{}", chosen.name(), declined),
+    }
 
     VirtioGpu::new(
         display,
@@ -927,10 +962,32 @@ impl Frontend {
                             GpuResponse::ErrRutabaga(RutabagaError::InvalidContextId)
                         )
                     );
+                    // A display with nowhere to put pixels refuses the cursor plane, and a guest
+                    // moving its pointer asks again for every motion sample. The stub backend --
+                    // where a GPU device lands when no exporter is bound to its screen -- returns
+                    // `Unsupported` from `create_surface` for any parented surface, so a VM whose
+                    // picture is somebody else's (the simplefb screen's, or nobody's) printed one
+                    // ERROR per pointer sample for as long as it ran. The response the guest gets
+                    // is unchanged, and the guest does not read it: cursor commands ride the
+                    // cursor queue, which the driver posts to without inspecting the reply. What
+                    // changes is that the log stops describing a working configuration as broken;
+                    // the one INFO line at display-open already said there is no screen here.
+                    let cursor_on_a_screenless_display = matches!(
+                        (&gpu_cmd, &gpu_response),
+                        (
+                            GpuCommand::UpdateCursor(_) | GpuCommand::MoveCursor(_),
+                            GpuResponse::ErrDisplay(GpuDisplayError::Unsupported)
+                        )
+                    );
                     if expected_during_teardown {
                         debug!(
                             "gpu command {:?} arrived after its context went away: {:?}",
                             gpu_cmd, gpu_response
+                        );
+                    } else if cursor_on_a_screenless_display {
+                        debug!(
+                            "gpu command {:?}: this display has no plane to put a cursor on",
+                            gpu_cmd
                         );
                     } else {
                         error!(
@@ -1071,8 +1128,6 @@ enum WorkerToken {
     /// A zero-copy flip's completion fence signaled; one token covers every pending fence and
     /// the handler polls each to find the signaled ones (they are few and short-lived).
     FlipFence,
-    /// The VMM's simplefb bridge offered a frame (see `ExternalScanout`).
-    ExternalFrame,
     #[cfg(windows)]
     DisplayDescriptorRequest,
 }
@@ -1168,9 +1223,6 @@ struct Worker {
     #[cfg(windows)]
     gpu_display_wait_descriptor_ctrl_rd: RecvTube,
     activation_resources: Option<GpuActivationResources>,
-    /// Frames from the VMM's simplefb bridge, shown while the guest is not displaying through
-    /// this device (see `ExternalScanout`).
-    external_scanout: Option<Arc<ExternalScanout>>,
 }
 
 #[derive(Copy, Clone)]
@@ -1208,7 +1260,7 @@ impl Worker {
         #[cfg(windows)] gpu_display_wait_descriptor_ctrl_rd: RecvTube,
         #[cfg(windows)] gpu_display_wait_descriptor_ctrl_wr: SendTube,
         snapshot_scratch_directory: Option<PathBuf>,
-        external_scanout: Option<Arc<ExternalScanout>>,
+        dmabuf_import_capped: bool,
     ) -> anyhow::Result<Worker> {
         let fence_state = Arc::new(Mutex::new(Default::default()));
         let fence_handler_resources = Arc::new(Mutex::new(None));
@@ -1229,6 +1281,7 @@ impl Worker {
             #[cfg(windows)]
             gpu_display_wait_descriptor_ctrl_wr,
             snapshot_scratch_directory,
+            dmabuf_import_capped,
         )
         .ok_or_else(|| anyhow!("failed to build virtio gpu"))?;
 
@@ -1253,7 +1306,6 @@ impl Worker {
             #[cfg(windows)]
             gpu_display_wait_descriptor_ctrl_rd,
             activation_resources: None,
-            external_scanout,
         })
     }
 
@@ -1262,36 +1314,18 @@ impl Worker {
         // a `WorkerRequest::Activate`, the worker will remain in `run_until_sleep_or_exit()`
         // until suspended via `kill_evt` or `suspend_evt` being signaled.
         //
-        // "Inactive" is not the same as "nothing to display". A guest with no virtio-gpu driver
-        // resets the device on its way out of the firmware and never activates it again -- that
-        // is exactly what Windows does, whose Basic Display Driver only knows the linear
-        // framebuffer the firmware left behind -- and the simplefb bridge feeding that
-        // framebuffer to this device is still running. Waiting on the request channel alone would
-        // park this thread for the rest of the VM's life with the firmware's last frame frozen on
-        // screen, which is the one case the whole arbitration exists for. So while there is a
-        // bridge, wait with a timeout and serve it in between.
+        // A guest with no virtio-gpu driver resets the device on its way out of the firmware and
+        // never activates it again -- Windows, whose Basic Display Driver only knows the linear
+        // framebuffer the firmware left behind. This thread then parks here for the rest of the
+        // VM's life, which is correct: that guest is painting the simplefb screen, and the
+        // simplefb screen has its own exporter to paint it on. This device's screen keeps the
+        // last frame the firmware put there, and nothing about that is this thread's to fix.
         loop {
-            let request = if self.external_scanout.is_some() {
-                match self.request_receiver.recv_timeout(EXTERNAL_IDLE_POLL) {
-                    Ok(r) => r,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if let Some(external) = self.external_scanout.clone() {
-                            serve_external_scanout(&external, &mut self.state.virtio_gpu);
-                        }
-                        continue;
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        info!("virtio gpu worker connection ended, exiting.");
-                        return;
-                    }
-                }
-            } else {
-                match self.request_receiver.recv() {
-                    Ok(r) => r,
-                    Err(_) => {
-                        info!("virtio gpu worker connection ended, exiting.");
-                        return;
-                    }
+            let request = match self.request_receiver.recv() {
+                Ok(r) => r,
+                Err(_) => {
+                    info!("virtio gpu worker connection ended, exiting.");
+                    return;
                 }
             };
 
@@ -1471,16 +1505,6 @@ impl Worker {
                 .context("failed adding poll event to WaitContext")?;
         }
 
-        let external_evt = self
-            .external_scanout
-            .as_ref()
-            .map(|e| e.event().try_clone());
-        if let Some(Ok(evt)) = &external_evt {
-            event_manager
-                .add(evt, WorkerToken::ExternalFrame)
-                .context("failed adding the external scanout event to WaitContext")?;
-        }
-
         self.resource_bridges
             .add_to_wait_context(&mut event_manager.wait_ctx);
 
@@ -1534,16 +1558,6 @@ impl Worker {
 
             for event in events.iter().filter(|e| e.is_readable) {
                 match event.token {
-                    WorkerToken::ExternalFrame => {
-                        // The simplefb bridge has a frame. It only offers one while the guest is
-                        // not displaying through this device, and `present_external` checks that
-                        // again here, in the thread that owns the display -- so the two sources
-                        // can never be mid-frame at the same time.
-                        if let Some(external) = self.external_scanout.clone() {
-                            let _ = external.event().wait();
-                            serve_external_scanout(&external, &mut self.state.virtio_gpu);
-                        }
-                    }
                     WorkerToken::CtrlQueue => {
                         let _ = ctrl_evt.wait();
                         // Set flag that control queue is available to be read, but defer reading
@@ -1642,18 +1656,6 @@ impl Worker {
                 signal_used_ctrl = true;
             }
 
-            // Republish who owns the display after every batch of guest commands. This is where
-            // ownership actually changes -- a scanout bound or unbound, a device reset at OS
-            // handover -- and the bridge reads the flag to decide whether to bother producing a
-            // frame at all. Updating it only when a frame arrives would make the first "the guest
-            // owns it" observation permanent: the bridge stops offering, nothing wakes this
-            // thread, and the flag can never go back. That is exactly the handover this exists
-            // for (firmware paints through virtio-gpu, then Windows, which has no virtio-gpu
-            // driver, never binds a scanout again).
-            if let Some(external) = &self.external_scanout {
-                external.set_guest_owns(self.state.virtio_gpu.guest_owns_display());
-            }
-
             // Process the entire control queue before the resource bridge in case a resource is
             // created or destroyed by the control queue. Processing the resource bridge first may
             // lead to a race condition.
@@ -1713,14 +1715,57 @@ pub enum DisplayBackend {
     /// via this name, and pass the surface to it.
     Android(String),
     #[cfg(feature = "vnc")]
-    /// Start a VNC server for remote display access.
-    /// VncTcp(addr, width, height, password, touch_input) listens on a TCP address.
-    /// touch_input=false (default) injects pointer events as an absolute mouse;
-    /// touch_input=true keeps the older multi-touch touchscreen behavior.
-    VncTcp(String, u32, u32, Option<String>, bool),
+    /// Start a VNC server for remote display access on a TCP address.
+    ///
+    /// Named fields rather than a tuple: the list is long enough that "which of these is which" at
+    /// the call site is exactly the kind of question a struct answers for free.
+    VncTcp {
+        addr: String,
+        width: u32,
+        height: u32,
+        password: Option<String>,
+        /// Whether this binding may run the hardware H.264 encoder and serve the stream to RFB
+        /// clients that ask for encoding 50. Resolved by the caller from the transport ceiling
+        /// (see `VncConfig::h264_enabled`); there is no port, the stream rides `addr`.
+        hw_encode: bool,
+        /// This binding's own absolute pointer and keyboard, parked until the sink is built.
+        ///
+        /// Behind an `Arc<Mutex<..>>` because of what this enum is: a CLONEABLE entry in a
+        /// try-in-turn chain whose `build` takes `&self`. An `EventDevice` owns a socket and can be
+        /// neither cloned nor moved out of a `&self`, so the devices are parked here and taken by
+        /// whichever `build` call succeeds. The chain stops at the first success, so they are taken
+        /// at most once; if this entry declines, the next backend leaves them alone and they are
+        /// dropped with the config.
+        ///
+        /// Empty inside means `view-only=true` -- a binding that was given no input devices -- which
+        /// is a different thing from devices already taken, but neither can reach a second `build`.
+        /// The lock is an artifact of `&self`, not of sharing: after `build`, one thread owns them.
+        vnc_input: Arc<Mutex<VncBindingInput>>,
+    },
 }
 
 impl DisplayBackend {
+    /// What this entry is called when the chain reports which of them opened and which declined.
+    ///
+    /// Deliberately not the `Debug` derive: the Android and VNC variants carry a service name and
+    /// a listen address, and a log line about which backend opened is not the place to repeat
+    /// either. What a reader needs is which kind it was.
+    fn name(&self) -> &'static str {
+        match self {
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            DisplayBackend::Wayland(_) => "wayland",
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            DisplayBackend::X(_) => "x",
+            DisplayBackend::Stub => "stub",
+            #[cfg(windows)]
+            DisplayBackend::WinApi => "winapi",
+            #[cfg(feature = "android_display")]
+            DisplayBackend::Android(_) => "android",
+            #[cfg(feature = "vnc")]
+            DisplayBackend::VncTcp { .. } => "vnc",
+        }
+    }
+
     fn build(
         &self,
         #[cfg(windows)] wndproc_thread: &mut Option<WindowProcedureThread>,
@@ -1748,32 +1793,27 @@ impl DisplayBackend {
             #[cfg(feature = "android_display")]
             DisplayBackend::Android(service_name) => GpuDisplay::open_android(service_name),
             #[cfg(feature = "vnc")]
-            DisplayBackend::VncTcp(addr, width, height, password, touch_input) => {
-                GpuDisplay::open_vnc_tcp(addr, *width, *height, password.clone(), *touch_input)
+            DisplayBackend::VncTcp {
+                addr,
+                width,
+                height,
+                password,
+                hw_encode,
+                vnc_input,
+            } => {
+                let input = std::mem::take(&mut *vnc_input.lock());
+                GpuDisplay::open_vnc_tcp(
+                    addr,
+                    *width,
+                    *height,
+                    password.clone(),
+                    *hw_encode,
+                    input.tablet,
+                    input.keyboard,
+                )
             }
         }
     }
-}
-
-/// How long the worker parks on the request channel before looking at the simplefb bridge again,
-/// while no driver has the device activated. The bridge produces at 30 fps, so this is one frame:
-/// long enough that a device nobody is displaying through costs nothing, short enough that a
-/// Windows desktop is not a third of a second behind itself.
-const EXTERNAL_IDLE_POLL: Duration = Duration::from_millis(33);
-
-/// Take whatever the simplefb bridge is offering and put it on the display.
-///
-/// Both callers are the gpu worker thread: the event loop while the device is active, and the
-/// request loop while it is not. Ownership is re-evaluated on the way out, because this is the
-/// only place it is evaluated at all -- the bridge only ever reads the flag.
-fn serve_external_scanout(external: &ExternalScanout, virtio_gpu: &mut VirtioGpu) {
-    let (w, h, stride) = (external.width(), external.height(), external.stride());
-    external.take_frame(|frame| {
-        if let Err(e) = virtio_gpu.present_external(w, h, stride, frame) {
-            error!("failed to present an external frame: {:?}", e);
-        }
-    });
-    external.set_guest_owns(virtio_gpu.guest_owns_display());
 }
 
 pub struct Gpu {
@@ -1791,8 +1831,6 @@ pub struct Gpu {
     display_params: Vec<GpuDisplayParameters>,
     /// What the guest is told in `virtio_gpu_config.num_scanouts`. Zero means render-only.
     num_scanouts: u32,
-    /// Frames from the VMM's simplefb bridge, if this VM has one (see `ExternalScanout`).
-    external_scanout: Option<Arc<ExternalScanout>>,
     display_event: Arc<AtomicBool>,
     rutabaga_builder: RutabagaBuilder,
     pci_address: Option<PciAddress>,
@@ -1818,6 +1856,14 @@ pub struct Gpu {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     gpu_cgroup_path: Option<PathBuf>,
     snapshot_scratch_directory: Option<PathBuf>,
+    /// Whether the exporter bound to this device's screen capped its transport to a CPU copy.
+    ///
+    /// Not a `GpuParameters` field, and that is the point: the ceiling belongs to the *binding*
+    /// between one exporter and one screen (`--vnc-server ...,transport-cap=`, `
+    /// --android-display-service ...,transport-cap=`), not to the GPU device, which has no opinion
+    /// about how its frames leave. Set after construction because that is where a caller can read
+    /// the binding -- `Gpu::new` takes the display backends but not the config they came from.
+    dmabuf_import_capped: bool,
 }
 
 /// Default real time priority for the virtio-gpu worker thread.
@@ -1899,7 +1945,6 @@ impl Gpu {
         channels: &BTreeMap<String, PathBuf>,
         #[cfg(windows)] wndproc_thread: WindowProcedureThread,
         #[cfg(any(target_os = "android", target_os = "linux"))] gpu_cgroup_path: Option<&PathBuf>,
-        external_scanout: Option<Arc<ExternalScanout>>,
     ) -> Gpu {
         let mut display_params = gpu_parameters.display_params.clone();
         // Zero configured displays is a real configuration, not an oversight: the picture comes
@@ -1970,99 +2015,7 @@ impl Gpu {
         let (gpu_display_wait_descriptor_ctrl_wr, gpu_display_wait_descriptor_ctrl_rd) =
             Tube::directional_pair().expect("failed to create wait descriptor control pair.");
 
-        // DroidVM: host-visible blob folio backing lives in the crosvm GPU backend (not gfxstream).
-        // Split of concerns: the *folio mechanism* + `threshold` / `exceed-policy` are VMM policy
-        // (Vm::prepare_runtime_blob_backing over the mapper Tube -- Gunyah folds each blob into 2MB
-        // order-9 folios so its later SHARE is stage-2/exec clean; KVM/gzvm no-op). The
-        // host-visible VRAM *quota* is metered HERE, GPU-side, so the GPU cannot monopolise
-        // host-visible memory and starve peer devices (e.g. virtio-fs). gfxstream's prepare/release
-        // callbacks bridge to this via the process-global handlers.
         let mapper: Arc<Mutex<Option<Box<dyn SharedMemoryMapper>>>> = Arc::new(Mutex::new(None));
-        #[cfg(feature = "gfxstream")]
-        {
-            // CMDLINE_V2 v3 decoupling: the prepare callback is ALWAYS registered -- it is a pure
-            // bridge (dup the blob's shmem fd to the VMM, which applies its own folio policy per
-            // `--runtime-share`; KVM/gzvm no-op). `vram-limit` only decides quota *metering*:
-            // None/0 => unmetered; -1 => explicitly unlimited (unmetered, but "defined" so it can
-            // enable fusion routing); N>0 => cap of N MB. udmabuf=true (guest-alloc) => unmetered:
-            // the pre-alloc pool itself is the VRAM cap there.
-            let quota: Option<u64> = if gpu_parameters.udmabuf {
-                None
-            } else {
-                match gpu_parameters.vram_limit {
-                    Some(n) if n > 0 => Some((n as u64) << 20),
-                    _ => None,
-                }
-            };
-            const THP: u64 = 2 * 1024 * 1024;
-            let used = Arc::new(AtomicU64::new(0));
-            let used_p = Arc::clone(&used);
-            let used_r = Arc::clone(&used);
-            let mapper_p = Arc::clone(&mapper);
-            rutabaga_gfx::register_blob_backing_handlers(
-                Box::new(move |memfd: i32, size: u64| -> i64 {
-                    let rounded = (size + THP - 1) & !(THP - 1);
-                    if let Some(quota) = quota {
-                        // Reserve the worst case (a full 2MB folio) against the GPU's quota first,
-                        // so we never overshoot and starve peer devices. If it doesn't fit, decline
-                        // to folio -- the blob stays 4K rather than eating another device's memory.
-                        let mut cur = used_p.load(Ordering::Relaxed);
-                        loop {
-                            if cur + rounded > quota {
-                                return 0;
-                            }
-                            match used_p.compare_exchange_weak(
-                                cur,
-                                cur + rounded,
-                                Ordering::Relaxed,
-                                Ordering::Relaxed,
-                            ) {
-                                Ok(_) => break,
-                                Err(actual) => cur = actual,
-                            }
-                        }
-                    }
-                    // SAFETY: dup a private copy of the blob's shmem fd for the VM backend;
-                    // gfxstream keeps the original. from_raw_descriptor owns the dup.
-                    let dup = unsafe { libc::dup(memfd) };
-                    let backed = if dup < 0 {
-                        Ok(0)
-                    } else {
-                        let sd = unsafe { SafeDescriptor::from_raw_descriptor(dup) };
-                        match mapper_p.lock().as_mut() {
-                            Some(m) => m.prepare_blob_backing(sd, size),
-                            None => Ok(0),
-                        }
-                    };
-                    match backed {
-                        Ok(backed) => {
-                            // Correct the reservation to what was actually folio-backed (<= rounded;
-                            // 0 when below threshold, fell back, or no folio backend).
-                            if quota.is_some() && backed < rounded {
-                                used_p.fetch_sub(rounded - backed, Ordering::Relaxed);
-                            }
-                            backed as i64
-                        }
-                        Err(e) => {
-                            // The VMM refused the backing (--runtime-share exceed-policy=oom with
-                            // the reserve exhausted): fail the allocation -- gfxstream turns a
-                            // negative return into VK_ERROR_OUT_OF_DEVICE_MEMORY.
-                            base::warn!("VMM refused blob backing (exceed-policy=oom?): {:#}", e);
-                            if quota.is_some() {
-                                used_p.fetch_sub(rounded, Ordering::Relaxed);
-                            }
-                            -1
-                        }
-                    }
-                }),
-                Box::new(move |charged: u64| {
-                    if charged != 0 {
-                        used_r.fetch_sub(charged, Ordering::Relaxed);
-                    }
-                }),
-            );
-        }
-
         Gpu {
             exit_evt_wrtube,
             gpu_control_tube: Some(gpu_control_tube),
@@ -2077,7 +2030,6 @@ impl Gpu {
             display_backends,
             display_params,
             num_scanouts,
-            external_scanout,
             display_event: Arc::new(AtomicBool::new(false)),
             rutabaga_builder,
             pci_address: gpu_parameters.pci_address,
@@ -2098,7 +2050,19 @@ impl Gpu {
             #[cfg(any(target_os = "android", target_os = "linux"))]
             gpu_cgroup_path: gpu_cgroup_path.cloned(),
             snapshot_scratch_directory: gpu_parameters.snapshot_scratch_path.clone(),
+            dmabuf_import_capped: false,
         }
+    }
+
+    /// Caps this device's screen to the CPU transport, for a binding configured
+    /// `transport-cap=cpu`.
+    ///
+    /// Must be called before the device is activated, which is when the display is opened and the
+    /// cap applied; there is no way to change it afterwards, deliberately (see
+    /// `GpuDisplay::cap_transport_to_cpu`). Ceilings only remove options from a negotiation whose
+    /// floor is a CPU copy, so this cannot fail and there is nothing to report.
+    pub fn cap_transport_to_cpu(&mut self) {
+        self.dmabuf_import_capped = true;
     }
 
     /// Initializes the internal device state so that it can begin processing virtqueues.
@@ -2136,6 +2100,7 @@ impl Gpu {
                 .try_clone()
                 .expect("failed to clone wait context control channel"),
             self.snapshot_scratch_directory.clone(),
+            self.dmabuf_import_capped,
         )?;
 
         for event_device in self.event_devices.take().expect("missing event_devices") {
@@ -2182,6 +2147,7 @@ impl Gpu {
         let fixed_blob_mapping = self.fixed_blob_mapping;
         let udmabuf = self.udmabuf;
         let snapshot_scratch_directory = self.snapshot_scratch_directory.clone();
+        let dmabuf_import_capped = self.dmabuf_import_capped;
 
         #[cfg(windows)]
         let mut wndproc_thread = self.wndproc_thread.take();
@@ -2213,7 +2179,6 @@ impl Gpu {
         let (worker_request_sender, worker_request_receiver) = mpsc::channel();
         let (worker_response_sender, worker_response_receiver) = mpsc::channel();
 
-        let external_scanout = self.external_scanout.clone();
         let worker_thread = WorkerThread::start("v_gpu", move |kill_evt| {
             #[cfg(any(target_os = "android", target_os = "linux"))]
             if let Some(cgroup_path) = gpu_cgroup_path {
@@ -2246,7 +2211,7 @@ impl Gpu {
                 #[cfg(windows)]
                 gpu_display_wait_descriptor_ctrl_wr,
                 snapshot_scratch_directory,
-                external_scanout,
+                dmabuf_import_capped,
             )
             .expect("Failed to create virtio gpu worker thread");
 

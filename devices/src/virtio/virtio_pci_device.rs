@@ -1633,12 +1633,6 @@ impl SharedMemoryMapper for VmRequester {
         Ok(gunyah_handle)
     }
 
-    fn prepare_blob_backing(&mut self, fd: SafeDescriptor, size: u64) -> anyhow::Result<u64> {
-        self.vm_memory_client
-            .prepare_blob_backing(fd, size)
-            .context("prepare_blob_backing failed")
-    }
-
     fn remove_mapping(&mut self, offset: u64) -> anyhow::Result<()> {
         let id = self.mappings.remove(&offset).context("invalid offset")?;
         self.vm_memory_client
