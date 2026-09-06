@@ -1789,40 +1789,6 @@ impl Vm for GunyahVm {
         self.unshare_blob(label)
     }
 
-    // Host-visible blob backing: fold each blob's shmem into a 2MB order-9 folio *before* it is
-    // pinned (formerly gfxstream's HostVisibleFolio; moved here so the GPU backend is
-    // backend-agnostic and gzvm/etc. reuse it). A 2MB-clean blob's later SHARE (share_blob) never
-    // splits a hyp stage-2 block shared with LENT guest RAM -> no EXEC strip. `threshold` /
-    // `exceed-policy` are VMM policy (here); the host-visible VRAM quota is metered on the GPU side.
-    fn prepare_runtime_blob_backing(
-        &mut self,
-        fd: &dyn base::AsRawDescriptor,
-        size: u64,
-    ) -> Result<u64> {
-        // Folio policy is VMM-owned (--runtime-share hugepage-threshold-kb=,exceed-policy=),
-        // read from hv_cfg -- no per-blob arg from the GPU side.
-        if size < self.hv_cfg.folio_threshold_bytes {
-            return Ok(0); // below threshold -> 4K direct-supply path
-        }
-        let rounded = mthp::round_up_2mb(size);
-
-        // SAFETY: fd is a live growable shmem descriptor for this blob (owned by the GPU backend
-        // for the blob's lifetime); folio_back_fd only grows + collapses it.
-        if let Err(e) = unsafe { mthp::folio_back_fd(fd.as_raw_descriptor(), rounded) } {
-            // Reserve/CMA exhausted (or collapse failed): honour the exceed-policy.
-            warn!("GH-FOLIO: folio_back_fd failed ({}); size=0x{:x}", e, size);
-            if self.hv_cfg.folio_oom_on_exceed {
-                return Err(Error::new(e.raw_os_error().unwrap_or(EINVAL)));
-            }
-            return Ok(0); // fallback: leave it on the 4K path
-        }
-        debug!(
-            "GH-FOLIO: blob size=0x{:x} -> 2MB folios rounded=0x{:x}",
-            size, rounded
-        );
-        Ok(rounded)
-    }
-
     fn prepare_blob_range(
         &mut self,
         fd: &dyn base::AsRawDescriptor,
