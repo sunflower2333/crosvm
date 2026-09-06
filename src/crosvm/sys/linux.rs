@@ -2369,9 +2369,6 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         if let Some(mb) = pa.venus_host_mb {
             std::env::set_var("NCTX_VENUS_POOL_MB", mb.to_string());
         }
-        if let Some(v) = pa.alloc_from_vm_sys_ram {
-            std::env::set_var("NCTX_POOL_FROM_SYSRAM", if v { "1" } else { "0" });
-        }
         if let Some(mb) = pa.test_pool_mb {
             std::env::set_var("DROIDVM_TEST_POOL_MB", mb.to_string());
         }
@@ -4291,11 +4288,21 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             }
         };
 
+        // The bridge opens the exporter on its own thread, so this is the only way it can tell
+        // the VM that the address it was given is unusable; see start_simplefb_display_thread.
+        let vm_evt = match vm_evt_wrtube.try_clone() {
+            Ok(tube) => tube,
+            Err(e) => {
+                error!("simplefb: failed to clone VM event tube: {}", e);
+                return None;
+            }
+        };
         match simplefb_display::start_simplefb_display_thread(
             guest_mem,
             params,
             target,
             transport_cap,
+            vm_evt,
         ) {
             Ok(handle) => {
                 info!("simplefb display bridge started");
