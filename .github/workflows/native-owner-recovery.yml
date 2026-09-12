@@ -18,9 +18,9 @@ jobs:
           fetch-depth: 1
       - uses: dtolnay/rust-toolchain@stable
       - name: Actual allocation and recovery implementation with OS fault seams
-        run: cargo test --manifest-path devices/tests/native_owner_recovery/Cargo.toml --locked
+        run: cargo +stable test --manifest-path devices/tests/native_owner_recovery/Cargo.toml --locked
       - name: Actual protocol and discovery encoder
-        run: cargo test --manifest-path devices/tests/shared_allocation_wire/Cargo.toml --locked
+        run: cargo +stable test --manifest-path devices/tests/shared_allocation_wire/Cargo.toml --locked
       - name: Verify canonical wire layout
         run: |
           cc -std=c11 -Wall -Wextra -Werror -x c -fsyntax-only include/dvsa_protocol.h

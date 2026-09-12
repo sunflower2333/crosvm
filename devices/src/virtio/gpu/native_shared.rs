@@ -27,6 +27,7 @@ const MAX_RECOVERY_RECORDS: usize = 4096;
 struct RecoveryRecord {
     identity: NativeAllocationIdentity,
     released: bool,
+    cleanup_started: bool,
 }
 
 struct Owner {
@@ -129,7 +130,7 @@ impl VirtioGpu {
                 return Err(ErrInvalidParameter);
             }
             self.native_allocations.recovery.insert(wanted.resource_id,
-                RecoveryRecord { identity: wanted, released: true });
+                RecoveryRecord { identity: wanted, released: true, cleanup_started: true });
             return self.shared_owner_response(request.query, OWNER_RELEASED);
         };
         if record.identity.context_id != wanted.context_id ||
@@ -139,6 +140,7 @@ impl VirtioGpu {
         }
         if record.released { return self.shared_owner_response(request.query, OWNER_RELEASED); }
         if cleanup {
+            self.native_allocations.recovery.get_mut(&wanted.resource_id).unwrap().cleanup_started = true;
             // Mapping receipt and renderer identity remain host-owned. A
             // transient KGSL/Gunyah failure returns RETAINED and can be retried.
             if self.native_allocations.ledger.mapping_receipt(record.identity).is_some() &&
@@ -231,7 +233,8 @@ impl VirtioGpu {
         let identity = self.native_allocations.ledger.reserve(generation,
             request.query.hdr.ctx_id.to_native(), resource_id).ok_or(ErrOutOfMemory)?;
         if recoverable {
-            self.native_allocations.recovery.insert(resource_id, RecoveryRecord { identity, released: false });
+            self.native_allocations.recovery.insert(resource_id,
+                RecoveryRecord { identity, released: false, cleanup_started: false });
         }
         let allocated = self.display.borrow_mut().allocate_shared_buffer(width, height);
         let allocation = match allocated {
@@ -299,6 +302,9 @@ impl VirtioGpu {
     }
 
     pub(super) fn map_native_allocation(&mut self, resource_id: u32, offset: u64) -> VirtioGpuResult {
+        if self.native_allocations.recovery.get(&resource_id).is_some_and(|record| record.cleanup_started) {
+            return Err(ErrInvalidParameter);
+        }
         let generation = self.native_generation();
         let owner = self.native_allocations.owners.get(&resource_id).ok_or(ErrInvalidResourceId)?;
         let identity = owner.identity;
@@ -339,6 +345,9 @@ impl VirtioGpu {
             return Err(ErrInvalidParameter);
         }
         let identity = Self::shared_identity(request.query);
+        if self.native_allocations.recovery.get(&identity.resource_id).is_some_and(|record| record.cleanup_started) {
+            return Err(ErrInvalidParameter);
+        }
         let generation = self.native_generation();
         let receipt = self.native_allocations.ledger.mapping_receipt(identity).ok_or(ErrInvalidParameter)?;
         if receipt.offset != request.bar_offset.to_native() || receipt.size != request.mapped_size.to_native() {

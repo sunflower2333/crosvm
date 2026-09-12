@@ -257,6 +257,18 @@ mod tests {
         assert_eq!(gpu.display.borrow().releases.get(), 1);
     }
     #[test]
+    fn cleanup_failure_never_restores_mapping_or_ack_admission() {
+        let mut gpu = gpu(); let epoch = session(&mut gpu);
+        assert!(gpu.allocate_recoverable(allocate(epoch)).is_ok());
+        gpu.rutabaga.release_failed = true;
+        response(gpu.recover_shared_owner(owner(epoch, true), true), OWNER_RETAINED);
+        assert!(gpu.map_native_allocation(91, 8 << 20).is_err());
+        assert_eq!(gpu.mapper.lock().as_ref().unwrap().unmaps, 0);
+        assert_eq!(gpu.display.borrow().releases.get(), 0);
+        gpu.rutabaga.release_failed = false;
+        response(gpu.recover_shared_owner(owner(epoch, true), true), OWNER_RELEASED);
+    }
+    #[test]
     fn never_submitted_or_preallocation_error_requires_terminal_seal_not_empty_query() {
         let mut gpu = gpu(); let epoch = session(&mut gpu);
         response(gpu.recover_shared_owner(owner(epoch, false), false), OWNER_UNKNOWN);
