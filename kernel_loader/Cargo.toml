@@ -1,0 +1,18 @@
+[package]
+name = "kernel_loader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+data_model = { path = "../common/data_model" }
+libc = "0.2"
+base = { path = "../base" }
+lz4_flex = "0.11"
+remain = "0.2"
+resources = { path = "../resources" }
+thiserror = "1"
+vm_memory = { path = "../vm_memory" }
+zerocopy = { version = "0.8.13", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"

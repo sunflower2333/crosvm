@@ -1,0 +1,15 @@
+[package]
+name = "metrics_generic"
+version = "0.1.0"
+authors = ["The ChromiumOS Authors"]
+edition = "2021"
+
+[features]
+default = []
+experimental = []
+collect = []
+
+[dependencies]
+anyhow = "1"
+base = { path = "../../../base" }
+metrics_events = { path = "../../../metrics_events" }

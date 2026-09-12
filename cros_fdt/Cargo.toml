@@ -1,0 +1,11 @@
+[package]
+name = "cros_fdt"
+version = "0.1.0"
+authors = ["The ChromiumOS Authors"]
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+indexmap = "1"
+remain = "0.2"
+thiserror = "1.0.20"

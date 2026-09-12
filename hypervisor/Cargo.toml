@@ -1,0 +1,55 @@
+[package]
+name = "hypervisor"
+version = "0.1.0"
+authors = ["The ChromiumOS Authors"]
+edition = "2021"
+
+[features]
+enable_haxm_tests = []
+haxm = []
+whpx = []
+geniezone = []
+gvm = []
+gunyah = []
+noncoherent-dma = []
+
+[dependencies]
+anyhow = "1"
+bit_field = { path = "../bit_field" }
+bitflags = "2.2.1"
+cros_fdt = { path = "../cros_fdt" }
+data_model = { path = "../common/data_model" }
+downcast-rs = "1.2.0"
+enumn = "0.1.0"
+fnv = "1"
+libc = "0.2"
+once_cell = "1.7"
+resources = { path = "../resources" }
+serde = { version = "1", features = [ "derive" ] }
+serde_json = { version = "1" }
+snapshot = { workspace = true }
+sync = { path = "../common/sync" }
+base = { path = "../base" }
+vm_memory = { path = "../vm_memory" }
+
+[target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
+kvm_sys = { path = "../kvm_sys" }
+
+[target.'cfg(target_arch = "x86_64")'.dev-dependencies]
+hypervisor_test_macro = { path = "hypervisor_test_macro" }
+zerocopy = { version = "0.8.13", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+thiserror = "1"
+winapi = "0.3"
+win_util = { path = "../win_util" }
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.39.0"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+]
+
+[target.'cfg(windows)'.dev-dependencies]
+tempfile = "3"

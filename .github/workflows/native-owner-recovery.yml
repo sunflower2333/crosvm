@@ -1,0 +1,37 @@
+name: Native shared owner recovery production contracts
+on:
+  workflow_dispatch:
+  push:
+    branches: [work/native-owner-recovery-20260912, ci/native-owner-recovery-20260912]
+permissions:
+  contents: read
+jobs:
+  production:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Actual allocation and recovery implementation with OS fault seams
+        run: cargo test --manifest-path devices/tests/native_owner_recovery/Cargo.toml --locked
+      - name: Actual protocol and discovery encoder
+        run: cargo test --manifest-path devices/tests/shared_allocation_wire/Cargo.toml --locked
+      - name: Verify canonical wire layout
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -x c -fsyntax-only include/dvsa_protocol.h
+          c++ -std=c++17 -Wall -Wextra -Werror -x c++ -fsyntax-only include/dvsa_protocol.h
+          sha256sum include/dvsa_protocol.h
+      - name: Preserve exact source identities
+        run: |
+          mkdir -p recovery-evidence
+          git rev-parse HEAD > recovery-evidence/commit.txt
+          sha256sum include/dvsa_protocol.h devices/src/virtio/gpu/native_shared.rs devices/src/virtio/gpu/shared_allocation_protocol.rs vm_control/src/native_allocation.rs > recovery-evidence/source.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: owner-recovery-${{ matrix.runner }}
+          path: recovery-evidence

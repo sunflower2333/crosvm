@@ -1,0 +1,176 @@
+// Copyright 2024 The ChromiumOS Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+//! Dbus monitor for polling signal from powerd to update power properties.
+
+use std::error::Error;
+use std::os::unix::io::RawFd;
+
+use base::AsRawDescriptor;
+use base::RawDescriptor;
+use base::ReadNotifier;
+use dbus::ffidisp::BusType;
+use dbus::ffidisp::Connection;
+use dbus::ffidisp::ConnectionItem;
+use dbus::ffidisp::WatchEvent;
+use protobuf::Message;
+use remain::sorted;
+use thiserror::Error;
+
+use crate::powerd::POWER_INTERFACE_NAME;
+use crate::protos::power_supply_properties::PowerSupplyProperties;
+use crate::BatteryData;
+use crate::PowerData;
+use crate::PowerMonitor;
+
+// Signal name from power_manager/dbus_constants.h.
+const POLL_SIGNAL_NAME: &str = "PowerSupplyPoll";
+
+#[sorted]
+#[derive(Error, Debug)]
+pub enum DBusMonitorError {
+    #[error("failed to convert protobuf message: {0}")]
+    ConvertProtobuf(protobuf::Error),
+    #[error("failed to add D-Bus match rule: {0}")]
+    DBusAddMatch(dbus::Error),
+    #[error("failed to connect to D-Bus: {0}")]
+    DBusConnect(dbus::Error),
+    #[error("failed to read D-Bus message: {0}")]
+    DBusRead(dbus::arg::TypeMismatchError),
+    #[error("multiple D-Bus fds")]
+    MultipleDBusFd,
+    #[error("no D-Bus fd")]
+    NoDBusFd,
+}
+
+pub struct DBusMonitor {
+    connection: Connection,
+    connection_fd: RawFd,
+    previous_data: Option<BatteryData>,
+}
+
+impl DBusMonitor {
+    /// Connects and configures a new D-Bus connection to listen for powerd's PowerSupplyPoll
+    /// signal.
+    pub fn connect() -> std::result::Result<Box<dyn PowerMonitor>, Box<dyn Error>> {
+        let connection =
+            Connection::get_private(BusType::System).map_err(DBusMonitorError::DBusConnect)?;
+        connection
+            .add_match(&format!(
+                "interface='{}',member='{}'",
+                POWER_INTERFACE_NAME, POLL_SIGNAL_NAME
+            ))
+            .map_err(DBusMonitorError::DBusAddMatch)?;
+        // Get the D-Bus connection's fd for async I/O. This should always return a single fd.
+        let fds: Vec<RawFd> = connection
+            .watch_fds()
+            .into_iter()
+            .filter(|w| w.readable())
+            .map(|w| w.fd())
+            .collect();
+        if fds.is_empty() {
+            return Err(DBusMonitorError::NoDBusFd.into());
+        }
+        if fds.len() > 1 {
+            return Err(DBusMonitorError::MultipleDBusFd.into());
+        }
+        Ok(Box::new(Self {
+            connection,
+            connection_fd: fds[0],
+            previous_data: None,
+        }))
+    }
+}
+
+fn denoise_value(new_val: u32, prev_val: u32, margin: f64) -> u32 {
+    if new_val.abs_diff(prev_val) as f64 / prev_val.min(new_val).max(1) as f64 >= margin {
+        new_val
+    } else {
+        prev_val
+    }
+}
+
+impl PowerMonitor for DBusMonitor {
+    /// Returns the newest pending `PowerData` message, if any.
+    /// Callers should poll `PowerMonitor` to determine when messages are available.
+    fn read_message(&mut self) -> std::result::Result<Option<PowerData>, Box<dyn Error>> {
+        // Select the newest available power message before converting to protobuf.
+        let newest_message: Option<dbus::Message> = self
+            .connection
+            .watch_handle(
+                self.connection_fd,
+                WatchEvent::Readable as std::os::raw::c_uint,
+            )
+            .fold(None, |last, item| match item {
+                ConnectionItem::Signal(message) => {
+                    // Ignore non-matching signals: although match rules are configured, some system
+                    // signals can still get through, eg. NameAcquired.
+                    let interface = match message.interface() {
+                        Some(i) => i,
+                        None => {
+                            return last;
+                        }
+                    };
+
+                    if &*interface != POWER_INTERFACE_NAME {
+                        return last;
+                    }
+
+                    let member = match message.member() {
+                        Some(m) => m,
+                        None => {
+                            return last;
+                        }
+                    };
+
+                    if &*member != POLL_SIGNAL_NAME {
+                        return last;
+                    }
+
+                    Some(message)
+                }
+                _ => last,
+            });
+
+        let previous_data = self.previous_data.take();
+        match newest_message {
+            Some(message) => {
+                let data_bytes: Vec<u8> = message.read1().map_err(DBusMonitorError::DBusRead)?;
+                let mut props = PowerSupplyProperties::new();
+                props
+                    .merge_from_bytes(&data_bytes)
+                    .map_err(DBusMonitorError::ConvertProtobuf)?;
+                let mut data: PowerData = props.into();
+                if let (Some(new_data), Some(previous)) = (data.battery.as_mut(), previous_data) {
+                    // The raw information from powerd signals isn't really that useful to
+                    // the guest. Voltage/current are volatile values, so the .0333 hZ
+                    // snapshot provided by powerd isn't particularly meaningful. We do
+                    // need to provide *something*, but we might as well make it less noisy
+                    // to avoid having the guest try to process mostly useless information.
+                    // charge_counter is potentially useful to the guest, but it doesn't
+                    // need to be higher precision than battery.percent.
+                    new_data.voltage = denoise_value(new_data.voltage, previous.voltage, 0.1);
+                    new_data.current = denoise_value(new_data.current, previous.current, 0.1);
+                    new_data.charge_counter =
+                        denoise_value(new_data.charge_counter, previous.charge_counter, 0.01);
+                }
+                self.previous_data = data.battery;
+                Ok(Some(data))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+impl AsRawDescriptor for DBusMonitor {
+    fn as_raw_descriptor(&self) -> RawDescriptor {
+        self.connection_fd
+    }
+}
+
+impl ReadNotifier for DBusMonitor {
+    fn get_read_notifier(&self) -> &dyn AsRawDescriptor {
+        self
+    }
+}

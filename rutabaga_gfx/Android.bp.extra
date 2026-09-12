@@ -1,0 +1,49 @@
+// Manually written variant of librutabaga_gfx.
+// See https://r.android.com/2965726
+rust_library {
+    name: "librutabaga_gfx_gfxstream",
+    host_supported: true,
+    vendor_available: true,
+    crate_name: "rutabaga_gfx",
+    cargo_env_compat: true,
+    cargo_pkg_version: "0.1.2",
+    srcs: ["src/lib.rs"],
+    edition: "2021",
+    rustlibs: [
+        "libcfg_if",
+        "liblibc",
+        "liblog_rust",
+        "libnix",
+        "libserde",
+        "libserde_json",
+        "libthiserror",
+        "libzerocopy",
+    ],
+    proc_macros: ["libremain"],
+    target: {
+        host: {
+            cfgs: [
+                "fence_passing_option1",
+                "gfxstream_unstable",
+            ],
+            features: [
+                "gfxstream",
+                "vulkano",
+            ],
+            shared_libs: [
+                "libgfxstream_backend",
+            ],
+            compile_multilib: "64",
+            rustlibs: [
+                "libvulkano",
+            ],
+        },
+        android: {
+            cfgs: [
+                "fence_passing_option1",
+                "gfxstream_unstable",
+            ],
+        },
+    },
+    apex_available: ["com.android.virt"],
+}

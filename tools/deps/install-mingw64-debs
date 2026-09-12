@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Copyright 2022 The ChromiumOS Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+set -ex
+
+# Install mingw64 toolchain and wine
+sudo apt-get install --yes --no-install-recommends \
+    gcc-mingw-w64-x86-64-win32 \
+    wine \
+    wine64

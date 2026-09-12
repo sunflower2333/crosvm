@@ -1,0 +1,11 @@
+[package]
+name = "dvsa-production-wire-fixtures"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+data_model = { path = "../../../common/data_model" }
+zerocopy = { version = "=0.8.14", features = ["derive"] }

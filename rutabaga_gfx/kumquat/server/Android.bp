@@ -1,0 +1,45 @@
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "external_crosvm_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-BSD
+    default_applicable_licenses: ["external_crosvm_license"],
+}
+
+rust_binary {
+    name: "kumquat",
+    crate_name: "kumquat",
+    host_supported: true,
+    vendor_available: true,
+    prefer_rlib: true,
+    cargo_env_compat: true,
+    crate_root: "src/main.rs",
+    cargo_pkg_version: "0.1.3",
+    edition: "2021",
+    cfgs: [
+        "gfxstream_unstable",
+    ],
+    features: [
+        "gfxstream",
+    ],
+    rustlibs: [
+        "librutabaga_gfx_gfxstream",
+        "liblibc",
+        "liblog_rust",
+        "libnix",
+        "libthiserror",
+        "libclap",
+    ],
+    shared_libs: [
+        "libgfxstream_backend",
+    ],
+    target: {
+        host: {
+            compile_multilib: "64",
+        },
+        android: {
+            compile_multilib: "64",
+        },
+    },
+}

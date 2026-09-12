@@ -1,0 +1,22 @@
+[package]
+name = "metrics"
+version = "0.1.0"
+authors = ["The ChromiumOS Authors"]
+edition = "2021"
+
+[features]
+collect = []
+experimental = []
+
+[dependencies]
+anyhow = "1"
+base = { path = "../base" }
+cfg-if = "1"
+serde = { version = "1", features = ["derive"] }
+sync = { path = "../common/sync" }
+metrics_events = { path = "../metrics_events" }
+metrics_product = { path = "../vendor/generic/metrics", package = "metrics_generic" }
+
+[target.'cfg(windows)'.dependencies]
+chrono = { version = "0.4.34", default-features = false, features = ["now"] }
+winapi = { version = "0.3" }

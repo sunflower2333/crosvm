@@ -1,0 +1,41 @@
+diff --git a/gpu_display/Android.bp b/gpu_display/Android.bp
+index dc5db8549..18a04722e 100644
+--- a/gpu_display/Android.bp
++++ b/gpu_display/Android.bp
+@@ -29,7 +29,6 @@ rust_library {
+     edition: "2021",
+     features: [
+         "android_display",
+-        "android_display_stub",
+         "gfxstream",
+     ],
+     rustlibs: [
+@@ -43,8 +42,27 @@ rust_library {
+     ],
+     proc_macros: ["libremain"],
+     static_libs: ["libdisplay_wl"],
+-    shared_libs: ["libwayland-client"],
++
++    // added manually
++    target: {
++        host: {
++            shared_libs: ["libwayland_client"],
++            features: ["android_display_stub"],
++        },
++        android: {
++            static_libs: [
++                "libwayland_client_static",
++                "libffi",
++                "libcrosvm_android_display_client",
++            ],
++            shared_libs: [
++                "libc++",
++                "libbinder_ndk",
++                "libnativewindow",
++            ],
++        },
++    },
+     apex_available: ["com.android.virt"],
+ }
+ 
+ cc_library_static {

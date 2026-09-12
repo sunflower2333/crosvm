@@ -1,0 +1,33 @@
+# Automatically assign a reviewer
+crosvm-reviews@google.com
+
+# Please use the above alias to automatically select an owner for review.
+# All owners below are marked as #{LAST_RESORT_SUGGESTION} so that
+# they won't be suggested by gerrit.
+
+# ChromeOS Team
+denniskempin@google.com #{LAST_RESORT_SUGGESTION}
+dtor@chromium.org #{LAST_RESORT_SUGGESTION}
+dverkamp@chromium.org #{LAST_RESORT_SUGGESTION}
+keiichiw@chromium.org #{LAST_RESORT_SUGGESTION}
+stevensd@chromium.org #{LAST_RESORT_SUGGESTION}
+takayas@chromium.org #{LAST_RESORT_SUGGESTION}
+uekawa@chromium.org #{LAST_RESORT_SUGGESTION}
+
+# Cloud Android Team
+fmayle@google.com #{LAST_RESORT_SUGGESTION}
+
+# For Windows
+auradkar@google.com #{LAST_RESORT_SUGGESTION}
+nkgold@google.com #{LAST_RESORT_SUGGESTION}
+rizhang@google.com #{LAST_RESORT_SUGGESTION}
+idanr@google.com #{LAST_RESORT_SUGGESTION}
+
+# Bots
+crosvm-bot@crosvm-packages.iam.gserviceaccount.com #{LAST_RESORT_SUGGESTION}
+recipe-mega-autoroller@chops-service-accounts.iam.gserviceaccount.com #{LAST_RESORT_SUGGESTION}
+crosvm-luci-ci-builder@crosvm-infra.iam.gserviceaccount.com #{LAST_RESORT_SUGGESTION}
+
+# Changes to Cargo.lock will require additional reviews by the crosvm council.
+per-file Cargo.lock = set noparent
+per-file Cargo.lock = file:OWNERS_COUNCIL

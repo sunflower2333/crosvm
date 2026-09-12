@@ -1,0 +1,214 @@
+// Copyright 2022 The ChromiumOS Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+//! Definitions and utilities for GPU related parameters.
+
+#[cfg(windows)]
+use std::marker::PhantomData;
+use std::path::PathBuf;
+
+use serde::Deserialize;
+use serde::Deserializer;
+use serde::Serialize;
+use serde::Serializer;
+use serde_keyvalue::FromKeyValues;
+use vm_control::gpu::DisplayParameters;
+
+use super::GpuMode;
+use super::GpuWsi;
+use crate::virtio::gpu::VIRTIO_GPU_MAX_SCANOUTS;
+use crate::PciAddress;
+
+mod serde_capset_mask {
+    use super::*;
+
+    pub fn serialize<S>(capset_mask: &u64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let context_types = rutabaga_gfx::calculate_capset_names(*capset_mask).join(":");
+
+        serializer.serialize_str(context_types.as_str())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(rutabaga_gfx::calculate_capset_mask(s.split(':')))
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioDeviceMode {
+    #[serde(rename = "per-surface")]
+    PerSurface,
+    #[serde(rename = "one-global")]
+    OneGlobal,
+}
+
+/// What gfxstream does when its host-visible folio budget is exhausted or a collapse fails.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VramExceedPolicy {
+    /// Keep the allocation on ordinary 4 KiB pages.
+    Fallback,
+    /// Fail the Vulkan allocation.
+    Oom,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues)]
+#[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
+pub struct GpuParameters {
+    #[serde(rename = "backend")]
+    pub mode: GpuMode,
+    #[serde(default = "default_max_num_displays")]
+    pub max_num_displays: u32,
+    #[serde(default = "default_audio_device_mode")]
+    pub audio_device_mode: AudioDeviceMode,
+    #[serde(rename = "displays")]
+    pub display_params: Vec<DisplayParameters>,
+    // `width` and `height` are supported for CLI backwards compatibility.
+    #[serde(rename = "width")]
+    pub __width_compat: Option<u32>,
+    #[serde(rename = "height")]
+    pub __height_compat: Option<u32>,
+    #[serde(rename = "egl")]
+    pub renderer_use_egl: bool,
+    #[serde(rename = "gles")]
+    pub renderer_use_gles: bool,
+    #[serde(rename = "glx")]
+    pub renderer_use_glx: bool,
+    #[serde(rename = "surfaceless")]
+    pub renderer_use_surfaceless: bool,
+    #[serde(rename = "vulkan")]
+    pub use_vulkan: Option<bool>,
+    pub wsi: Option<GpuWsi>,
+    pub udmabuf: bool,
+    pub cache_path: Option<String>,
+    pub cache_size: Option<String>,
+    pub pci_address: Option<PciAddress>,
+    pub pci_bar_size: u64,
+    #[serde(rename = "context-types", with = "serde_capset_mask")]
+    pub capset_mask: u64,
+    // enforce that blob resources MUST be exportable as file descriptors
+    pub external_blob: bool,
+    pub system_blob: bool,
+    // enable use of descriptor mapping to fixed host VA within a prepared vMMU mapping (e.g. kvm
+    // user memslot)
+    pub fixed_blob_mapping: bool,
+    #[serde(rename = "implicit-render-server")]
+    pub allow_implicit_render_server_exec: bool,
+    // Passthrough parameters sent to the underlying renderer in a renderer-specific format.
+    pub renderer_features: Option<String>,
+    // When running with device sandboxing, the path of a directory available for
+    // scratch space.
+    pub snapshot_scratch_path: Option<PathBuf>,
+    // DroidVM gfxstream host-visible VRAM quota and folio policy. These are renderer allocation
+    // knobs, plumbed to gfxstream as GFXSTREAM_VRAM_* env before the GPU process forks.
+    //   vram-limit=<MB>: N>0 = cap; 0 = unmetered; -1 = explicitly unlimited (still counts as
+    //   "defined", which enables fusion routing together with a --pre-alloc gfx pool).
+    // Not exported when udmabuf=true: in guest-alloc mode the pool itself is the cap.
+    pub vram_limit: Option<i64>,
+    // Allocations at least this large are rounded and collapsed into 2 MiB folios before gfxstream
+    // creates the udmabuf imported by the host Vulkan driver. 0 means every allocation.
+    pub vram_folio_threshold_kb: Option<u64>,
+    // On folio quota/collapse failure, either keep ordinary pages or fail the allocation.
+    pub vram_exceed_policy: Option<VramExceedPolicy>,
+    // CMDLINE_V2 v3 fusion size gate: host-visible allocations <= this (KB) try the pre-alloc
+    // pool first; larger ones go straight to the runtime-SHARE path. Only effective when fusion
+    // routing is enabled (udmabuf=false AND vram-limit defined AND a --pre-alloc gfx pool exists);
+    // otherwise forced 0 (= no gate). Plumbed to gfxstream as GFXSTREAM_POOL_BLOB_MAX_KB.
+    pub pool_blob_max_kb: Option<u64>,
+    // Guest-alloc (udmabuf=true) pool partition: the host-owned slice (MB) of the gfx pre-alloc
+    // pool that serves ALL gfx host-alloc requests (ASG rings, stray HOST3D blobs); exhausted =>
+    // runtime-share fallback (module present) or clean per-client failure. The remainder is the
+    // guest slice (announced to the guest driver via capset). gfx- prefix = per-proxy namespace
+    // (other proxy variants may follow). Ignored when udmabuf=false (whole pool is host-owned).
+    // Plumbed to gfxstream as GFXSTREAM_POOL_HOST_MB.
+    pub gfx_host_pre_alloc_mb: Option<u64>,
+    // gunyah-pvm: gate the Gunyah pVM-specific gfxstream behavior (pin RingBlob backing so the
+    // permanent Gunyah SHARE mapping stays stable). Only Qualcomm/Gunyah needs it; leave off on
+    // other SoCs (MediaTek, Tensor, ...). Plumbed to GFXSTREAM_GUNYAH_PIN_RINGBLOB.
+    pub gunyah_pvm: Option<bool>,
+}
+
+impl Default for GpuParameters {
+    fn default() -> Self {
+        GpuParameters {
+            max_num_displays: default_max_num_displays(),
+            audio_device_mode: default_audio_device_mode(),
+            display_params: vec![],
+            __width_compat: None,
+            __height_compat: None,
+            renderer_use_egl: true,
+            renderer_use_gles: true,
+            renderer_use_glx: false,
+            renderer_use_surfaceless: true,
+            use_vulkan: None,
+            mode: Default::default(),
+            wsi: None,
+            cache_path: None,
+            cache_size: None,
+            pci_address: None,
+            pci_bar_size: (1 << 28),
+            udmabuf: false,
+            capset_mask: 0,
+            external_blob: false,
+            system_blob: false,
+            // TODO(b/324649619): not yet fully compatible with other platforms (windows)
+            // TODO(b/246334944): gfxstream may map vulkan opaque blobs directly (without vulkano),
+            // so set the default to disabled when built with the gfxstream feature.
+            //
+            // Gunyah's drm2kgsl route opts into SingleMappingEager after the host arena is
+            // available. Other Gunyah blob routes continue to select their own mapping policy in
+            // create_gpu_device.
+            fixed_blob_mapping: cfg!(target_os = "linux") && !cfg!(feature = "gfxstream"),
+            allow_implicit_render_server_exec: false,
+            renderer_features: None,
+            snapshot_scratch_path: None,
+            vram_limit: None,
+            vram_folio_threshold_kb: None,
+            vram_exceed_policy: None,
+            pool_blob_max_kb: None,
+            gfx_host_pre_alloc_mb: None,
+            gunyah_pvm: None,
+        }
+    }
+}
+
+fn default_max_num_displays() -> u32 {
+    VIRTIO_GPU_MAX_SCANOUTS as u32
+}
+
+fn default_audio_device_mode() -> AudioDeviceMode {
+    AudioDeviceMode::PerSurface
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::*;
+
+    use super::*;
+
+    #[test]
+    fn capset_mask_serialize_deserialize() {
+        #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+        struct CapsetMask {
+            #[serde(rename = "context-types", with = "serde_capset_mask")]
+            pub value: u64,
+        }
+
+        // Capset "virgl", id: 1, capset_mask: 0b0010
+        // Capset "gfxstream", id: 3, capset_mask: 0b1000
+        const CAPSET_MASK: u64 = 0b1010;
+        const SERIALIZED_CAPSET_MASK: &str = "{\"context-types\":\"virgl:gfxstream-vulkan\"}";
+
+        let capset_mask = CapsetMask { value: CAPSET_MASK };
+
+        assert_eq!(to_string(&capset_mask).unwrap(), SERIALIZED_CAPSET_MASK);
+        assert_eq!(
+            from_str::<CapsetMask>(SERIALIZED_CAPSET_MASK).unwrap(),
+            capset_mask
+        );
+    }
+}

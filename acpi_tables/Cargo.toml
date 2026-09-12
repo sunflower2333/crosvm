@@ -1,0 +1,11 @@
+[package]
+name = "acpi_tables"
+version = "0.1.0"
+authors = ["The ChromiumOS Authors"]
+edition = "2021"
+
+[dependencies]
+zerocopy = { version = "0.8.13", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"

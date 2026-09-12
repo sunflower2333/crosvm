@@ -1,0 +1,16 @@
+# Copyright 2024 The ChromiumOS Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# Policy file for the vhost-user transport over a socket.
+
+# FIONBIO: for setting non-blocking mode over the socket.
+# TCGETS/TCSETS: used on FD 0, probably for serial.
+# b/239779171: try moving this to the serial device once we can extend ioctls across policy files.
+ioctl: arg1 == FIONBIO || arg1 == TCGETS || arg1 == TCSETS
+# For accepting a client connection over the socket.
+accept4: 1
+# For creating a socket if the specified socket path does not exits
+socketpair: arg0 == AF_UNIX
+# For crosvm to reap child after vhost_user device exits
+wait4: 1

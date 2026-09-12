@@ -1,0 +1,14 @@
+[package]
+name = "dvsa-production-owner-recovery"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+data_model = { path = "../../../common/data_model" }
+zerocopy = { version = "=0.8.14", features = ["derive"] }
+rand = "0.8"
+anyhow = "1"
+parking_lot = "0.12"

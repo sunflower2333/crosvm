@@ -1,0 +1,31 @@
+diff --git a/crosvm_control/Android.bp b/crosvm_control/Android.bp
+index 34e77e142..d73c7ec15 100644
+--- a/crosvm_control/Android.bp
++++ b/crosvm_control/Android.bp
+@@ -28,8 +28,12 @@ rust_ffi_shared {
+         "libswap",
+         "libvm_control",
+     ],
+-    static_libs: ["libcrosvm_control_test"],
++    // The build.rs file compiles the generated C header just as a test, which
++    // tricks cargo_embargo into thinking there is a library dependency that
++    // doesn't actually exist.
++    //
++    // static_libs: ["libcrosvm_control_test"],
+     apex_available: ["com.android.virt"],
+ }
+ 
+ rust_ffi_static {
+@@ -47,7 +51,11 @@ rust_ffi_static {
+         "libswap",
+         "libvm_control",
+     ],
+-    static_libs: ["libcrosvm_control_test"],
++    // The build.rs file compiles the generated C header just as a test, which
++    // tricks cargo_embargo into thinking there is a library dependency that
++    // doesn't actually exist.
++    //
++    // static_libs: ["libcrosvm_control_test"],
+     apex_available: ["com.android.virt"],
+     visibility: ["//packages/modules/Virtualization/android/virtmgr"],
+ }
