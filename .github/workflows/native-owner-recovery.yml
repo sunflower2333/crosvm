@@ -11,6 +11,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        rand-feature: [legacy-rand, android-rand]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -18,7 +19,7 @@ jobs:
           fetch-depth: 1
       - uses: dtolnay/rust-toolchain@stable
       - name: Actual allocation and recovery implementation with OS fault seams
-        run: cargo +stable test --manifest-path devices/tests/native_owner_recovery/Cargo.toml --locked
+        run: cargo +stable test --manifest-path devices/tests/native_owner_recovery/Cargo.toml --locked --no-default-features --features ${{ matrix.rand-feature }}
       - name: Actual protocol and discovery encoder
         run: cargo +stable test --manifest-path devices/tests/shared_allocation_wire/Cargo.toml --locked
       - name: Verify canonical wire layout
@@ -33,5 +34,5 @@ jobs:
           sha256sum include/dvsa_protocol.h devices/src/virtio/gpu/native_shared.rs devices/src/virtio/gpu/shared_allocation_protocol.rs vm_control/src/native_allocation.rs > recovery-evidence/source.sha256
       - uses: actions/upload-artifact@v4
         with:
-          name: owner-recovery-${{ matrix.runner }}
+          name: owner-recovery-${{ matrix.runner }}-${{ matrix.rand-feature }}
           path: recovery-evidence

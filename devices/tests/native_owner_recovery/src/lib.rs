@@ -3,6 +3,10 @@
 //! Only allocator/renderer/mapper OS boundaries are deterministic fixtures.
 //! This is not native AHB, KGSL or Gunyah runtime proof.
 #![allow(dead_code)]
+#[cfg(all(feature = "legacy-rand", feature = "android-rand"))]
+compile_error!("select one actual rand dependency generation");
+#[cfg(feature = "android-rand")]
+extern crate rand_android as rand;
 extern crate self as base;
 extern crate self as gpu_display;
 extern crate self as vm_control;

@@ -16,7 +16,18 @@ use crate::virtio::gpu::shared_allocation_protocol::{
     CMD_QUERY_SHARED_OWNER, CMD_CLEANUP_SHARED_OWNER, CMD_ALLOCATE_RECOVERABLE,
     OWNER_SESSION, OWNER_UNKNOWN, OWNER_RETAINED, OWNER_RELEASED,
 };
-use rand::RngCore;
+
+fn fresh_host_epoch() -> [u64; 2] {
+    // Cargo uses rand0.8 (RngCore); the actual Android Soong graph supplies
+    // rand0.9 (TryRngCore). Both export the fallible OsRng method via these
+    // traits. Keep the compatibility import local; never use a seeded PRNG,
+    // a transport counter or an infallible/panicking entropy fallback.
+    use rand::*;
+    let mut bytes = [0u8; 16];
+    if rngs::OsRng.try_fill_bytes(&mut bytes).is_err() { return [0; 2]; }
+    [u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+     u64::from_le_bytes(bytes[8..].try_into().unwrap())]
+}
 
 const MAX_ALLOCATIONS: usize = 3;
 // Tombstones are never evicted within an incarnation. Fail before side effects
@@ -57,13 +68,9 @@ pub(super) struct NativeAllocationOwners {
 
 impl Default for NativeAllocationOwners {
     fn default() -> Self {
-        let mut bytes = [0u8; 16];
         // A fresh object may have an empty journal while old Drop-leaked AHBs
         // still exist. Never use reset counters or empty maps as lifetime proof.
-        let host_epoch = if rand::rngs::OsRng.try_fill_bytes(&mut bytes).is_ok() {
-            [u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-             u64::from_le_bytes(bytes[8..].try_into().unwrap())]
-        } else { [0; 2] };
+        let host_epoch = fresh_host_epoch();
         Self { ledger: NativeAllocationMapLedger::new(MAX_ALLOCATIONS), owners: Map::new(),
             host_epoch, recovery: Map::new() }
     }
