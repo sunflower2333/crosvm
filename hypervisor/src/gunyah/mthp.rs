@@ -357,11 +357,8 @@ pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResu
     // cannot serve a page returns an error here instead of silently leaving a hole
     // that only surfaces as a SIGBUS on first guest/host touch. Safe (no crash risk)
     // unlike a manual read/write touch of memory that might not be backed.
-    let verify_ret = libc::madvise(
-        host_addr as *mut libc::c_void,
-        size as usize,
-        MADV_POPULATE_READ,
-    );
+    let verify_ret =
+        libc::madvise(host_addr as *mut libc::c_void, size as usize, MADV_POPULATE_READ);
     let populated = verify_ret == 0;
     if populated {
         info!("GH: verify (MADV_POPULATE_READ): OK, region fully backed");

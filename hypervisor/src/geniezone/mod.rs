@@ -612,10 +612,14 @@ impl GeniezoneVm {
                 MemoryRegionPurpose::Drm2KgslPool => GZVM_USER_MEM_REGION_GUEST_MEM,
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                 MemoryRegionPurpose::VenusPool => GZVM_USER_MEM_REGION_GUEST_MEM,
+                // The virtio-media pools are Gunyah concepts too; plain guest memory here.
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                MemoryRegionPurpose::MediaPool => GZVM_USER_MEM_REGION_GUEST_MEM,
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                MemoryRegionPurpose::MediaPoolGuest => GZVM_USER_MEM_REGION_GUEST_MEM,
                 // Growable pools are a Gunyah-protected concept; here it is ordinary guest memory
                 // and its pre_alloc/step are ignored, same as every other pool on this backend.
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-                MemoryRegionPurpose::Edk2PreloadPool => GZVM_USER_MEM_REGION_GUEST_MEM,
                 MemoryRegionPurpose::DynamicTestPool => GZVM_USER_MEM_REGION_GUEST_MEM,
                 // Pseudo-unprotected is a Gunyah shape; here guest RAM is guest RAM and the
                 // handoff page is a page nobody needs to hand anything over through.

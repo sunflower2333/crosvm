@@ -985,6 +985,28 @@ where
         config: defaults::new_mouse_config(idx, name),
         source: Some(SocketEventSource::new(source)),
         virtio_features,
+    })
+}
+
+/// Creates a new virtio absolute-pointing mouse (qemu usb-tablet profile): ABS_X/ABS_Y plus
+/// mouse buttons and scroll wheel. Used for remote displays (VNC) where the client cursor
+/// position must map 1:1 onto the guest.
+pub fn new_absolute_mouse<T>(
+    idx: u32,
+    source: T,
+    width: u32,
+    height: u32,
+    name: Option<&str>,
+    virtio_features: u64,
+) -> Result<Input<SocketEventSource<T>>>
+where
+    T: Read + Write + AsRawDescriptor + Send + 'static,
+{
+    Ok(Input {
+        worker_thread: None,
+        config: defaults::new_absolute_mouse_config(idx, width, height, name),
+        source: Some(SocketEventSource::new(source)),
+        virtio_features,
         haptics: None,
     })
 }

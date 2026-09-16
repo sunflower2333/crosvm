@@ -1288,46 +1288,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn invalid_framebuffer_region_releases_native_lock() {
-        use std::cell::Cell;
-        use std::rc::Rc;
-
-        struct LockedSurface {
-            bytes: [u8; 16],
-            locked: Rc<Cell<bool>>,
-            posts: Rc<Cell<u32>>,
-        }
-        impl GpuDisplaySurface for LockedSurface {
-            fn framebuffer(&mut self) -> Option<GpuDisplayFramebuffer> {
-                assert!(!self.locked.replace(true), "native buffer locked twice");
-                Some(GpuDisplayFramebuffer::new(
-                    VolatileSlice::new(&mut self.bytes), 8, 4, DRM_FORMAT_ABGR8888,
-                ))
-            }
-            fn flip(&mut self) {
-                assert!(self.locked.replace(false), "post without a lock");
-                self.posts.set(self.posts.get() + 1);
-            }
-        }
-        let locked = Rc::new(Cell::new(false));
-        let posts = Rc::new(Cell::new(0));
-        let mut display = GpuDisplay::open_stub().unwrap();
-        display.surfaces.insert(1, Box::new(LockedSurface {
-            bytes: [0; 16], locked: locked.clone(), posts: posts.clone(),
-        }));
-        for (x, y, width, height) in [(0, 0, 0, 2), (0, 0, 2, 3), (u32::MAX, 0, 2, 2)] {
-            assert!(display.framebuffer_region(1, x, y, width, height).is_none());
-            assert!(!locked.get());
-        }
-        assert_eq!(posts.get(), 3);
-        assert!(display.framebuffer_region(1, 0, 0, 2, 2).is_some());
-        assert!(locked.get());
-        display.flip(1);
-        assert!(!locked.get());
-        assert_eq!(posts.get(), 4);
-    }
-
-    #[test]
     fn converts_between_red_first_and_blue_first_8888() {
         let rgba = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
         let mut bgra = [0; 8];

@@ -1035,6 +1035,55 @@ impl VmMemoryRequest {
                 // which drives the guest accept itself. `Sync` consumes the handle HERE: the
                 // in-VM accept module performs the accept over the virtio-gunyah-accept
                 // transport before we return, so the caller sees plain upstream semantics.
+                let (accept_handle, guest_synced, guest_accept_handle) = match (vm_accept, accept_handle) {
+                    (VmAccept::Sync, Some(handle)) => {
+                        let Some(accept_tube) = gunyah_accept_tube else {
+                            error!(
+                                "VmAccept::Sync attach at {:#x} but no virtio-gunyah-accept \
+                                 transport is wired up; failing",
+                                guest_addr.offset()
+                            );
+                            let _ = vm.runtime_unshare(guest_addr, slot, VmAccept::Off);
+                            return VmMemoryResponse::Err(SysError::new(ENODEV));
+                        };
+                        let accepted = drive_guest_accept(
+                            accept_tube,
+                            GunyahAcceptOp::Accept,
+                            handle,
+                            guest_addr.offset(),
+                            size,
+                        );
+                        // The VMM's own pin over this region has done its job either way: the
+                        // hypervisor owns the memory now, and on the failure path we are about
+                        // to hand it back. Release it before the unshare so the reclaim has a
+                        // single owner to wait for.
+                        vm.release_share_pin(guest_addr);
+                        if let Err(e) = accepted {
+                            // The guest never accepted; reclaim the SHARE and fail the attach.
+                            let _ = vm.runtime_unshare(guest_addr, slot, VmAccept::Off);
+                            return VmMemoryResponse::Err(e);
+                        }
+                        (None, true, Some(handle))
+                    }
+                    (VmAccept::Async, Some(_)) => {
+                        error!("VmAccept::Async transport not implemented");
+                        let _ = vm.runtime_unshare(guest_addr, slot, VmAccept::Off);
+                        return VmMemoryResponse::Err(SysError::new(ENOTSUP));
+                    }
+                    // Off (caller-driven), or no handle needed (plain memslot hypervisors).
+                    // The caller drives the accept out of band, so there is no point at which we
+                    // could release the pin later; the hypervisor already holds its own from the
+                    // SHARE, which is what the probe existed to guarantee.
+                    (_, handle) => {
+                        vm.release_share_pin(guest_addr);
+                        (handle, false, None)
+                    }
+                };
+
+                // VmAccept routing: `Off` hands the handle back to the caller (e.g. virtio-gpu),
+                // which drives the guest accept itself. `Sync` consumes the handle HERE: the
+                // in-VM accept module performs the accept over the virtio-gunyah-accept
+                // transport before we return, so the caller sees plain upstream semantics.
                 let (accept_handle, guest_synced, guest_accept_handle) =
                     match (vm_accept, accept_handle) {
                         (VmAccept::Sync, Some(handle)) => {
@@ -1299,6 +1348,34 @@ impl VmMemoryRequest {
                             VmAccept::Off
                         },
                     ) {
+                    Ok(_) => {
+                        if let Some(iommu_client) = iommu_client {
+                            if iommu_client.registered_memory.remove(&id) {
+                                let request = VirtioIOMMURequest::VfioCommand(
+                                    VirtioIOMMUVfioCommand::VfioDmabufUnmap(id),
+                                );
+                                region_state.registered_memory.insert(
+                                    id,
+                                    RegisteredMemory::DynamicMapping {
+                                        slot,
+                                        guest_synced,
+                                        guest_accept_handle,
+                                        size,
+                                    },
+                                );
+                                return VmMemoryResponse::Err(e);
+                            }
+                        }
+                    }
+                    match vm.runtime_unshare(
+                        id.0,
+                        slot,
+                        if guest_synced {
+                            VmAccept::Sync
+                        } else {
+                            VmAccept::Off
+                        },
+                    ) {
                         Ok(_) => {
                             if let Some(iommu_client) = iommu_client {
                                 if iommu_client.registered_memory.remove(&id) {
@@ -1373,6 +1450,57 @@ impl VmMemoryRequest {
                                 e
                             })
                         }
+                    }
+                    Err(e) => {
+                        // The guest-side release, when required, has already completed. Restore
+                        // the acceptance before returning the error; otherwise the guest would
+                        // keep treating this suffix as backed and could access an unmapped GPA.
+                        let mut guest_restore_failed = false;
+                        if !guest_synced {
+                            if let (Some(handle), Some(accept_tube)) =
+                                (guest_accept_handle, gunyah_accept_tube)
+                            {
+                                match drive_guest_accept(
+                                    accept_tube,
+                                    GunyahAcceptOp::Accept,
+                                    handle,
+                                    id.0.offset(),
+                                    size,
+                                ) {
+                                    Ok(()) => guest_synced = true,
+                                    Err(restore_err) => error!(
+                                        "failed to restore guest acceptance for {:#x} after \
+                                         host unshare failure ({}); mapping remains unavailable \
+                                         to the guest",
+                                        id.0.offset(),
+                                        restore_err
+                                    ),
+                                }
+                            } else if guest_accept_handle.is_some() {
+                                guest_restore_failed = true;
+                            }
+                        }
+                        if guest_accept_handle.is_some() && !guest_synced {
+                            // EUCLEAN is a private crosvm/guest-driver contract: the host
+                            // mapping is retained for retry, but the guest stage-2 mapping could
+                            // not be restored. The guest must stop using this suffix.
+                            guest_restore_failed = true;
+                        }
+                        region_state.registered_memory.insert(
+                            id,
+                            RegisteredMemory::DynamicMapping {
+                                slot,
+                                guest_synced,
+                                guest_accept_handle,
+                                size,
+                            },
+                        );
+                        VmMemoryResponse::Err(if guest_restore_failed {
+                            SysError::new(EUCLEAN)
+                        } else {
+                            e
+                        })
+                    }
                     }
                 }
                 Some(RegisteredMemory::FixedMapping { slot, offset, size }) => {

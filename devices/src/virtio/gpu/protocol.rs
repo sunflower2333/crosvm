@@ -970,7 +970,7 @@ impl GpuResponse {
                 map_info,
                 pool_offset,
             } => {
-                let base = virtio_gpu_resp_map_info {
+                let resp_info = virtio_gpu_resp_map_info {
                     hdr,
                     map_info: Le32::from(map_info),
                     pool_offset: Le32::from(pool_offset.unwrap_or(0)),

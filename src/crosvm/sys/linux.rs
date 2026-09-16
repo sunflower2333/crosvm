@@ -6,6 +6,7 @@
 mod android;
 pub mod cmdline;
 pub mod config;
+pub(crate) mod device_helper;
 mod device_helpers;
 pub(crate) mod ext2;
 #[cfg(feature = "gpu")]
@@ -19,7 +20,6 @@ pub(crate) mod pci_hotplug_manager;
 #[cfg(feature = "vnc")]
 mod simplefb_display;
 #[cfg(feature = "audio")]
-pub(crate) mod snd_helper;
 mod vcpu;
 
 #[cfg(all(feature = "pvclock", target_arch = "aarch64"))]
@@ -96,6 +96,8 @@ use devices::virtio::device_constants::video::VideoDeviceType;
 // there, since that is the build where the simplefb bridge is the only display.
 #[cfg(any(feature = "gpu", feature = "vnc"))]
 use devices::virtio::gpu::EventDevice;
+#[cfg(feature = "media")]
+use devices::virtio::media::MediaPool;
 #[cfg(target_arch = "x86_64")]
 use devices::virtio::memory_mapper::MemoryMapper;
 use devices::virtio::memory_mapper::MemoryMapperTrait;
@@ -193,6 +195,8 @@ use vm_control::api::VmMemoryClient;
 use vm_control::*;
 use vm_memory::FileBackedMappingParameters;
 use vm_memory::GuestAddress;
+#[cfg(feature = "media")]
+use vm_memory::MediaPoolHandle;
 use vm_memory::GuestMemory;
 use vm_memory::MemoryPolicy;
 use vm_memory::MemoryRegionOptions;
@@ -209,6 +213,10 @@ use crate::crosvm::config::DEFAULT_VNC_PORT;
 use crate::crosvm::config::Executable;
 use crate::crosvm::config::HypervisorKind;
 use crate::crosvm::config::InputDeviceOption;
+#[cfg(feature = "media")]
+use crate::crosvm::config::MediaDeviceConfig;
+#[cfg(feature = "media")]
+use crate::crosvm::config::MediaDeviceKind;
 use crate::crosvm::config::IrqChipKind;
 use crate::crosvm::config::DEFAULT_TOUCH_DEVICE_HEIGHT;
 use crate::crosvm::config::DEFAULT_TOUCH_DEVICE_WIDTH;
@@ -494,6 +502,7 @@ fn create_virtio_devices(
     #[cfg_attr(not(feature = "gpu"), allow(unused_variables))] vm_evt_wrtube: &SendTube,
     #[cfg(feature = "balloon")] balloon_inflate_tube: Option<Tube>,
     worker_process_pids: &mut BTreeSet<Pid>,
+    helper_pid_labels: &mut BTreeMap<u32, String>,
     #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
     #[cfg(feature = "gpu")] has_vfio_gfx_device: bool,
     #[cfg(feature = "registered_events")] registered_evt_q: &SendTube,
@@ -826,7 +835,6 @@ fn create_virtio_devices(
     let mut keyboard_idx = 0;
     let mut mouse_idx = 0;
     let mut absolute_mouse_idx = 0;
-    let mut gamepad_idx = 0;
     let mut rotary_idx = 0;
     let mut switches_idx = 0;
     let mut multi_touch_idx = 0;
@@ -1131,6 +1139,7 @@ fn create_virtio_devices(
                 snd_params,
                 snd_device_tube,
                 worker_process_pids,
+                helper_pid_labels,
             )?);
         }
     }
@@ -1144,8 +1153,72 @@ fn create_virtio_devices(
     }
 
     #[cfg(feature = "media")]
-    if cfg.simple_media_device {
-        devs.push(create_simple_media_device(cfg.protection_type)?);
+    {
+        // `--simple-media-device` is the old spelling of `--virtio-media kind=simple`, so it adds
+        // a simple device only when the command line does not already ask for one; giving both
+        // used to make two.
+        let simple = (cfg.simple_media_device
+            && !cfg
+                .virtio_media
+                .iter()
+                .any(|m| m.kind == MediaDeviceKind::Simple))
+        .then(|| MediaDeviceConfig {
+            kind: MediaDeviceKind::Simple,
+            card: None,
+            camera_id: None,
+            role: None,
+            allow_sw: false,
+            uid: None,
+            gid: None,
+        });
+        let media_devices: Vec<&MediaDeviceConfig> =
+            cfg.virtio_media.iter().chain(simple.iter()).collect();
+
+        // The `media_host` pool, when the VM has one, is created once and its allocator is the
+        // only allocator over the window, for every media device of the VM: the offsets it
+        // hands out are what the guest maps, so two allocators over the same window would alias
+        // each other's buffers (VPU_DESIGN.md §2.2, review B2, D49's band of noise --
+        // logs/vpu_wp/F12-encoder.md). One dup of the descriptor and one host mapping for the
+        // whole VM.
+        //
+        // A device with `uid=` runs in a helper process, which cannot share the allocator's
+        // lock -- so it does not allocate at all: `create_unprivileged_virtio_media_device`
+        // gives each helper a tube (`--pool-fd`) served by a VMM thread that owns that helper's
+        // lease, and the helper reserves and releases offsets through it. (F12 first fixed D49
+        // by carving static per-helper slices; M8 replaced the slices with this, so a 4K
+        // decode's ~190 MiB CAPTURE set can have the pool while the other devices are idle
+        // instead of hitting its 128 MiB slice.)
+        let handle = if media_devices.is_empty() {
+            None
+        } else {
+            match MediaPoolHandle::from_guest_memory(vm.get_memory()) {
+                Some(handle) => Some(handle),
+                None if hypervisor_is_gunyah(cfg) => {
+                    // No silent fallback to the shared-memory BAR here: on Gunyah it would not
+                    // fit next to the GPU's, and the guest would find a device with no usable
+                    // buffers (VPU_DESIGN.md §3.3). This holds even when the guest driver owns
+                    // every queue: the device still needs somewhere to put a host-owned buffer
+                    // the moment the guest asks for one.
+                    bail!("virtio-media on gunyah needs --pre-alloc media-host-mb");
+                }
+                None => None,
+            }
+        };
+        let pool = match handle {
+            None => None,
+            Some(handle) => Some(MediaPool::new(handle)?),
+        };
+
+        for media_cfg in media_devices {
+            devs.push(create_virtio_media_device(
+                cfg.protection_type,
+                media_cfg,
+                pool.clone(),
+                vm.get_memory(),
+                worker_process_pids,
+                helper_pid_labels,
+            )?);
+        }
     }
 
     #[cfg(all(feature = "media", feature = "video-decoder"))]
@@ -1321,6 +1394,8 @@ fn create_devices(
     vfio_container_manager: &mut VfioContainerManager,
     // Stores a set of PID of child processes that are suppose to exit cleanly.
     worker_process_pids: &mut BTreeSet<Pid>,
+    // What to call a helper process crosvm exec'd itself, for the crash log.
+    helper_pid_labels: &mut BTreeMap<u32, String>,
     #[cfg(feature = "vnc")] simplefb_vnc_input_out: &mut VncBindingInput,
 ) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
     let mut devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
@@ -1453,6 +1528,7 @@ fn create_devices(
         #[cfg(feature = "balloon")]
         balloon_inflate_tube,
         worker_process_pids,
+        helper_pid_labels,
         #[cfg(feature = "gpu")]
         render_server_fd,
         #[cfg(feature = "gpu")]
@@ -2324,6 +2400,29 @@ fn run_gunyah(
     )
 }
 
+/// Whether this VM runs on Gunyah, from the same resolution `run_config` makes: an explicit
+/// `--hypervisor`, else the first hypervisor device found. Used before the VM is created, by
+/// devices that must refuse a configuration Gunyah cannot serve.
+#[cfg(feature = "media")]
+fn hypervisor_is_gunyah(cfg: &Config) -> bool {
+    #[cfg(all(
+        unix,
+        any(target_arch = "arm", target_arch = "aarch64"),
+        feature = "gunyah"
+    ))]
+    {
+        return matches!(
+            cfg.hypervisor.clone().or_else(get_default_hypervisor),
+            Some(HypervisorKind::Gunyah { .. })
+        );
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = cfg;
+        false
+    }
+}
+
 /// Choose a default hypervisor if no `--hypervisor` option was specified.
 fn get_default_hypervisor() -> Option<HypervisorKind> {
     let kvm_path = Path::new(KVM_PATH);
@@ -2390,6 +2489,12 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         if let Some(mb) = pa.venus_host_mb {
             std::env::set_var("NCTX_VENUS_POOL_MB", mb.to_string());
         }
+        if let Some(mb) = pa.media_host_mb {
+            std::env::set_var("NCTX_MEDIA_POOL_MB", mb.to_string());
+        }
+        if let Some(mb) = pa.media_guest_mb {
+            std::env::set_var("NCTX_MEDIA_GUEST_POOL_MB", mb.to_string());
+        }
         if let Some(mb) = pa.test_pool_mb {
             std::env::set_var("DROIDVM_TEST_POOL_MB", mb.to_string());
         }
@@ -2401,12 +2506,7 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         }
     }
 
-    // The EDK2 preload pool is deliberately independent of GPU pre-allocation. Always override
-    // the legacy environment variable so an inherited value cannot enable it without the CLI.
-    std::env::set_var(
-        "DROIDVM_EDK2_PRELOAD_MB",
-        cfg.edk2_preload_mb.unwrap_or(0).to_string(),
-    );
+    let components = setup_vm_components(&cfg)?;
 
     let hypervisor = cfg
         .hypervisor
@@ -2606,42 +2706,12 @@ where
         Tube::directional_pair().context("failed to create registered event tube")?;
 
     let mut worker_process_pids = BTreeSet::new();
+    // Helpers crosvm exec'd itself (`device_helper::launch`) are not jailed devices, so nothing
+    // names them in `pid_debug_label_map`; they are collected here and added once the VM exists.
+    let mut helper_pid_labels = BTreeMap::new();
 
     #[cfg(feature = "vnc")]
     let mut simplefb_vnc_input = VncBindingInput::default();
-
-    // PCI BARs are allocated while Arch::build_vm generates the PCI root, before aarch64's FDT
-    // pass exports pool metadata. Publish the drm2kgsl arena now so virtio-gpu can use its exact
-    // fd-backed pages for the host-visible BAR instead of preparing an anonymous arena first.
-    #[cfg(all(feature = "gpu", any(target_arch = "arm", target_arch = "aarch64")))]
-    for region in vm.get_memory().regions() {
-        if region.options.purpose == vm_memory::MemoryRegionPurpose::Drm2KgslPool {
-            let fd = region.shm.as_raw_descriptor();
-            std::env::set_var("CROSVM_DRM2KGSL_ARENA_FD", fd.to_string());
-            std::env::set_var(
-                "CROSVM_DRM2KGSL_ARENA_FD_OFFSET",
-                region.shm_offset.to_string(),
-            );
-            std::env::set_var(
-                "CROSVM_DRM2KGSL_ARENA_HOST_VA",
-                (region.host_addr as u64).to_string(),
-            );
-            if std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_none() {
-                std::env::set_var(
-                    "CROSVM_DRM2KGSL_ARENA_GPA",
-                    format!("{:#x}", region.guest_addr.offset()),
-                );
-            }
-            std::env::set_var(
-                "CROSVM_DRM2KGSL_ARENA_SIZE",
-                (region.size as u64).to_string(),
-            );
-            info!(
-                "GPU-POOL-EARLY: published Drm2KgslPool fd={} off={:#x} size={:#x} before PCI BAR allocation",
-                fd, region.shm_offset, region.size
-            );
-        }
-    }
 
     let mut devices = create_devices(
         &cfg,
@@ -2659,6 +2729,7 @@ where
         &reg_evt_wrtube,
         &mut vfio_container_manager,
         &mut worker_process_pids,
+        &mut helper_pid_labels,
         #[cfg(feature = "vnc")]
         &mut simplefb_vnc_input,
     )?;
@@ -2854,6 +2925,10 @@ where
     if cfg.protection_type.isolates_memory() {
         linux.vm.get_memory().set_protected();
     }
+
+    // A helper that dies is then logged by name, the way a jailed device's process is, and its
+    // exit is judged as one of crosvm's own children rather than waved through as a stray.
+    linux.pid_debug_label_map.extend(helper_pid_labels);
 
     for tube in linux.vm_request_tubes.drain(..) {
         add_control_tube(TaggedControlTube::Vm(tube).into());
@@ -4218,13 +4293,12 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     let _simplefb_display_thread = (|| -> Option<std::thread::JoinHandle<()>> {
         let sfb_cfg = cfg.simplefb.as_ref()?;
         let guest_mem = linux.vm.get_memory().clone();
-        let bpp: u32 = match sfb_cfg.format.as_str() {
-            "a8r8g8b8" | "x8r8g8b8" | "a8b8g8r8" => 4,
-            "r8g8b8" => 3,
-            "r5g6b5" => 2,
-            _ => 4,
-        };
-        let stride = sfb_cfg.width * bpp;
+        let bpp = arch::simplefb_bpp(sfb_cfg.format.as_str());
+        // Padded to the alignment the GPU transport needs (see `arch::simplefb_stride`). Taken from
+        // the same function that sized the region and wrote the device tree's `stride`, because a
+        // bridge that disagreed with either would hand the sink a sheared picture and report
+        // nothing -- the failure would look like a wrong image, not like an error.
+        let stride = arch::simplefb_stride(sfb_cfg.width, sfb_cfg.format.as_str());
         // The same DT string the guest reads, resolved once here rather than assumed downstream:
         // the bridge hands it to the sink as part of every frame it produces.
         let fourcc = simplefb_display::simplefb_format_fourcc(sfb_cfg.format.as_str());
@@ -4609,7 +4683,6 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                     iommu_client,
                     vm_memory_handler_control_for_thread,
                     gunyah_accept_host_tube,
-                    pre_mapped_memory_regions,
                 )
             }
         })
@@ -5306,7 +5379,6 @@ fn vm_memory_handler_thread(
     mut iommu_client: Option<VmMemoryRequestIommuClient>,
     handler_control: Tube,
     gunyah_accept_tube: Option<Tube>,
-    pre_mapped_memory_regions: Vec<vm_control::VmMappedMemoryRegion>,
 ) -> anyhow::Result<()> {
     #[derive(EventToken)]
     enum Token {

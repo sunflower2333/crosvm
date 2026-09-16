@@ -24,9 +24,9 @@ use base::SharedMemory;
 use base::Tube;
 use base::WorkerThread;
 use data_model::Le32;
+use base::SafeDescriptor;
 use hypervisor::Datamatch;
 use hypervisor::MemCacheType;
-use hypervisor::Vm;
 use hypervisor::VmAccept;
 use libc::ERANGE;
 #[cfg(target_arch = "x86_64")]
@@ -1662,8 +1662,16 @@ impl SharedMemoryMapper for VmRequester {
         cache: MemCacheType,
         vm_accept: VmAccept,
     ) -> anyhow::Result<Option<u32>> {
-        self.prepare_lazy()?;
-        self.validate_cache(cache)?;
+        if !self.prepared {
+            if let SharedMemoryPrepareType::SingleMappingOnFirst(prepare_cache_type) =
+                self.prepare_type
+            {
+                self.vm_memory_client
+                    .prepare_shared_memory_region(self.alloc, prepare_cache_type)
+                    .context("lazy prepare_shared_memory_region failed")?;
+            }
+            self.prepared = true;
+        }
 
         let (id, gunyah_handle) = self
             .vm_memory_client

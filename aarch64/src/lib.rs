@@ -255,48 +255,24 @@ const AARCH64_VMWDT_IRQ: u32 = 31;
 
 const AARCH64_SIMPLEFB_FIXED_ADDR: u64 = 0x50000000;
 
-// The first folio of the drm2kgsl BAR is intentionally left unmapped.  It keeps a guest access
-// to the BAR header/guard from being confused with the host-owned control arena; the remaining
-// bytes are backed by the arena memfd and are the only range that Gunyah can reserve.
-const DRM2KGSL_BAR_BASE_GUARD: u64 = 2 << 20;
-
-/// Return the exact guest range backed by the pre-start drm2kgsl BAR mapping.
-///
-/// `bar_size` is the complete PCI aperture while `arena_size` is the source mapping supplied to
-/// `prepare_shared_memory_region_at_offset()`.  The source starts after the guard, so its length
-/// is `arena_size - guard`; it is not necessarily the whole BAR tail when the aperture is larger
-/// than the arena.  Keep all arithmetic checked because these values originate in environment
-/// metadata captured while the PCI allocator is still being assembled.
-fn drm2kgsl_prebacked_bar_reservation(
-    bar_gpa: u64,
-    bar_size: u64,
-    arena_size: u64,
-) -> Option<(u64, u64)> {
-    if arena_size <= DRM2KGSL_BAR_BASE_GUARD || arena_size > bar_size {
-        return None;
-    }
-
-    let suffix_gpa = bar_gpa.checked_add(DRM2KGSL_BAR_BASE_GUARD)?;
-    let suffix_size = arena_size.checked_sub(DRM2KGSL_BAR_BASE_GUARD)?;
-    let suffix_end = suffix_gpa.checked_add(suffix_size)?;
-    let bar_end = bar_gpa.checked_add(bar_size)?;
-    if suffix_end > bar_end {
-        return None;
-    }
-
-    Some((suffix_gpa, suffix_size))
+/// Exclusive top of the Gunyah 64-bit PCI MMIO window, a deterministic function of the
+/// end of guest RAM (`plat_mmio_base`). This is the single source of truth for the
+/// window top: `get_system_allocator_config` sizes the window with it, and the GPU pool
+/// region is placed immediately ABOVE it (a reserved-memory node INSIDE the window makes
+/// the guest's pci-host-generic bridge fail its window claim and kills virtio-blk).
+/// `gunyah/aarch64.rs` derives `size-max` from the same formula (kept in sync there).
+fn gunyah_high_mmio_window_top(plat_mmio_base: u64) -> u64 {
+    let base = plat_mmio_base + AARCH64_PLATFORM_MMIO_SIZE;
+    const BAR_TARGET: u64 = 4u64 << 30; // 4 GiB host-visible BAR headroom
+    base.next_multiple_of(BAR_TARGET) + BAR_TARGET + (1u64 << 29)
 }
 
 /// Compute the page-aligned framebuffer data size for simplefb.
 fn simplefb_data_size(sfb: &arch::SimplefbParams) -> u64 {
-    let bpp: u32 = match sfb.format.as_str() {
-        "a8r8g8b8" | "x8r8g8b8" | "a8b8g8r8" => 4,
-        "r8g8b8" => 3,
-        "r5g6b5" => 2,
-        _ => 4,
-    };
-    let stride = sfb.width * bpp;
-    let size = ((stride * sfb.height) as u64);
+    // The PADDED stride, not `width * bpp`: this number decides how much memory the region holds,
+    // and a region sized for a packed layout would leave the last rows of a padded one outside it.
+    let stride = arch::simplefb_stride(sfb.width, &sfb.format);
+    let size = (stride as u64) * (sfb.height as u64);
     (size + 0x1f_ffff) & !0x1f_ffff
 }
 
@@ -792,6 +768,42 @@ fn pool_specs() -> Vec<PoolSpec> {
         });
     }
 
+    // The virtio-media pools. Both are fully pre-shared (step 0): a growable one would need
+    // runtime grants over a share device the development phone does not load, and would put a
+    // second growable pool into the `pool_id` ordering, which is assigned by call order in the
+    // device tree and by address order on the host. See VPU_DESIGN.md §2.2.
+    let media = mb("NCTX_MEDIA_POOL_MB");
+    if media != 0 {
+        out.push(PoolSpec {
+            name: "media_host",
+            size: media,
+            purpose: MemoryRegionPurpose::MediaPool,
+            // Host-owned, like the other three host pools: the media device's own buffers, sized
+            // by how many streams the VM runs rather than by how much memory it was given.
+            consume_system_mem: true,
+            prealloc: media,
+            step: 0,
+            max_grants: 0,
+            gap_before: 0,
+        });
+    }
+
+    let media_guest = mb("NCTX_MEDIA_GUEST_POOL_MB");
+    if media_guest != 0 {
+        out.push(PoolSpec {
+            name: "media_guest",
+            size: media_guest,
+            purpose: MemoryRegionPurpose::MediaPoolGuest,
+            // Guest-owned, like gpu_guest: the guest driver allocates from it, it is the VM's
+            // memory, and it stays on top of `--mem` rather than inside it.
+            consume_system_mem: false,
+            prealloc: media_guest,
+            step: 0,
+            max_grants: 0,
+            gap_before: 0,
+        });
+    }
+
     for suffix in ["", "_2"] {
         let size = mb(&format!("DROIDVM_TEST_POOL{}_MB", suffix));
         if size == 0 {
@@ -1091,34 +1103,6 @@ impl arch::LinuxArch for AArch64 {
             top = base + spec.size;
         }
 
-        // Dedicated EDK2 preload pool. It is independent of the GPU/test pools and of `--mem`:
-        // firmware accepts it as one runtime memparcel, so it must not be counted by the
-        // pool-from-system-RAM accounting above or overlap the swiotlb/simplefb tail of `--mem`.
-        let edk2_preload_mb: u64 = std::env::var("DROIDVM_EDK2_PRELOAD_MB")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        if edk2_preload_mb != 0 {
-            let external_floor = AARCH64_PHYS_MEM_START + components.memory_size;
-            let top = memory_regions
-                .iter()
-                .map(|(addr, size, _)| addr.offset() + *size)
-                .max()
-                .unwrap_or(external_floor)
-                .max(external_floor);
-            let base = (top + (2 << 20) - 1) & !((2 << 20) - 1);
-            let size = edk2_preload_mb << 20;
-            memory_regions.push((
-                GuestAddress(base),
-                size,
-                MemoryRegionOptions::new()
-                    .purpose(MemoryRegionPurpose::Edk2PreloadPool)
-                    .align(2 << 20)
-                    .growable_pool(0, size)
-                    .max_grants(1),
-            ));
-        }
-
         // Add simplefb region as SharedFramebuffer.
         // For Gunyah (StaticSwiotlbAllocationRequired), the region is placed at
         // end of RAM (before swiotlb) and follows the swiotlb sharing path:
@@ -1157,62 +1141,45 @@ impl arch::LinuxArch for AArch64 {
         let plat_mmio_base = vm.get_memory().end_addr().offset();
         let plat_mmio_size = AARCH64_PLATFORM_MMIO_SIZE;
 
-        let (high_mmio_base, high_mmio_size) =
-            if matches!(vm.hypervisor_kind(), HypervisorKind::Gunyah) {
-                // Gunyah only establishes guest stage-2 mappings for IPAs within the VM's IPA
-                // layout [base-address, base-address + size-max) declared in gunyah-vm-config
-                // (see GunyahVm::create_fdt). base-address is PHYS_MEM_START (it also locates the
-                // guest kernel), so the host-visible virtio-gpu BAR must sit ABOVE RAM and below
-                // the layout top — not in the normal >4GiB high-MMIO window (outside the layout)
-                // nor below PHYS_MEM_START. A BAR outside the layout is accepted by the SHARE
-                // ioctl but never gets a working stage-2 entry, so the guest SIGBUSes on access.
-                //
-                // Place the 64-bit PCI MMIO window immediately above the platform MMIO region
-                // (i.e. just above guest RAM). Size the window for a 4 GiB host-visible BAR:
-                // PCI requires size-aligned BAR placement, so the window must reach the next
-                // 4 GiB boundary above its base plus the BAR itself, plus slack for the other
-                // 64-bit BARs. The checked helper is also used by Gunyah's FDT producer.
-                let layout = compute_gunyah_mmio_layout(
-                    plat_mmio_base,
-                    plat_mmio_size,
-                    GUNYAH_DEFAULT_BAR_ALIGNMENT,
-                )
-                .expect("Gunyah high-MMIO layout overflowed");
-                if layout.high_mmio_top > guest_phys_end {
+        let (high_mmio_base, high_mmio_size) = if matches!(
+            vm.hypervisor_kind(),
+            HypervisorKind::Gunyah
+        ) {
+            // Gunyah only establishes guest stage-2 mappings for IPAs within the VM's IPA
+            // layout [base-address, base-address + size-max) declared in gunyah-vm-config
+            // (see GunyahVm::create_fdt). base-address is PHYS_MEM_START (it also locates the
+            // guest kernel), so the host-visible virtio-gpu BAR must sit ABOVE RAM and below
+            // the layout top — not in the normal >4GiB high-MMIO window (outside the layout)
+            // nor below PHYS_MEM_START. A BAR outside the layout is accepted by the SHARE
+            // ioctl but never gets a working stage-2 entry, so the guest SIGBUSes on access.
+            //
+            // Place the 64-bit PCI MMIO window immediately above the platform MMIO region
+            // (i.e. just above guest RAM). Size the window for a 4 GiB host-visible BAR:
+            // PCI requires size-aligned BAR placement, so the window must reach the next
+            // 4 GiB boundary above its base plus the BAR itself, plus slack for the other
+            // 64-bit BARs. gunyah size-max headroom is raised to match (see
+            // hypervisor/src/gunyah/aarch64.rs create_fdt).
+            let base = plat_mmio_base + plat_mmio_size;
+            let window_top = gunyah_high_mmio_window_top(plat_mmio_base);
+            base::warn!(
+                "GUNYAH-HIGHMMIO: base={:#x} top={:#x} size={:#x} (plat_mmio_base={:#x})",
+                base, window_top, window_top - base, plat_mmio_base
+            );
+            (base, window_top - base)
+        } else {
+            // Place the 64-bit PCI MMIO window above 4GiB so firmware does not see a
+            // single aperture that straddles the 32-bit boundary.
+            let high_mmio_base = (plat_mmio_base + plat_mmio_size).max(1u64 << 32);
+            let high_mmio_size = guest_phys_end
+                .checked_sub(high_mmio_base)
+                .unwrap_or_else(|| {
                     panic!(
-                        "Gunyah high-MMIO top {:#x} exceeds guest physical address space {:#x}",
-                        layout.high_mmio_top, guest_phys_end,
+                        "guest_phys_end {:#x} < high_mmio_base {:#x}",
+                        guest_phys_end, high_mmio_base,
                     );
-                }
-                base::warn!(
-                    "GUNYAH-HIGHMMIO: base={:#x} top={:#x} size={:#x} bar_base={:#x} \
-                 (guest_memory_end={:#x}, platform_end={:#x})",
-                    layout.high_mmio_base,
-                    layout.high_mmio_top,
-                    layout.high_mmio_size(),
-                    layout.aligned_bar_base,
-                    layout.guest_memory_end,
-                    layout.platform_mmio_end,
-                );
-                (layout.high_mmio_base, layout.high_mmio_size())
-            } else {
-                // Place the 64-bit PCI MMIO window above 4GiB so firmware does not see a
-                // single aperture that straddles the 32-bit boundary.
-                let platform_mmio_end = plat_mmio_base
-                    .checked_add(plat_mmio_size)
-                    .expect("platform MMIO address overflowed");
-                let high_mmio_base = platform_mmio_end.max(1u64 << 32);
-                let high_mmio_size =
-                    guest_phys_end
-                        .checked_sub(high_mmio_base)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "guest_phys_end {:#x} < high_mmio_base {:#x}",
-                                guest_phys_end, high_mmio_base,
-                            );
-                        });
-                (high_mmio_base, high_mmio_size)
-            };
+                });
+            (high_mmio_base, high_mmio_size)
+        };
         SystemAllocatorConfig {
             io: None,
             low_mmio: arch_memory_layout.pci_mem,
@@ -1336,7 +1303,8 @@ impl arch::LinuxArch for AArch64 {
                         // pseudo-unprotected mode that is the window, which starts above the boot
                         // region rather than at the bottom of the address space.
                         let initrd_max_size =
-                            (AARCH64_PHYS_MEM_START + main_memory_size).saturating_sub(initrd_addr);
+                            (AARCH64_PHYS_MEM_START + main_memory_size)
+                                .saturating_sub(initrd_addr);
                         let initrd_addr = GuestAddress(initrd_addr);
                         let initrd_size =
                             arch::load_image(&mem, &mut initrd_file, initrd_addr, initrd_max_size)
@@ -1484,31 +1452,25 @@ impl arch::LinuxArch for AArch64 {
             .into_iter()
             .map(|(dev, jail_orig)| (dev.into_pci_device().unwrap(), jail_orig))
             .collect();
-        let (
-            pci,
-            pci_irqs,
-            mut pid_debug_label_map,
-            _amls,
-            _gpe_scope_amls,
-            pre_mapped_memory_regions,
-        ) = arch::generate_pci_root(
-            pci_devices,
-            irq_chip.as_irq_chip_mut(),
-            mmio_bus.clone(),
-            GuestAddress(arch_memory_layout.pci_cam.start),
-            12,
-            io_bus.clone(),
-            system_allocator,
-            &mut vm,
-            // Reserve the top two SPIs for the fixed GPIO/VMWDT interrupts
-            // (AARCH64_GPIO_IRQ / AARCH64_VMWDT_IRQ) so the dynamically
-            // allocated virtio-pci IRQs can't collide with them.
-            (devices::AARCH64_GIC_NR_SPIS - AARCH64_IRQ_BASE - 2) as usize,
-            None,
-            #[cfg(feature = "swap")]
-            swap_controller,
-        )
-        .map_err(Error::CreatePciRoot)?;
+        let (pci, pci_irqs, mut pid_debug_label_map, _amls, _gpe_scope_amls) =
+            arch::generate_pci_root(
+                pci_devices,
+                irq_chip.as_irq_chip_mut(),
+                mmio_bus.clone(),
+                GuestAddress(arch_memory_layout.pci_cam.start),
+                12,
+                io_bus.clone(),
+                system_allocator,
+                &mut vm,
+                // Reserve the top two SPIs for the fixed GPIO/VMWDT interrupts
+                // (AARCH64_GPIO_IRQ / AARCH64_VMWDT_IRQ) so the dynamically
+                // allocated virtio-pci IRQs can't collide with them.
+                (devices::AARCH64_GIC_NR_SPIS - AARCH64_IRQ_BASE - 2) as usize,
+                None,
+                #[cfg(feature = "swap")]
+                swap_controller,
+            )
+            .map_err(Error::CreatePciRoot)?;
 
         let pci_root = Arc::new(Mutex::new(pci));
         let pci_bus = Arc::new(Mutex::new(PciConfigMmio::new(pci_root.clone(), 12)));
@@ -1860,24 +1822,6 @@ impl arch::LinuxArch for AArch64 {
         // NCTX_GFX_POOL_MB they ride the transparent runtime_share/guest-accept path instead (no
         // pool region emitted).
         let mut gpu_guest_resv: Option<(u64, u64, u64, u64)> = None;
-        // Read the dedicated preload pool back from the final memory layout so its DT metadata
-        // cannot disagree with the host-side grant table.
-        let edk2_preload_resv: Option<(u64, u64, u64, u64)> = {
-            let mut found = None;
-            for region in vm.get_memory().regions() {
-                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-                if region.options.purpose == vm_memory::MemoryRegionPurpose::Edk2PreloadPool {
-                    let size = region.size as u64;
-                    found = Some((
-                        region.guest_addr.offset(),
-                        size,
-                        region.options.boot_share_len(size),
-                        region.options.step_size,
-                    ));
-                }
-            }
-            found
-        };
         // (base, size, pre_alloc, step) for the growable test pool, read back off the region so
         // the DT node and the region cannot disagree about what the guest was promised.
         let test_pool_resv: Vec<(u64, u64, u64, u64)> = {
@@ -1903,6 +1847,15 @@ impl arch::LinuxArch for AArch64 {
             .map(|r| (r.guest_addr.offset(), r.size as u64));
         let mut drm2kgsl_resv: Option<(u64, u64)> = None;
         let mut venus_resv: Option<(u64, u64)> = None;
+        // The virtio-media pools: only (gpa, size), for the two reserved-memory nodes. Neither
+        // gets env vars. The host pool's consumer is the media device, which is built here in the
+        // VMM (or exec'd from here as a vhost-user helper) and takes the region itself through
+        // `vm_memory::MediaPoolHandle::from_guest_memory` -- the env-var handoff exists for the
+        // renderer, which is forked before any of this runs and cannot be handed a descriptor.
+        // The guest pool has no host-side consumer at all: the guest driver owns it and the host
+        // meets it as ordinary guest addresses in a scatter-gather list.
+        let mut media_resv: Option<(u64, u64)> = None;
+        let mut media_guest_resv: Option<(u64, u64)> = None;
         let gpu_resv: Option<(u64, u64)> = {
             let mut found = None;
             for region in vm.get_memory().regions() {
@@ -1912,9 +1865,15 @@ impl arch::LinuxArch for AArch64 {
                     let gpa = region.guest_addr.offset();
                     // gfxstream consumer (host-visible sub-allocator, when in gfx pre-alloc mode).
                     std::env::set_var("GFXSTREAM_POOL_FD", fd.to_string());
-                    std::env::set_var("GFXSTREAM_POOL_FD_OFFSET", region.shm_offset.to_string());
+                    std::env::set_var(
+                        "GFXSTREAM_POOL_FD_OFFSET",
+                        region.shm_offset.to_string(),
+                    );
                     std::env::set_var("GFXSTREAM_POOL_GPA", format!("{:#x}", gpa));
-                    std::env::set_var("GFXSTREAM_POOL_SIZE", (region.size as u64).to_string());
+                    std::env::set_var(
+                        "GFXSTREAM_POOL_SIZE",
+                        (region.size as u64).to_string(),
+                    );
                     base::warn!(
                         "GPU-POOL: GpuPool region gpa={:#x} size={:#x} fd={} off={:#x} \
                          (blessed by GunyahVm::new)",
@@ -1955,7 +1914,6 @@ impl arch::LinuxArch for AArch64 {
                 if region.options.purpose == vm_memory::MemoryRegionPurpose::Drm2KgslPool {
                     let fd = region.shm.as_raw_descriptor();
                     let gpa = region.guest_addr.offset();
-                    let bar_prebacked = std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some();
                     std::env::set_var("CROSVM_DRM2KGSL_ARENA_FD", fd.to_string());
                     std::env::set_var(
                         "CROSVM_DRM2KGSL_ARENA_FD_OFFSET",
@@ -1965,83 +1923,18 @@ impl arch::LinuxArch for AArch64 {
                         "CROSVM_DRM2KGSL_ARENA_HOST_VA",
                         (region.host_addr as u64).to_string(),
                     );
-                    if !bar_prebacked {
-                        std::env::set_var("CROSVM_DRM2KGSL_ARENA_GPA", format!("{:#x}", gpa));
-                    }
-                    std::env::set_var(
-                        "CROSVM_DRM2KGSL_ARENA_SIZE",
-                        (region.size as u64).to_string(),
+                    std::env::set_var("CROSVM_DRM2KGSL_ARENA_GPA", format!("{:#x}", gpa));
+                    std::env::set_var("CROSVM_DRM2KGSL_ARENA_SIZE", (region.size as u64).to_string());
+                    base::warn!(
+                        "GPU-POOL: Drm2KgslPool region gpa={:#x} size={:#x} fd={} off={:#x} \
+                         hva={:#x} (blessed by GunyahVm::new)",
+                        gpa,
+                        region.size,
+                        fd,
+                        region.shm_offset,
+                        region.host_addr,
                     );
-                    if bar_prebacked {
-                        base::warn!(
-                            "GPU-POOL: Drm2KgslPool host-only backing size={:#x} fd={} off={:#x} \
-                             hva={:#x}; guest access is exclusively through the VirtIO PCI BAR",
-                            region.size,
-                            fd,
-                            region.shm_offset,
-                            region.host_addr,
-                        );
-                        // Keep the host-only arena out of guest RAM and reserve the complete BAR
-                        // range in the DT. vm_control records that range while installing the
-                        // eager suffix mapping, before this FDT pass runs.
-                        let bar_gpa =
-                            std::env::var("CROSVM_DRM2KGSL_BAR_GPA")
-                                .ok()
-                                .and_then(|value| {
-                                    value.strip_prefix("0x").map_or_else(
-                                        || value.parse().ok(),
-                                        |hex| u64::from_str_radix(hex, 16).ok(),
-                                    )
-                                });
-                        let bar_size = std::env::var("CROSVM_DRM2KGSL_BAR_SIZE")
-                            .ok()
-                            .and_then(|value| value.parse::<u64>().ok());
-                        match (bar_gpa, bar_size) {
-                            (Some(bar_gpa), Some(bar_size)) => {
-                                match drm2kgsl_prebacked_bar_reservation(
-                                    bar_gpa,
-                                    bar_size,
-                                    region.size as u64,
-                                ) {
-                                    Some((suffix_gpa, suffix_size)) => {
-                                        base::info!(
-                                            "GPU-POOL: reserving mapped BAR suffix gpa={:#x} \
-                                             size={:#x} (bar={:#x}+{:#x}, arena={:#x})",
-                                            suffix_gpa,
-                                            suffix_size,
-                                            bar_gpa,
-                                            bar_size,
-                                            region.size,
-                                        );
-                                        drm2kgsl_resv = Some((suffix_gpa, suffix_size));
-                                    }
-                                    None => base::error!(
-                                        "GPU-POOL: invalid prebacked BAR metadata: \
-                                         bar={:#x}+{:#x}, arena={:#x}, guard={:#x}",
-                                        bar_gpa,
-                                        bar_size,
-                                        region.size,
-                                        DRM2KGSL_BAR_BASE_GUARD,
-                                    ),
-                                }
-                            }
-                            _ => base::error!(
-                                "GPU-POOL: prebacked drm2kgsl BAR metadata is missing; \
-                                 guarded guest BAR mapping will be unavailable"
-                            ),
-                        }
-                    } else {
-                        base::warn!(
-                            "GPU-POOL: Drm2KgslPool region gpa={:#x} size={:#x} fd={} off={:#x} \
-                             hva={:#x} (blessed by GunyahVm::new)",
-                            gpa,
-                            region.size,
-                            fd,
-                            region.shm_offset,
-                            region.host_addr,
-                        );
-                        drm2kgsl_resv = Some((gpa, region.size as u64));
-                    }
+                    drm2kgsl_resv = Some((gpa, region.size as u64));
                 }
                 // venus transport pool (pool merge, landed): hand vkr the memfd view it
                 // sub-allocates blob_id==0 shmems from, and announce `venus_host` so the guest
@@ -2052,7 +1945,10 @@ impl arch::LinuxArch for AArch64 {
                     let gpa = region.guest_addr.offset();
                     std::env::set_var("VENUS_POOL_FD", fd.to_string());
                     std::env::set_var("VENUS_POOL_FD_OFFSET", region.shm_offset.to_string());
-                    std::env::set_var("VENUS_POOL_HOST_VA", (region.host_addr as u64).to_string());
+                    std::env::set_var(
+                        "VENUS_POOL_HOST_VA",
+                        (region.host_addr as u64).to_string(),
+                    );
                     std::env::set_var("VENUS_POOL_GPA", format!("{:#x}", gpa));
                     std::env::set_var("VENUS_POOL_SIZE", (region.size as u64).to_string());
                     base::warn!(
@@ -2063,6 +1959,37 @@ impl arch::LinuxArch for AArch64 {
                         region.shm_offset,
                     );
                     venus_resv = Some((gpa, region.size as u64));
+                }
+                // virtio-media host pool. Logged with the same shape as the pools above -- a
+                // missing pool and a pool that was never blessed look identical from the guest,
+                // and this line is what tells the two apart in a boot log -- but deliberately
+                // exported through no env at all: see the declaration of `media_resv`.
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                if region.options.purpose == vm_memory::MemoryRegionPurpose::MediaPool {
+                    let gpa = region.guest_addr.offset();
+                    base::warn!(
+                        "MEDIA-POOL: MediaPool region gpa={:#x} size={:#x} fd={} off={:#x} \
+                         hva={:#x} (blessed by GunyahVm::new)",
+                        gpa,
+                        region.size,
+                        region.shm.as_raw_descriptor(),
+                        region.shm_offset,
+                        region.host_addr,
+                    );
+                    media_resv = Some((gpa, region.size as u64));
+                }
+                // virtio-media guest pool: the `media_guest` node and nothing else, exactly like
+                // GpuPoolGuest. The guest driver finds it by name and owns the allocator.
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                if region.options.purpose == vm_memory::MemoryRegionPurpose::MediaPoolGuest {
+                    let gpa = region.guest_addr.offset();
+                    base::warn!(
+                        "MEDIA-POOL: MediaPoolGuest region gpa={:#x} size={:#x} \
+                         (blessed, guest-owned)",
+                        gpa,
+                        region.size,
+                    );
+                    media_guest_resv = Some((gpa, region.size as u64));
                 }
             }
             found
@@ -2105,21 +2032,16 @@ impl arch::LinuxArch for AArch64 {
             }),
             gpu_resv,
             gpu_guest_resv,
-            edk2_preload_resv,
             venus_resv,
+            media_resv,
+            media_guest_resv,
             test_pool_resv,
             shim_handoff_resv,
             drm2kgsl_resv,
             bat_mmio_base_and_irq,
             vmwdt_cfg,
             components.simplefb.as_ref().map(|sfb| {
-                let bpp: u32 = match sfb.format.as_str() {
-                    "a8r8g8b8" | "x8r8g8b8" | "a8b8g8r8" => 4,
-                    "r8g8b8" => 3,
-                    "r5g6b5" => 2,
-                    _ => 4,
-                };
-                let stride = sfb.width * bpp;
+                let stride = arch::simplefb_stride(sfb.width, &sfb.format);
                 let fb_addr = get_simplefb_addr(sfb, vm_block, components.swiotlb, vm.get_hypervisor());
                 let fb_alloc = get_simplefb_size(sfb, vm_block, components.swiotlb, vm.get_hypervisor());
                 fdt::SimplefbDtConfig {
@@ -2141,7 +2063,6 @@ impl arch::LinuxArch for AArch64 {
             &components.smbios,
             pflash_cfg,
             sbsa_uart_cfg,
-            has_bios,
         )
         .map_err(Error::CreateFdt)?;
 
@@ -2175,7 +2096,7 @@ impl arch::LinuxArch for AArch64 {
         };
 
         vm.init_arch(entry, fdt_address, fdt_max_size.try_into().unwrap())
-            .map_err(Error::InitVmError)?;
+        .map_err(Error::InitVmError)?;
 
         let vm_request_tubes = vec![vmwdt_host_tube, vcpufreq_host_tube];
 
@@ -2510,7 +2431,8 @@ impl AArch64 {
             return Err(Error::PflashTooLarge(size, AARCH64_PFLASH_MAX_SIZE));
         }
 
-        let pflash = Pflash::new(Box::new(pflash_image), block_size).map_err(Error::PflashSetup)?;
+        let pflash = Pflash::new(Box::new(pflash_image), block_size)
+            .map_err(Error::PflashSetup)?;
         let base = AARCH64_PFLASH_BASE;
 
         mmio_bus
@@ -2694,6 +2616,87 @@ impl AArch64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `pool_specs()` lays the pools out in list order, and list order is guest-physical order.
+    ///
+    /// The media pools go in after the four that were there before and before the test pools, so
+    /// the layout reads gfx / gpu_guest / drm2kgsl / venus / media_host / media_guest / test.
+    /// That is not cosmetic: the growable pools' `pool_id` is handed to the guest in device-tree
+    /// call order and looked up on the host by address rank, and the two agree only while a
+    /// pool's position in this list matches its position in `create_fdt` (see `fdt.rs`). Both
+    /// media pools are non-growable, so they take no `pool_id` -- but they sit between the one
+    /// growable pool that exists and the test pools, which is exactly where inserting them in the
+    /// wrong place would have moved the test pools' ids without changing a single test.
+    ///
+    /// This is the only test in this module that touches the environment, deliberately:
+    /// `pool_specs()` reads process-global state, and two tests setting it would race.
+    #[test]
+    fn pool_specs_orders_the_media_pools_after_the_gpu_pools() {
+        for (var, mb) in [
+            ("NCTX_GFX_POOL_MB", "16"),
+            ("NCTX_GFX_GUEST_POOL_MB", "32"),
+            ("NCTX_DRM2KGSL_POOL_MB", "8"),
+            ("NCTX_VENUS_POOL_MB", "8"),
+            ("NCTX_MEDIA_POOL_MB", "256"),
+            ("NCTX_MEDIA_GUEST_POOL_MB", "128"),
+            ("DROIDVM_TEST_POOL_MB", "4"),
+        ] {
+            std::env::set_var(var, mb);
+        }
+
+        let specs = pool_specs();
+        let names: Vec<&str> = specs.iter().map(|p| p.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "gfx_host",
+                "gpu_guest",
+                "drm2kgsl_host",
+                "venus_host",
+                "media_host",
+                "media_guest",
+                "test",
+            ]
+        );
+
+        let media_host = specs.iter().find(|p| p.name == "media_host").unwrap();
+        assert_eq!(media_host.purpose, MemoryRegionPurpose::MediaPool);
+        assert_eq!(media_host.size, 256 << 20);
+        // Fully pre-shared: a non-growable pool must have prealloc == size, or the difference is
+        // memory the guest was told about and could never obtain (reads there return zeros).
+        assert_eq!(media_host.prealloc, media_host.size);
+        assert_eq!(media_host.step, 0);
+        // Host-owned, so it comes out of `--mem` like the other three host pools.
+        assert!(media_host.consume_system_mem);
+
+        let media_guest = specs.iter().find(|p| p.name == "media_guest").unwrap();
+        assert_eq!(media_guest.purpose, MemoryRegionPurpose::MediaPoolGuest);
+        assert_eq!(media_guest.size, 128 << 20);
+        assert_eq!(media_guest.prealloc, media_guest.size);
+        assert_eq!(media_guest.step, 0);
+        // Guest-owned, so it is additive to `--mem`, like gpu_guest.
+        assert!(!media_guest.consume_system_mem);
+
+        // The host pool is inside `--mem`; the guest pool is not. Rounded to the 2 MiB folio the
+        // share path backs a pool in, which both of these already are.
+        let expected_host_bytes = (16 + 8 + 8 + 256) << 20;
+        assert_eq!(sys_ram_pool_bytes(), expected_host_bytes);
+
+        // A pool whose knob is absent is not created at all.
+        for var in [
+            "NCTX_MEDIA_POOL_MB",
+            "NCTX_MEDIA_GUEST_POOL_MB",
+            "NCTX_GFX_POOL_MB",
+            "NCTX_GFX_GUEST_POOL_MB",
+            "NCTX_DRM2KGSL_POOL_MB",
+            "NCTX_VENUS_POOL_MB",
+            "DROIDVM_TEST_POOL_MB",
+        ] {
+            std::env::remove_var(var);
+        }
+        assert!(pool_specs().is_empty());
+        assert_eq!(sys_ram_pool_bytes(), 0);
+    }
 
     #[test]
     fn drm2kgsl_prebacked_bar_reservation_uses_mapped_suffix() {
