@@ -138,6 +138,84 @@ pub fn new_rotary_config(idx: u32) -> VirtioInputConfig {
     )
 }
 
+/// Instantiates a VirtioInputConfig object for an XInput-style gamepad.
+///
+/// This is the device the DroidVM Windows `vioinput` driver binds its XInputHID
+/// gamepad and haptic transport to. The advertised codes are exactly the ones
+/// the guest's mapper consumes, no more: the guest refuses the gamepad unless
+/// all six main axes carry usable `absinfo`, and it must be the only input
+/// class on the device, so nothing keyboard- or mouse-shaped belongs here.
+pub fn new_gamepad_config(idx: u32, name: Option<&str>) -> VirtioInputConfig {
+    let name = name
+        .map(str::to_owned)
+        .unwrap_or(format!("Crosvm Virtio Gamepad {idx}"));
+    VirtioInputConfig::new(
+        virtio_input_device_ids::new(0, 0, 0, 0),
+        name,
+        format!("virtio-gamepad-{idx}"),
+        virtio_input_bitmap::new([0u8; 128]),
+        default_gamepad_events(),
+        default_gamepad_absinfo(),
+    )
+}
+
+fn default_gamepad_absinfo() -> BTreeMap<u16, virtio_input_absinfo> {
+    let mut absinfo: BTreeMap<u16, virtio_input_absinfo> = BTreeMap::new();
+    // Sticks are signed 16-bit, matching XInput's native range. `min`/`max` are
+    // carried as two's complement in the u32 config fields.
+    for axis in [ABS_X, ABS_Y, ABS_RX, ABS_RY] {
+        absinfo.insert(
+            axis,
+            virtio_input_absinfo::new(i16::MIN as i32 as u32, i16::MAX as i32 as u32, 0, 0),
+        );
+    }
+    // Triggers. The guest rescales these to the 10-bit HID field, so declaring
+    // 0..=1023 keeps the conversion lossless.
+    for axis in [ABS_Z, ABS_RZ] {
+        absinfo.insert(axis, virtio_input_absinfo::new(0, 1023, 0, 0));
+    }
+    // D-pad as a hat. The guest also accepts BTN_DPAD_*, but the two
+    // representations must never be advertised or sent together.
+    for axis in [ABS_HAT0X, ABS_HAT0Y] {
+        absinfo.insert(
+            axis,
+            virtio_input_absinfo::new((-1i32) as u32, 1, 0, 0),
+        );
+    }
+    absinfo
+}
+
+fn default_gamepad_events() -> BTreeMap<u16, virtio_input_bitmap> {
+    let mut supported_events: BTreeMap<u16, virtio_input_bitmap> = BTreeMap::new();
+    supported_events.insert(
+        EV_KEY,
+        // BTN_SOUTH is BTN_GAMEPAD, which is the bit the guest probes for.
+        // BTN_C/BTN_Z/BTN_TL2/BTN_TR2 have no XInputHID usage and are omitted.
+        virtio_input_bitmap::from_bits(&[
+            BTN_SOUTH,
+            BTN_EAST,
+            BTN_NORTH,
+            BTN_WEST,
+            BTN_TL,
+            BTN_TR,
+            BTN_SELECT,
+            BTN_START,
+            BTN_MODE,
+            BTN_THUMBL,
+            BTN_THUMBR,
+            // Optional Share control.
+            KEY_RECORD,
+        ]),
+    );
+    supported_events.insert(
+        EV_ABS,
+        virtio_input_bitmap::from_bits(&[
+            ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_Z, ABS_RZ, ABS_HAT0X, ABS_HAT0Y,
+        ]),
+    );
+    supported_events
+}
+
 /// Instantiates a VirtioInputConfig object with the default configuration for a touchscreen (no
 /// multitouch support).
 pub fn new_single_touch_config(

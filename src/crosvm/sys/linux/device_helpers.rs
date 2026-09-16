@@ -900,6 +900,83 @@ pub fn create_rotary_device<T: IntoUnixStream>(
     })
 }
 
+pub fn create_gamepad_device<T: IntoUnixStream>(
+    protection_type: ProtectionType,
+    jail_config: Option<&JailConfig>,
+    gamepad_socket: T,
+    name: Option<&str>,
+    haptics: bool,
+    vibrator: Option<&Path>,
+    vibrator_right: Option<&Path>,
+    idx: u32,
+) -> DeviceResult {
+    let socket = gamepad_socket
+        .into_unix_stream()
+        .context("failed configuring virtio gamepad")?;
+
+    // Bind the motor up front so a missing or unusable node is reported once,
+    // here, instead of once per effect from inside the worker.
+    let haptics = if haptics {
+        let spec = match (vibrator, vibrator_right) {
+            // Explicitly named nodes that do not work are a configuration
+            // error, not something to paper over.
+            (Some(l), Some(r)) => {
+                let spec = virtio::input::VibratorSpec::Split {
+                    left: l.to_path_buf(),
+                    right: r.to_path_buf(),
+                };
+                spec.open().context("opening vibrator pair")?;
+                Some(spec)
+            }
+            (Some(p), None) => {
+                let spec = virtio::input::VibratorSpec::Single(p.to_path_buf());
+                spec.open()
+                    .with_context(|| format!("opening vibrator {}", p.display()))?;
+                Some(spec)
+            }
+            (None, Some(_)) => bail!("gamepad{idx}: vibrator_right given without vibrator"),
+            (None, None) => virtio::input::VibratorSpec::probe(),
+        };
+        if spec.is_none() {
+            warn!(
+                "gamepad{idx}: haptics requested but no vibrator found; \
+                 effects will be logged and not played"
+            );
+        }
+        Some(virtio::input::HapticsSetup {
+            epoch: virtio::input::next_epoch(),
+            lease_ms: virtio::input::DVH_DEFAULT_LEASE_MS,
+            sink_factory: Box::new(move || match spec.as_ref() {
+                // Reopened per activation so a reset gets a clean handle.
+                Some(spec) => match spec.open() {
+                    Ok(sink) => sink,
+                    Err(e) => {
+                        error!("gamepad{idx}: reopening vibrator failed: {e:#}");
+                        Box::new(virtio::input::LoggingSink::new(format!("gamepad{idx}")))
+                    }
+                },
+                None => Box::new(virtio::input::LoggingSink::new(format!("gamepad{idx}"))),
+            }),
+        })
+    } else {
+        None
+    };
+
+    let dev = virtio::input::new_gamepad(
+        idx,
+        socket,
+        name,
+        virtio::base_features(protection_type),
+        haptics,
+    )
+    .context("failed to set up input device")?;
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        jail: simple_jail(jail_config, "input_device")?,
+    })
+}
+
 pub fn create_vinput_device(
     protection_type: ProtectionType,
     jail_config: Option<&JailConfig>,

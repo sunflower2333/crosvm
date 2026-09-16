@@ -611,6 +611,19 @@ pub enum InputDeviceOption {
         height: Option<u32>,
         name: Option<String>,
     },
+    // XInput-style gamepad. `haptics` opts the device into the private DVH1
+    // rumble transport the DroidVM Windows driver negotiates; it stays off by
+    // default because a host that cannot vibrate must not advertise that it can.
+    Gamepad {
+        path: PathBuf,
+        name: Option<String>,
+        haptics: Option<bool>,
+        // Explicit sysfs vibrator directory (one holding `activate`+`duration`,
+        // or a legacy `enable`). Omitted means probe the well-known locations.
+        // With `vibrator_right` as well, the two form a left/right pair.
+        vibrator: Option<PathBuf>,
+        vibrator_right: Option<PathBuf>,
+    },
     Rotary {
         path: PathBuf,
     },
@@ -3195,6 +3208,102 @@ mod tests {
             *rotary,
             InputDeviceOption::Rotary {
                 path: PathBuf::from("/dev/rotary-test")
+            }
+        );
+    }
+
+    #[test]
+    fn virtio_gamepad() {
+        let config: Config = crate::crosvm::cmdline::RunCommand::from_args(
+            &[],
+            &["--input", "gamepad[path=/dev/gamepad-test]", "/dev/null"],
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+        let gamepad = config
+            .virtio_input
+            .iter()
+            .find(|input| matches!(input, InputDeviceOption::Gamepad { .. }))
+            .unwrap();
+
+        // Haptics stay off unless asked for: a host that cannot vibrate must
+        // not advertise the capability.
+        assert_eq!(
+            *gamepad,
+            InputDeviceOption::Gamepad {
+                path: PathBuf::from("/dev/gamepad-test"),
+                name: None,
+                haptics: None,
+                vibrator: None,
+                vibrator_right: None,
+            }
+        );
+    }
+
+    #[test]
+    fn virtio_gamepad_vibrator_spelling() {
+        // The exact argv spelling gets typed by hand into the app's
+        // extra_options; getting it wrong fails the whole VM launch.
+        let config: Config = crate::crosvm::cmdline::RunCommand::from_args(
+            &[],
+            &[
+                "--input",
+                "gamepad[path=/dev/gp,haptics=true,vibrator=/sys/class/leds/vibrator_l,vibrator_right=/sys/class/leds/vibrator_r]",
+                "/dev/null",
+            ],
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+        let gamepad = config
+            .virtio_input
+            .iter()
+            .find(|input| matches!(input, InputDeviceOption::Gamepad { .. }))
+            .unwrap();
+
+        assert_eq!(
+            *gamepad,
+            InputDeviceOption::Gamepad {
+                path: PathBuf::from("/dev/gp"),
+                name: None,
+                haptics: Some(true),
+                vibrator: Some(PathBuf::from("/sys/class/leds/vibrator_l")),
+                vibrator_right: Some(PathBuf::from("/sys/class/leds/vibrator_r")),
+            }
+        );
+    }
+
+    #[test]
+    fn virtio_gamepad_with_haptics() {
+        let config: Config = crate::crosvm::cmdline::RunCommand::from_args(
+            &[],
+            &[
+                "--input",
+                "gamepad[path=/dev/gamepad-test,name=DroidVM Pad,haptics=true]",
+                "/dev/null",
+            ],
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+        let gamepad = config
+            .virtio_input
+            .iter()
+            .find(|input| matches!(input, InputDeviceOption::Gamepad { .. }))
+            .unwrap();
+
+        assert_eq!(
+            *gamepad,
+            InputDeviceOption::Gamepad {
+                path: PathBuf::from("/dev/gamepad-test"),
+                name: Some("DroidVM Pad".to_string()),
+                haptics: Some(true),
+                vibrator: None,
+                vibrator_right: None,
             }
         );
     }

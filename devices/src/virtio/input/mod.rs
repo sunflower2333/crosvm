@@ -6,12 +6,16 @@
 mod defaults;
 mod evdev;
 mod event_source;
+mod haptics;
+mod vibrator;
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::anyhow;
 use anyhow::bail;
@@ -22,6 +26,8 @@ use base::error;
 use base::info;
 use base::warn;
 use base::AsRawDescriptor;
+use base::Timer;
+use base::TimerTrait;
 use base::Event;
 use base::EventToken;
 use base::RawDescriptor;
@@ -44,6 +50,21 @@ use zerocopy::IntoBytes;
 use zerocopy::KnownLayout;
 
 use self::event_source::EvdevEventSource;
+pub use self::haptics::next_epoch;
+pub use self::haptics::HapticEffect;
+pub use self::haptics::HapticSink;
+pub use self::haptics::HapticsSetup;
+pub use self::haptics::LoggingSink;
+pub use self::vibrator::SysfsVibrator;
+pub use self::vibrator::VibratorSpec;
+pub use self::haptics::DVH_DEFAULT_LEASE_MS;
+
+use self::haptics::HapticsBridge;
+use self::haptics::StatusVerdict;
+use self::haptics::DVH_CAP_BYTES;
+use self::haptics::DVH_EVENT_TYPE;
+use self::haptics::DVH_CAP_SELECT;
+use self::haptics::DVH_CAP_SUBSEL;
 use self::event_source::EventSource;
 use self::event_source::SocketEventSource;
 use super::copy_config;
@@ -281,6 +302,11 @@ pub struct VirtioInputConfig {
     properties: virtio_input_bitmap,
     supported_events: BTreeMap<u16, virtio_input_bitmap>,
     axis_info: BTreeMap<u16, virtio_input_absinfo>,
+    /// DVH1 haptic capability record, present only when the host can actually
+    /// play effects. While this is `None` the guest never opens the profile,
+    /// which is the intended behaviour on a host without a vibrator.
+    #[serde(default)]
+    haptic_capability: Option<[u8; DVH_CAP_BYTES as usize]>,
 }
 
 impl VirtioInputConfig {
@@ -301,7 +327,17 @@ impl VirtioInputConfig {
             properties,
             supported_events,
             axis_info,
+            haptic_capability: None,
         }
+    }
+
+    /// Advertise the private haptic profile on this device.
+    pub fn with_haptic_capability(
+        mut self,
+        capability: [u8; DVH_CAP_BYTES as usize],
+    ) -> VirtioInputConfig {
+        self.haptic_capability = Some(capability);
+        self
     }
 
     fn from_evdev<T: AsRawDescriptor>(source: &T) -> Result<VirtioInputConfig> {
@@ -350,6 +386,15 @@ impl VirtioInputConfig {
             VIRTIO_INPUT_CFG_ID_DEVIDS => {
                 cfg.set_device_ids(&self.device_ids);
             }
+            DVH_CAP_SELECT => {
+                // Only subsel 1 is defined. Anything else stays zero-sized so a
+                // future subsel can be added without a guest seeing stale bytes.
+                if self.subsel == DVH_CAP_SUBSEL {
+                    if let Some(capability) = self.haptic_capability.as_ref() {
+                        cfg.set_payload_slice(capability);
+                    }
+                }
+            }
             VIRTIO_INPUT_CFG_UNSET => {
                 // Per the virtio spec at https://docs.oasis-open.org/virtio/virtio/v1.1/cs01/virtio-v1.1-cs01.html#x1-3390008,
                 // there is no action required of us when this is set. It's unclear whether we
@@ -385,50 +430,59 @@ struct Worker<T: EventSource> {
     event_queue: Queue,
     status_queue: Queue,
     name: String,
+    /// Present only when this device advertises the private haptic profile.
+    haptics: Option<HapticsBridge>,
 }
 
 impl<T: EventSource> Worker<T> {
-    // Fills a virtqueue with events from the source.  Returns the number of bytes written.
-    fn fill_event_virtqueue(
-        event_source: &mut T,
-        avail_desc: &mut DescriptorChain,
-    ) -> Result<usize> {
-        let writer = &mut avail_desc.writer;
-
-        while writer.available_bytes() >= virtio_input_event::SIZE {
-            if let Some(evt) = event_source.pop_available_event() {
-                writer.write_obj(evt).map_err(InputError::WriteQueue)?;
-            } else {
-                break;
+    // Next event to hand the guest. Control frames go first: a REVOKE or a
+    // STATUS that ends an effect must not queue behind a backlog of input.
+    fn pop_outbound_event(&mut self) -> Option<virtio_input_event> {
+        if let Some(haptics) = self.haptics.as_mut() {
+            if let Some(evt) = haptics.pop_pending() {
+                return Some(evt);
             }
         }
-
-        Ok(writer.bytes_written())
+        self.event_source.pop_available_event()
     }
 
-    // Send events from the source to the guest
+    fn has_outbound_events(&self) -> bool {
+        self.haptics.as_ref().is_some_and(|h| h.has_pending())
+            || self.event_source.available_events_count() > 0
+    }
+
+    // Send events from the source, and any pending control frames, to the guest
     fn send_events(&mut self) -> bool {
         let mut needs_interrupt = false;
 
         // Only consume from the queue iterator if we know we have events to send
-        while self.event_source.available_events_count() > 0 {
+        while self.has_outbound_events() {
             match self.event_queue.pop() {
                 None => {
                     break;
                 }
                 Some(mut avail_desc) => {
-                    let bytes_written =
-                        match Worker::fill_event_virtqueue(&mut self.event_source, &mut avail_desc)
-                        {
-                            Ok(count) => count,
-                            Err(e) => {
-                                error!("Input: failed to send events to guest: {}", e);
-                                break;
-                            }
+                    let mut failed = false;
+                    while avail_desc.writer.available_bytes() >= virtio_input_event::SIZE {
+                        let Some(evt) = self.pop_outbound_event() else {
+                            break;
                         };
+                        if let Err(e) = avail_desc.writer.write_obj(evt) {
+                            error!(
+                                "Input: failed to send events to guest: {}",
+                                InputError::WriteQueue(e)
+                            );
+                            failed = true;
+                            break;
+                        }
+                    }
 
+                    let bytes_written = avail_desc.writer.bytes_written();
                     self.event_queue.add_used(avail_desc, bytes_written as u32);
                     needs_interrupt = true;
+                    if failed {
+                        break;
+                    }
                 }
             }
         }
@@ -450,17 +504,66 @@ impl<T: EventSource> Worker<T> {
         Ok(reader.bytes_read())
     }
 
+    // Forward ordinary status events, dropping any that carry the private
+    // haptic type. Those must never reach a real evdev device.
+    fn forward_status_events(&mut self, bytes: &[u8]) -> Result<()> {
+        for chunk in bytes.chunks_exact(virtio_input_event::SIZE) {
+            let evt = virtio_input_event::decode(chunk);
+            if evt.type_.to_native() == DVH_EVENT_TYPE {
+                warn!(
+                    "input: dropping private haptic event on '{}' status queue",
+                    self.name
+                );
+                continue;
+            }
+            self.event_source.send_event(&evt)?;
+        }
+        Ok(())
+    }
+
+    // Read one whole status descriptor before deciding what it is. A private
+    // frame has to be validated complete; inspecting only the first event would
+    // accept a frame whose CRC never checked out.
+    fn read_status_descriptor(&mut self, avail_desc: &mut DescriptorChain) -> Result<usize> {
+        if self.haptics.is_none() {
+            return Worker::read_event_virtqueue(avail_desc, &mut self.event_source);
+        }
+
+        let mut buf = Vec::new();
+        let reader = &mut avail_desc.reader;
+        reader
+            .read_to_end(&mut buf)
+            .map_err(|e| InputError::ReadQueue(e.into()))?;
+
+        let verdict = self
+            .haptics
+            .as_mut()
+            .expect("haptics checked above")
+            .handle_status_descriptor(&buf, Instant::now());
+        match verdict {
+            StatusVerdict::Consumed => {}
+            StatusVerdict::Rejected => {
+                warn!(
+                    "input: dropping malformed haptic frame on '{}' ({} bytes)",
+                    self.name,
+                    buf.len()
+                );
+            }
+            StatusVerdict::NotOurs => self.forward_status_events(&buf)?,
+        }
+        Ok(buf.len())
+    }
+
     fn process_status_queue(&mut self) -> Result<bool> {
         let mut needs_interrupt = false;
         while let Some(mut avail_desc) = self.status_queue.pop() {
-            let bytes_read =
-                match Worker::read_event_virtqueue(&mut avail_desc, &mut self.event_source) {
-                    Ok(count) => count,
-                    Err(e) => {
-                        error!("Input: failed to read events from virtqueue: {}", e);
-                        return Err(e);
-                    }
-                };
+            let bytes_read = match self.read_status_descriptor(&mut avail_desc) {
+                Ok(count) => count,
+                Err(e) => {
+                    error!("Input: failed to read events from virtqueue: {}", e);
+                    return Err(e);
+                }
+            };
 
             self.status_queue.add_used(avail_desc, bytes_read as u32);
             needs_interrupt = true;
@@ -482,6 +585,7 @@ impl<T: EventSource> Worker<T> {
             EventQAvailable,
             StatusQAvailable,
             InputEventsAvailable,
+            HapticDeadline,
             Kill,
         }
         let wait_ctx: WaitContext<Token> = match WaitContext::build_with(&[
@@ -496,6 +600,27 @@ impl<T: EventSource> Worker<T> {
                 return;
             }
         };
+
+        // The host has to be able to stop the motor on its own schedule: a
+        // paused, crashed or disconnected guest may never send STOP.
+        let mut haptic_timer = if self.haptics.is_some() {
+            match Timer::new() {
+                Ok(timer) => {
+                    if let Err(e) = wait_ctx.add(&timer, Token::HapticDeadline) {
+                        error!("failed adding haptic timer to WaitContext: {}", e);
+                        return;
+                    }
+                    Some(timer)
+                }
+                Err(e) => {
+                    error!("failed creating haptic timer: {}", e);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let mut armed_deadline: Option<Instant> = None;
 
         'wait: loop {
             let wait_events = match wait_ctx.wait() {
@@ -531,11 +656,26 @@ impl<T: EventSource> Worker<T> {
                         Err(e) => error!("error receiving events: {}", e),
                         Ok(_cnt) => eventq_needs_interrupt |= self.send_events(),
                     },
+                    Token::HapticDeadline => {
+                        if let Some(timer) = haptic_timer.as_mut() {
+                            if let Err(e) = timer.mark_waited() {
+                                error!("failed reading haptic timer: {}", e);
+                                break 'wait;
+                            }
+                        }
+                    }
                     Token::Kill => {
                         let _ = kill_evt.wait();
                         break 'wait;
                     }
                 }
+            }
+
+            // Run expiry after every wake, not just a timer wake: a lease can
+            // fall due while the loop was busy with input.
+            if let Some(haptics) = self.haptics.as_mut() {
+                haptics.poll_timeouts(Instant::now());
+                eventq_needs_interrupt |= self.send_events();
             }
 
             for event in wait_events.iter().filter(|e| e.is_hungup) {
@@ -551,6 +691,40 @@ impl<T: EventSource> Worker<T> {
             if statusq_needs_interrupt {
                 self.status_queue.trigger_interrupt();
             }
+
+            // Re-arm only when the deadline actually moved, so a busy input
+            // stream does not rewrite the timer on every wake.
+            if let (Some(timer), Some(haptics)) = (haptic_timer.as_mut(), self.haptics.as_ref()) {
+                let deadline = haptics.next_deadline();
+                if deadline != armed_deadline {
+                    match deadline {
+                        Some(at) => {
+                            // A deadline already in the past still needs a wake,
+                            // so never arm with a zero duration.
+                            let delay = at
+                                .saturating_duration_since(Instant::now())
+                                .max(Duration::from_millis(1));
+                            if let Err(e) = timer.reset_oneshot(delay) {
+                                error!("failed arming haptic timer: {}", e);
+                                break;
+                            }
+                        }
+                        None => {
+                            if let Err(e) = timer.clear() {
+                                error!("failed clearing haptic timer: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    armed_deadline = deadline;
+                }
+            }
+        }
+
+        // The guest will not read another event, so stop the motor outright
+        // rather than sending a frame nobody will collect.
+        if let Some(haptics) = self.haptics.as_mut() {
+            haptics.stop_now();
         }
 
         if let Err(e) = self.event_source.finalize() {
@@ -566,6 +740,8 @@ pub struct Input<T: EventSource + Send + 'static> {
     config: VirtioInputConfig,
     source: Option<T>,
     virtio_features: u64,
+    /// Set only on devices that advertise the private haptic profile.
+    haptics: Option<HapticsSetup>,
 }
 
 /// Snapshot of [Input]'s state.
@@ -623,12 +799,18 @@ where
             .source
             .take()
             .context("tried to activate device without a source for events")?;
+        // A fresh sink per activation, so a reset never inherits the previous
+        // session's motor state.
+        let haptics = self.haptics.as_ref().map(|setup| {
+            HapticsBridge::new(setup.epoch, setup.lease_ms, (setup.sink_factory)())
+        });
         self.worker_thread = Some(WorkerThread::start("v_input", move |kill_evt| {
             let mut worker = Worker {
                 event_source: source,
                 event_queue,
                 status_queue,
                 name,
+                haptics,
             };
             worker.run(kill_evt);
             worker
@@ -698,6 +880,7 @@ where
         config: VirtioInputConfig::from_evdev(&source)?,
         source: Some(EvdevEventSource::new(source)),
         virtio_features,
+        haptics: None,
     })
 }
 
@@ -718,6 +901,7 @@ where
         config: defaults::new_single_touch_config(idx, width, height, name),
         source: Some(SocketEventSource::new(source)),
         virtio_features,
+        haptics: None,
     })
 }
 
@@ -738,6 +922,7 @@ where
         config: defaults::new_multi_touch_config(idx, width, height, name),
         source: Some(SocketEventSource::new(source)),
         virtio_features,
+        haptics: None,
     })
 }
 
@@ -759,6 +944,7 @@ where
         config: defaults::new_trackpad_config(idx, width, height, name),
         source: Some(SocketEventSource::new(source)),
         virtio_features,
+        haptics: None,
     })
 }
 
@@ -780,6 +966,7 @@ where
         config: defaults::new_multitouch_trackpad_config(idx, width, height, name),
         source: Some(SocketEventSource::new(source)),
         virtio_features,
+        haptics: None,
     })
 }
 
@@ -798,6 +985,7 @@ where
         config: defaults::new_mouse_config(idx, name),
         source: Some(SocketEventSource::new(source)),
         virtio_features,
+        haptics: None,
     })
 }
 
@@ -820,6 +1008,7 @@ where
         config: defaults::new_absolute_mouse_config(idx, width, height, name),
         source: Some(SocketEventSource::new(source)),
         virtio_features,
+        haptics: None,
     })
 }
 
@@ -838,6 +1027,36 @@ where
         config: defaults::new_keyboard_config(idx, name),
         source: Some(SocketEventSource::new(source)),
         virtio_features,
+        haptics: None,
+    })
+}
+
+/// Creates a new virtio gamepad, optionally advertising the private haptic
+/// profile the DroidVM Windows driver binds XInput rumble to.
+///
+/// Passing `haptics: None` yields a plain gamepad: the guest finds no
+/// capability record and never opens the profile, which is the correct
+/// behaviour on a host with nothing to vibrate.
+pub fn new_gamepad<T>(
+    idx: u32,
+    source: T,
+    name: Option<&str>,
+    virtio_features: u64,
+    haptics: Option<HapticsSetup>,
+) -> Result<Input<SocketEventSource<T>>>
+where
+    T: Read + Write + AsRawDescriptor + Send + 'static,
+{
+    let mut config = defaults::new_gamepad_config(idx, name);
+    if let Some(setup) = haptics.as_ref() {
+        config = config.with_haptic_capability(setup.capability());
+    }
+    Ok(Input {
+        worker_thread: None,
+        config,
+        source: Some(SocketEventSource::new(source)),
+        virtio_features,
+        haptics,
     })
 }
 
@@ -855,6 +1074,7 @@ where
         config: defaults::new_switches_config(idx),
         source: Some(SocketEventSource::new(source)),
         virtio_features,
+        haptics: None,
     })
 }
 
@@ -872,6 +1092,7 @@ where
         config: defaults::new_rotary_config(idx),
         source: Some(SocketEventSource::new(source)),
         virtio_features,
+        haptics: None,
     })
 }
 
@@ -899,6 +1120,7 @@ where
         ),
         source: Some(SocketEventSource::new(source)),
         virtio_features,
+        haptics: None,
     })
 }
 
@@ -1030,6 +1252,184 @@ fn bitmap_from_map(map: &BTreeMap<String, u16>) -> Result<virtio_input_bitmap> {
         bitmap_idx.push(value);
     }
     Ok(virtio_input_bitmap::from_bits(&bitmap_idx))
+}
+
+#[cfg(test)]
+mod haptic_device_tests {
+    //! Exercises the real virtio device surface, not the bridge in isolation:
+    //! config space through `read`/`write`, and whole descriptor chains over
+    //! `GuestMemory`. Frames are the ones the Windows driver's own C encoder
+    //! produced, so a divergence shows up here rather than on the phone.
+
+    use std::time::Instant;
+
+    use vm_memory::GuestAddress;
+    use vm_memory::GuestMemory;
+
+    use super::super::descriptor_utils::create_descriptor_chain;
+    use super::super::descriptor_utils::DescriptorType;
+    use super::haptics::DvhMessage;
+    use super::haptics::DvhOpcode;
+    use super::haptics::HapticsBridge;
+    use super::haptics::LoggingSink;
+    use super::haptics::StatusVerdict;
+    use super::*;
+
+    const GUEST_EPOCH: u64 = 0x1122_3344_5566_7788;
+    // Encoded by vioinput/sys/HapticsCore.h, not by this crate.
+    const GUEST_READY: &str = "80ff00000100020080ff01008877665580ff02004433221180ff03000100000080ff04000000000080ff05000000000080ff06000000000080ff07000000000080ff08000000000080ff09000000000080ff0a000000000080ff0b0035c8af03";
+
+    fn bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len() / 2)
+            .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The guest reads the capability twice and compares; both reads must be
+    /// byte-identical and land at the documented offsets.
+    #[test]
+    fn capability_is_served_from_config_space() {
+        let setup = HapticsSetup {
+            epoch: GUEST_EPOCH,
+            lease_ms: 1000,
+            sink_factory: Box::new(|| Box::new(LoggingSink::new("t".to_string()))),
+        };
+        let mut config =
+            defaults::new_gamepad_config(0, None).with_haptic_capability(setup.capability());
+
+        // Select the private record the way a guest driver does.
+        let mut select = [0u8; 2];
+        select[0] = DVH_CAP_SELECT;
+        select[1] = DVH_CAP_SUBSEL;
+        config.write(0, &select);
+
+        let mut first = [0u8; 136];
+        config.read(0, &mut first);
+        let mut second = [0u8; 136];
+        config.read(0, &mut second);
+        assert_eq!(first, second, "two reads of the capability disagreed");
+
+        assert_eq!(first[0], DVH_CAP_SELECT);
+        assert_eq!(first[1], DVH_CAP_SUBSEL);
+        assert_eq!(first[2], 32, "size field");
+        let payload = &first[8..8 + 32];
+        assert_eq!(&payload[0..4], b"DVH1");
+        assert_eq!(u16::from_le_bytes([payload[12], payload[13]]), 0xff80);
+        assert_eq!(
+            u64::from_le_bytes(payload[16..24].try_into().unwrap()),
+            GUEST_EPOCH
+        );
+    }
+
+    /// Without haptics the record must be absent, so the guest declines the
+    /// profile instead of negotiating against a host that cannot vibrate.
+    #[test]
+    fn capability_is_absent_when_haptics_are_off() {
+        let mut config = defaults::new_gamepad_config(0, None);
+        config.write(0, &[DVH_CAP_SELECT, DVH_CAP_SUBSEL]);
+        let mut buf = [0u8; 136];
+        config.read(0, &mut buf);
+        assert_eq!(buf[2], 0, "size must be zero with no capability");
+        assert_eq!(&buf[8..12], &[0, 0, 0, 0]);
+    }
+
+    /// A gamepad must expose every axis the guest's probe insists on, with
+    /// usable absinfo, or it refuses to create the device at all.
+    #[test]
+    fn gamepad_config_satisfies_the_guest_probe() {
+        let config = defaults::new_gamepad_config(0, None);
+        for axis in [ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_Z, ABS_RZ] {
+            let info = config
+                .axis_info
+                .get(&axis)
+                .unwrap_or_else(|| panic!("missing absinfo for axis {axis:#x}"));
+            assert!(
+                info.max.to_native() as i32 > info.min.to_native() as i32,
+                "axis {axis:#x} has an empty range"
+            );
+        }
+        // BTN_GAMEPAD is the bit the guest gates the whole gamepad on.
+        let keys = config.supported_events.get(&EV_KEY).expect("EV_KEY");
+        let idx = BTN_GAMEPAD as usize;
+        assert_ne!(keys.bitmap[idx / 8] & (1 << (idx % 8)), 0, "BTN_GAMEPAD unset");
+    }
+
+    fn guest_memory() -> GuestMemory {
+        GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap()
+    }
+
+    /// A whole 96-byte frame arriving as one readable descriptor, read through
+    /// the real `Reader`, must be recognised and answered.
+    #[test]
+    fn a_status_descriptor_carrying_a_guest_frame_is_consumed() {
+        let mem = guest_memory();
+        let frame = bytes(GUEST_READY);
+        let mut chain = create_descriptor_chain(
+            &mem,
+            GuestAddress(0x0),
+            GuestAddress(0x1000),
+            vec![(DescriptorType::Readable, frame.len() as u32)],
+            0,
+        )
+        .expect("chain");
+        mem.write_all_at_addr(&frame, GuestAddress(0x1000)).unwrap();
+
+        let mut bridge =
+            HapticsBridge::new(GUEST_EPOCH, 1000, Box::new(LoggingSink::new("t".to_string())));
+
+        let mut buf = Vec::new();
+        chain.reader.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, frame, "reader did not surface the whole frame");
+        assert_eq!(
+            bridge.handle_status_descriptor(&buf, Instant::now()),
+            StatusVerdict::Consumed
+        );
+
+        // The answer must be twelve events the guest can reassemble.
+        let mut records = Vec::new();
+        while let Some(evt) = bridge.pop_pending() {
+            records.extend_from_slice(&evt.type_.to_native().to_le_bytes());
+            records.extend_from_slice(&evt.code.to_native().to_le_bytes());
+            records.extend_from_slice(&evt.value.to_native().to_le_bytes());
+        }
+        assert_eq!(records.len(), 96, "host did not emit one whole frame");
+        let reply = DvhMessage::decode(&records, DVH_EVENT_TYPE).expect("reply decodes");
+        assert_eq!(reply.opcode, DvhOpcode::HostReady as u16);
+        assert_eq!(reply.epoch, GUEST_EPOCH);
+    }
+
+    /// Control frames must fit the eventq descriptors the guest posts and come
+    /// back out in order when written through the real `Writer`.
+    #[test]
+    fn control_frames_write_into_an_event_descriptor() {
+        let mem = guest_memory();
+        let mut bridge =
+            HapticsBridge::new(GUEST_EPOCH, 1000, Box::new(LoggingSink::new("t".to_string())));
+        bridge.handle_status_descriptor(&bytes(GUEST_READY), Instant::now());
+
+        let mut chain = create_descriptor_chain(
+            &mem,
+            GuestAddress(0x0),
+            GuestAddress(0x1000),
+            vec![(DescriptorType::Writable, 96)],
+            0,
+        )
+        .expect("chain");
+
+        let mut written = 0;
+        while chain.writer.available_bytes() >= virtio_input_event::SIZE {
+            let Some(evt) = bridge.pop_pending() else { break };
+            chain.writer.write_obj(evt).unwrap();
+            written += 1;
+        }
+        assert_eq!(written, 12);
+        assert_eq!(chain.writer.bytes_written(), 96);
+
+        let mut out = vec![0u8; 96];
+        mem.read_exact_at_addr(&mut out, GuestAddress(0x1000)).unwrap();
+        let reply = DvhMessage::decode(&out, DVH_EVENT_TYPE).expect("guest-visible bytes decode");
+        assert_eq!(reply.opcode, DvhOpcode::HostReady as u16);
+    }
 }
 
 #[cfg(test)]

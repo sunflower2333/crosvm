@@ -826,6 +826,7 @@ fn create_virtio_devices(
     let mut keyboard_idx = 0;
     let mut mouse_idx = 0;
     let mut absolute_mouse_idx = 0;
+    let mut gamepad_idx = 0;
     let mut rotary_idx = 0;
     let mut switches_idx = 0;
     let mut multi_touch_idx = 0;
@@ -913,6 +914,26 @@ fn create_virtio_devices(
                     multi_touch_idx,
                 )?;
                 multi_touch_idx += 1;
+                dev
+            }
+            InputDeviceOption::Gamepad {
+                path,
+                name,
+                haptics,
+                vibrator,
+                vibrator_right,
+            } => {
+                let dev = create_gamepad_device(
+                    cfg.protection_type,
+                    cfg.jail_config.as_ref(),
+                    path.as_path(),
+                    name.as_deref(),
+                    haptics.unwrap_or(false),
+                    vibrator.as_deref(),
+                    vibrator_right.as_deref(),
+                    gamepad_idx,
+                )?;
+                gamepad_idx += 1;
                 dev
             }
             InputDeviceOption::Rotary { path } => {
