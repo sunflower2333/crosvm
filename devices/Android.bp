@@ -69,7 +69,7 @@ rust_test {
         "libdowncast_rs",
         "libfuse_rust",
         "libfutures",
-        "libgpu_display",
+        "libgpu_display_native_blt_test",
         "libhypervisor",
         "libjail",
         "libkvm_sys",

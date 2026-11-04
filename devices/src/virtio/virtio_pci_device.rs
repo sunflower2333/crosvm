@@ -11,6 +11,7 @@ use anyhow::anyhow;
 use anyhow::Context;
 use base::debug;
 use base::error;
+use base::info;
 use base::trace;
 use base::AsRawDescriptor;
 use base::AsRawDescriptors;
@@ -18,13 +19,14 @@ use base::Event;
 use base::Protection;
 use base::RawDescriptor;
 use base::Result;
+use base::SafeDescriptor;
 use base::SharedMemory;
 use base::Tube;
 use base::WorkerThread;
 use data_model::Le32;
-use base::SafeDescriptor;
 use hypervisor::Datamatch;
 use hypervisor::MemCacheType;
+use hypervisor::Vm;
 use hypervisor::VmAccept;
 use libc::ERANGE;
 #[cfg(target_arch = "x86_64")]
@@ -316,6 +318,9 @@ pub struct VirtioPciDevice {
     // is used to map/unmap files into the shared memory region.
     shared_memory_vm_memory_client: Option<VmMemoryClient>,
 
+    // Immutable BAR backing that must be installed after BAR allocation but before VM start.
+    pre_start_shared_memory: Option<PreStartSharedMemory>,
+
     // API client for registration of ioevents when PCI BAR reprogramming is detected.
     ioevent_vm_memory_client: VmMemoryClient,
 
@@ -323,6 +328,13 @@ pub struct VirtioPciDevice {
     sleep_state: Option<SleepState>,
 
     vm_control_tube: Arc<Mutex<Tube>>,
+}
+
+struct PreStartSharedMemory {
+    alloc: Alloc,
+    cache: MemCacheType,
+    source: VmMemorySource,
+    guest_offset: u64,
 }
 
 enum SleepState {
@@ -527,6 +539,7 @@ impl VirtioPciDevice {
             },
             iommu: None,
             shared_memory_vm_memory_client,
+            pre_start_shared_memory: None,
             ioevent_vm_memory_client,
             sleep_state: None,
             vm_control_tube: Arc::new(Mutex::new(vm_control_tube)),
@@ -804,16 +817,56 @@ impl PciDevice for VirtioPciDevice {
         allocate_device_bars(
             self,
             |size: u64, alloc: Alloc, alloc_option: &AllocOptions| {
-                resources
+                if std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some() {
+                    info!(
+                        "GPU-BAR-ALLOC: device={} request size={:#x} alloc={:?} options={:?}",
+                        device_type, size, alloc, alloc_option,
+                    );
+                }
+                let allocated = resources
                     .allocate_mmio(
                         size,
                         alloc,
                         format!("virtio-{}-custom_bar", device_type),
                         alloc_option,
                     )
-                    .map_err(|e| PciDeviceError::IoAllocationFailed(size, e))
+                    .map_err(|e| PciDeviceError::IoAllocationFailed(size, e))?;
+                if std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some() {
+                    info!(
+                        "GPU-BAR-ALLOC: device={} result address={:#x} size={:#x}",
+                        device_type, allocated, size,
+                    );
+                }
+                Ok(allocated)
             },
         )
+    }
+
+    fn prepare_device_memory(
+        &mut self,
+        vm: &mut dyn Vm,
+        resources: &mut SystemAllocator,
+    ) -> std::result::Result<Option<vm_control::VmMappedMemoryRegion>, PciDeviceError> {
+        let Some(pre_start) = self.pre_start_shared_memory.take() else {
+            return Ok(None);
+        };
+        let (region, _, _) = pre_start
+            .source
+            .map_without_gralloc(Protection::read_write())
+            .context("failed to map pre-start shared memory source")
+            .map_err(PciDeviceError::MmioSetup)?;
+        let mapped_region = vm_control::sys::prepare_shared_memory_region_at_offset(
+            vm,
+            resources,
+            pre_start.alloc,
+            pre_start.cache,
+            pre_start.guest_offset,
+            Some(region),
+            true,
+        )
+        .context("failed to install pre-start shared memory region")
+        .map_err(PciDeviceError::MmioSetup)?;
+        Ok(Some(mapped_region))
     }
 
     fn destroy_device(&mut self) {
@@ -852,12 +905,27 @@ impl PciDevice for VirtioPciDevice {
     }
 
     fn write_config_register(&mut self, reg_idx: usize, offset: u64, data: &[u8]) {
+        // The drm2kgsl pre-backed BAR is already mapped in Gunyah stage-2. The PCI
+        // configuration object locks only the address bits, so firmware can still write all
+        // ones and read the normal size mask during BAR probing. Do not short-circuit this
+        // call: doing so would make the probe read back the live address and can prevent UEFI
+        // from registering a bootable device.
+        let prebacked_bar = std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some()
+            && (reg_idx == 4 + SHMEM_BAR_NUM || reg_idx == 4 + SHMEM_BAR_NUM + 1);
         if let Some(res) = self.config_regs.write_reg(reg_idx, offset, data) {
             if let Some(msix_behavior) = res.downcast_ref::<MsixStatus>() {
                 self.device.control_notify(*msix_behavior);
             } else if let Some(status) = res.downcast_ref::<PmStatusChange>() {
                 self.handle_pm_status_change(status);
             }
+        }
+        if prebacked_bar {
+            info!(
+                "GPU-BAR-CONFIG: applied masked prebacked BAR2 write reg={} offset={:#x} len={}",
+                reg_idx,
+                offset,
+                data.len(),
+            );
         }
     }
 
@@ -1072,6 +1140,7 @@ where
         .pci_address
         .expect("allocate_address must be called prior to allocate_device_bars");
 
+    let mut vm_requester = None;
     let configs = virtio_pci_device.device.get_device_bars(address);
     let configs = if !configs.is_empty() {
         configs
@@ -1112,10 +1181,11 @@ where
             SharedMemoryPrepareType::DynamicPerMapping
         };
 
-        let vm_requester = Box::new(VmRequester::new(vm_memory_client, alloc, prepare_type));
-        virtio_pci_device
-            .device
-            .set_shared_memory_mapper(vm_requester);
+        vm_requester = Some(Box::new(VmRequester::new(
+            vm_memory_client,
+            alloc,
+            prepare_type,
+        )));
 
         vec![config]
     };
@@ -1134,10 +1204,34 @@ where
                 .align(config.size()),
         )?;
         let config = config.set_address(device_addr);
+        if std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some() {
+            info!(
+                "GPU-BAR-CONFIG: device={} bar={} address={:#x} size={:#x} 64bit={} prefetchable={}",
+                virtio_pci_device.device.device_type(),
+                config.bar_index(),
+                config.address(),
+                config.size(),
+                config.is_64bit_memory(),
+                config.is_prefetchable(),
+            );
+        }
         let _device_bar = virtio_pci_device
             .config_regs
             .add_pci_bar(config)
             .map_err(|e| PciDeviceError::IoRegistrationFailed(device_addr, e))?;
+        if std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some()
+            && config.bar_index() == SHMEM_BAR_NUM
+        {
+            virtio_pci_device
+                .config_regs
+                .lock_bar_address(config.bar_index())
+                .map_err(|e| PciDeviceError::IoRegistrationFailed(device_addr, e))?;
+            info!(
+                "GPU-BAR-CONFIG: locked prebacked shared-memory BAR={} at {:#x}",
+                config.bar_index(),
+                device_addr,
+            );
+        }
         ranges.push(BarRange {
             addr: device_addr,
             size: config.size(),
@@ -1150,11 +1244,27 @@ where
         .get_shared_memory_region()
         .is_some()
     {
+        if let Some(mut requester) = vm_requester {
+            virtio_pci_device.pre_start_shared_memory = requester.take_eager();
+            virtio_pci_device.device.set_shared_memory_mapper(requester);
+        }
         let shmem_region = AddressRange::from_start_and_size(ranges[0].addr, ranges[0].size)
             .expect("invalid shmem region");
         virtio_pci_device
             .device
             .set_shared_memory_region(shmem_region);
+        if std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some() {
+            for bar in virtio_pci_device.config_regs.get_bars() {
+                info!(
+                    "GPU-BAR-CONFIG: final bar={} address={:#x} size={:#x} 64bit={} prefetchable={}",
+                    bar.bar_index(),
+                    bar.address(),
+                    bar.size(),
+                    bar.is_64bit_memory(),
+                    bar.is_prefetchable(),
+                );
+            }
+        }
     }
 
     Ok(ranges)
@@ -1457,6 +1567,7 @@ struct VmRequester {
     mappings: BTreeMap<u64, VmMemoryRegionId>,
     prepare_type: SharedMemoryPrepareType,
     prepared: bool,
+    prepared_cache: Option<MemCacheType>,
 }
 
 impl VmRequester {
@@ -1471,7 +1582,59 @@ impl VmRequester {
             mappings: BTreeMap::new(),
             prepare_type,
             prepared: false,
+            prepared_cache: None,
         }
+    }
+
+    fn take_eager(&mut self) -> Option<PreStartSharedMemory> {
+        let prepare_type = std::mem::replace(
+            &mut self.prepare_type,
+            SharedMemoryPrepareType::DynamicPerMapping,
+        );
+        match prepare_type {
+            SharedMemoryPrepareType::SingleMappingEager(cache, source, guest_offset) => {
+                self.prepared = true;
+                self.prepared_cache = Some(cache);
+                Some(PreStartSharedMemory {
+                    alloc: self.alloc,
+                    cache,
+                    source,
+                    guest_offset,
+                })
+            }
+            other => {
+                self.prepare_type = other;
+                None
+            }
+        }
+    }
+
+    fn prepare_lazy(&mut self) -> anyhow::Result<()> {
+        if self.prepared {
+            return Ok(());
+        }
+        if let SharedMemoryPrepareType::SingleMappingOnFirst(cache) = &self.prepare_type {
+            let cache = *cache;
+            debug!("lazy prepare_shared_memory_region with {:?}", cache);
+            self.vm_memory_client
+                .prepare_shared_memory_region(self.alloc, cache, None)
+                .context("lazy prepare_shared_memory_region failed")?;
+            self.prepared_cache = Some(cache);
+        }
+        self.prepared = true;
+        Ok(())
+    }
+
+    fn validate_cache(&self, cache: MemCacheType) -> anyhow::Result<()> {
+        if cache == MemCacheType::CacheNonCoherent
+            && self.prepared_cache == Some(MemCacheType::CacheCoherent)
+        {
+            error!(
+                "invalid request to map with CacheNonCoherent for device with prepared CacheCoherent memory"
+            );
+            return Err(anyhow!("invalid MemCacheType"));
+        }
+        Ok(())
     }
 }
 
@@ -1483,32 +1646,12 @@ impl SharedMemoryMapper for VmRequester {
         prot: Protection,
         cache: MemCacheType,
     ) -> anyhow::Result<()> {
-        if !self.prepared {
-            if let SharedMemoryPrepareType::SingleMappingOnFirst(prepare_cache_type) =
-                self.prepare_type
-            {
-                debug!(
-                    "lazy prepare_shared_memory_region with {:?}",
-                    prepare_cache_type
-                );
-                self.vm_memory_client
-                    .prepare_shared_memory_region(self.alloc, prepare_cache_type)
-                    .context("lazy prepare_shared_memory_region failed")?;
-            }
-            self.prepared = true;
-        }
+        self.prepare_lazy()?;
 
         // devices must implement VirtioDevice::get_shared_memory_prepare_type(), returning
         // SharedMemoryPrepareType::SingleMappingOnFirst(MemCacheType::CacheNonCoherent) in order to
         // add any mapping that requests MemCacheType::CacheNonCoherent.
-        if cache == MemCacheType::CacheNonCoherent {
-            if let SharedMemoryPrepareType::SingleMappingOnFirst(MemCacheType::CacheCoherent) =
-                self.prepare_type
-            {
-                error!("invalid request to map with CacheNonCoherent for device with prepared CacheCoherent memory");
-                return Err(anyhow!("invalid MemCacheType"));
-            }
-        }
+        self.validate_cache(cache)?;
 
         let id = self
             .vm_memory_client
@@ -1535,16 +1678,8 @@ impl SharedMemoryMapper for VmRequester {
         cache: MemCacheType,
         vm_accept: VmAccept,
     ) -> anyhow::Result<Option<u32>> {
-        if !self.prepared {
-            if let SharedMemoryPrepareType::SingleMappingOnFirst(prepare_cache_type) =
-                self.prepare_type
-            {
-                self.vm_memory_client
-                    .prepare_shared_memory_region(self.alloc, prepare_cache_type)
-                    .context("lazy prepare_shared_memory_region failed")?;
-            }
-            self.prepared = true;
-        }
+        self.prepare_lazy()?;
+        self.validate_cache(cache)?;
 
         let (id, gunyah_handle) = self
             .vm_memory_client
@@ -1565,10 +1700,16 @@ impl SharedMemoryMapper for VmRequester {
     }
 
     fn remove_mapping(&mut self, offset: u64) -> anyhow::Result<()> {
-        let id = self.mappings.remove(&offset).context("invalid offset")?;
+        let id = *self.mappings.get(&offset).context("invalid offset")?;
         self.vm_memory_client
             .unregister_memory(id)
-            .context("unregister_memory failed")
+            .context("unregister_memory failed")?;
+        // Keep the bookkeeping entry until the hypervisor confirms the
+        // unregister.  A failed unregister is retryable; removing it first
+        // would turn the next UNMAP into an "invalid offset" and leak the
+        // mapping permanently.
+        self.mappings.remove(&offset);
+        Ok(())
     }
 
     fn as_raw_descriptor(&self) -> Option<RawDescriptor> {

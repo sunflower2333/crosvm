@@ -3,6 +3,15 @@
 // found in the LICENSE file.
 
 mod edid;
+mod external_scanout;
+mod fence_completion;
+mod native_ahb_release;
+mod native_ahb_paging;
+mod native_blt;
+mod native_blt_wire;
+mod native_geometry;
+#[cfg(test)]
+mod fence_tests;
 mod parameters;
 mod protocol;
 mod snapshot;
@@ -10,6 +19,7 @@ mod virtio_gpu;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::env;
 use std::io::Read;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -37,6 +47,7 @@ use base::warn;
 use base::AsRawDescriptor;
 use base::Event;
 use base::EventToken;
+use base::FromRawDescriptor;
 use base::RawDescriptor;
 use base::ReadNotifier;
 #[cfg(windows)]
@@ -49,6 +60,7 @@ use base::VmEventType;
 use base::WaitContext;
 use base::WorkerThread;
 use data_model::*;
+pub use external_scanout::ExternalScanout;
 pub use gpu_display::EventDevice;
 use gpu_display::*;
 use hypervisor::MemCacheType;
@@ -69,15 +81,26 @@ pub use vm_control::gpu::DEFAULT_DISPLAY_WIDTH;
 pub use vm_control::gpu::DEFAULT_REFRESH_RATE;
 #[cfg(windows)]
 use vm_control::ModifyWaitContext;
+use vm_control::VmMemorySource;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 use zerocopy::IntoBytes;
 
+const DRM2KGSL_BAR_BASE_GUARD: u64 = 2 << 20;
+
+use self::fence_completion::ContextFenceTokens;
+use self::fence_completion::FenceQueue;
+use self::fence_completion::GlobalFenceTokens;
 pub use self::protocol::virtio_gpu_config;
 pub use self::protocol::VIRTIO_GPU_F_CONTEXT_INIT;
 pub use self::protocol::VIRTIO_GPU_F_CREATE_GUEST_HANDLE;
 pub use self::protocol::VIRTIO_GPU_F_EDID;
 pub use self::protocol::VIRTIO_GPU_F_FENCE_PASSING;
+pub use self::protocol::VIRTIO_GPU_F_NATIVE_AHB_V2;
+pub use self::protocol::VIRTIO_GPU_F_NATIVE_AHB_RELEASE;
+pub use self::protocol::VIRTIO_GPU_F_NATIVE_AHB_PAGING;
+use self::native_ahb_release::NativeAhbReleaseState;
+use self::native_ahb_paging::NativeAhbPagingState;
 pub use self::protocol::VIRTIO_GPU_F_RESOURCE_BLOB;
 pub use self::protocol::VIRTIO_GPU_F_RESOURCE_UUID;
 pub use self::protocol::VIRTIO_GPU_F_VIRGL;
@@ -100,11 +123,16 @@ use super::SharedMemoryPrepareType;
 use super::SharedMemoryRegion;
 use super::VirtioDevice;
 use super::Writer;
+use crate::virtio::resource_bridge::ResourceResponse;
 use crate::PciAddress;
 
 // First queue is for virtio gpu commands. Second queue is for cursor commands, which we expect
 // there to be fewer of.
-const QUEUE_SIZES: &[u16] = &[512, 16];
+// A 1 GiB Windows backing allocation can contain 262144 noncontiguous 4 KiB
+// pages. Its 4 MiB entry payload needs up to 1025 direct descriptors, plus
+// command and response fragments. Keep the queue power-of-two and leave room
+// for other control commands; the cursor queue is independent.
+const QUEUE_SIZES: &[u16] = &[2048, 16];
 
 /// Most `virtio_gpu_mem_entry` records this will build a list from in one command.
 ///
@@ -117,7 +145,7 @@ const QUEUE_SIZES: &[u16] = &[512, 16];
 /// still has to go, because `Vec::with_capacity` is infallible, so a refused reservation is
 /// `handle_alloc_error()` and the GPU device runs in-process: that aborts the VM.
 ///
-/// The one that actually costs memory needs no lying at all. The ctrl queue has 512 descriptors
+/// The one that actually costs memory needs no lying at all. Even a queue with 512 descriptors
 /// and the chain walk only stops at `count >= queue_size` -- it does not require the descriptors to
 /// be distinct -- so 512 of them may all point at one guest buffer. A guest can then honestly
 /// present ~4 GiB of readable payload (the chain length is summed into a u32, which is the only
@@ -129,6 +157,65 @@ const QUEUE_SIZES: &[u16] = &[512, 16];
 /// 1M entries is a 16 MiB Vec, enough to describe a 4 GiB scatter-gather list of 4 KiB pages, so
 /// it bounds the retained cost without rejecting anything a real driver produces.
 const MAX_MEM_ENTRIES: usize = 1 << 20;
+
+#[cfg(test)]
+mod large_backing_tests {
+    use super::*;
+    use crate::virtio::descriptor_chain::VIRTQ_DESC_F_NEXT;
+    use crate::virtio::descriptor_chain::VIRTQ_DESC_F_WRITE;
+    use crate::virtio::queue::split_descriptor_chain::Desc;
+    use crate::virtio::queue::split_descriptor_chain::SplitDescriptorChain;
+
+    #[test]
+    fn fragmented_backing_uses_complete_direct_chain() {
+        for pages in [140070usize, 262144] {
+            // Worst alignment: two command pages, a partial first payload
+            // page, remaining payload pages, and two response pages.
+            let bytes = pages * size_of::<virtio_gpu_mem_entry>();
+            let mut lengths = vec![1u32, 95];
+            lengths.push(1);
+            let mut remaining = bytes - 1;
+            while remaining != 0 {
+                let fragment = remaining.min(4096);
+                lengths.push(fragment as u32);
+                remaining -= fragment;
+            }
+            let outputs = lengths.len();
+            lengths.extend([1, 23]);
+            let mem = GuestMemory::new(&[(GuestAddress(0), 0x20000)]).unwrap();
+            for (index, &length) in lengths.iter().enumerate() {
+                let flags = if index + 1 < lengths.len() {
+                    VIRTQ_DESC_F_NEXT
+                } else {
+                    0
+                } | if index >= outputs {
+                    VIRTQ_DESC_F_WRITE
+                } else {
+                    0
+                };
+                let descriptor = Desc {
+                    addr: 0x10000u64.into(),
+                    len: length.into(),
+                    flags: flags.into(),
+                    next: ((index + 1) as u16).into(),
+                };
+                mem.write_obj_at_addr(descriptor, GuestAddress((index * 16) as u64))
+                    .unwrap();
+            }
+            let chain = SplitDescriptorChain::new(&mem, GuestAddress(0), QUEUE_SIZES[0], 0);
+            let packet = DescriptorChain::new(chain, &mem, 0).unwrap();
+            assert_eq!(packet.count as usize, lengths.len());
+            assert_eq!(packet.reader.available_bytes(), bytes + 96);
+            assert_eq!(packet.writer.available_bytes(), 24);
+            assert_eq!(checked_entry_count(pages as u32, bytes).unwrap(), pages);
+            assert!(checked_entry_count(pages as u32, bytes - 1).is_err());
+            // A peer that only negotiates the old queue fails safely.
+            let old = SplitDescriptorChain::new(&mem, GuestAddress(0), 512, 0);
+            assert!(DescriptorChain::new(old, &mem, 0).is_err());
+        }
+        assert!(checked_entry_count(u32::MAX, usize::MAX).is_err());
+    }
+}
 
 /// Entries the guest actually presented, or an error. Clamping to `available_bytes` is what kills
 /// the over-reservation: capacity can no longer exceed the bytes really in the chain.
@@ -193,17 +280,16 @@ enum VirtioGpuRing {
     ContextSpecific { ctx_id: u32, ring_idx: u8 },
 }
 
-struct FenceDescriptor {
-    ring: VirtioGpuRing,
-    fence_id: u64,
-    desc_chain: DescriptorChain,
-    len: u32,
-}
-
 #[derive(Default)]
 pub struct FenceState {
-    descs: Vec<FenceDescriptor>,
-    completed_fences: BTreeMap<VirtioGpuRing, u64>,
+    queue: FenceQueue<VirtioGpuRing, ReturnDescriptor>,
+    global_tokens: GlobalFenceTokens,
+    context_tokens: ContextFenceTokens,
+    uses_global_tokens: bool,
+    context_retirement_event: Option<Event>,
+    waiting_for_context_destroy: bool,
+    waiting_for_reset: bool,
+    renderer_error: Option<RutabagaFenceError>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -215,19 +301,84 @@ struct FenceStateSnapshot {
         deserialize_with = "deserialize_map_from_kv_vec"
     )]
     completed_fences: BTreeMap<VirtioGpuRing, u64>,
+    // None identifies the legacy guest-cookie format (or another component).
+    #[serde(default)]
+    global_tokens_last_issued: Option<u32>,
+    #[serde(default)]
+    context_tokens_last_issued: Option<u64>,
 }
 
 impl FenceState {
-    fn snapshot(&self) -> FenceStateSnapshot {
-        assert!(self.descs.is_empty(), "can't snapshot with pending fences");
-        FenceStateSnapshot {
-            completed_fences: self.completed_fences.clone(),
+    fn check_renderer(&self) -> anyhow::Result<()> {
+        if let Some(failure) = self.renderer_error {
+            return Err(anyhow!(
+                "renderer fence failed, ownership retained: {:?}",
+                failure
+            ));
         }
+        Ok(())
     }
 
-    fn restore(&mut self, snapshot: FenceStateSnapshot) {
-        assert!(self.descs.is_empty(), "can't restore activated device");
-        self.completed_fences = snapshot.completed_fences;
+    fn snapshot(&self) -> anyhow::Result<FenceStateSnapshot> {
+        self.check_renderer()?;
+        if !self.queue.is_empty()
+            || !self.global_tokens.is_empty()
+            || !self.context_tokens.is_empty()
+        {
+            return Err(anyhow!("cannot snapshot GPU with pending fences"));
+        }
+        Ok(FenceStateSnapshot {
+            completed_fences: self.queue.completed_renderer.clone(),
+            global_tokens_last_issued: self
+                .uses_global_tokens
+                .then(|| self.global_tokens.last_issued()),
+            context_tokens_last_issued: self
+                .uses_global_tokens
+                .then(|| self.context_tokens.last_issued()),
+        })
+    }
+
+    fn restore(&mut self, snapshot: FenceStateSnapshot) -> anyhow::Result<()> {
+        self.check_renderer()?;
+        if !self.queue.is_empty()
+            || !self.global_tokens.is_empty()
+            || !self.context_tokens.is_empty()
+        {
+            return Err(anyhow!("cannot restore GPU with pending fences"));
+        }
+        if self.uses_global_tokens != snapshot.global_tokens_last_issued.is_some() {
+            return Err(anyhow!("incompatible GPU global fence snapshot format"));
+        }
+        if self.uses_global_tokens != snapshot.context_tokens_last_issued.is_some() {
+            return Err(anyhow!("incompatible GPU context fence snapshot format"));
+        }
+        if let Some(last_issued) = snapshot.context_tokens_last_issued {
+            if snapshot.completed_fences.iter().any(|(ring, id)| {
+                matches!(ring, VirtioGpuRing::ContextSpecific { .. }) && *id > last_issued
+            }) {
+                return Err(anyhow!("GPU context completion exceeds issued tokens"));
+            }
+        }
+        if let Some(last_issued) = snapshot.global_tokens_last_issued {
+            if snapshot
+                .completed_fences
+                .get(&VirtioGpuRing::Global)
+                .is_some_and(|id| *id > u64::from(last_issued))
+            {
+                return Err(anyhow!(
+                    "GPU fence snapshot completion exceeds issued tokens"
+                ));
+            }
+            if !self.global_tokens.restore_last_issued(last_issued) {
+                return Err(anyhow!("GPU global fences are still pending"));
+            }
+        }
+        if let Some(last_issued) = snapshot.context_tokens_last_issued {
+            // Both registries were checked empty before modifying either.
+            self.context_tokens.restore_last_issued(last_issued);
+        }
+        self.queue.completed_renderer = snapshot.completed_fences;
+        Ok(())
     }
 }
 
@@ -235,32 +386,6 @@ pub trait QueueReader {
     fn pop(&self) -> Option<DescriptorChain>;
     fn add_used(&self, desc_chain: DescriptorChain, len: u32);
     fn signal_used(&self);
-}
-
-struct LocalQueueReader {
-    queue: RefCell<Queue>,
-}
-
-impl LocalQueueReader {
-    fn new(queue: Queue) -> Self {
-        Self {
-            queue: RefCell::new(queue),
-        }
-    }
-}
-
-impl QueueReader for LocalQueueReader {
-    fn pop(&self) -> Option<DescriptorChain> {
-        self.queue.borrow_mut().pop()
-    }
-
-    fn add_used(&self, desc_chain: DescriptorChain, len: u32) {
-        self.queue.borrow_mut().add_used(desc_chain, len)
-    }
-
-    fn signal_used(&self) {
-        self.queue.borrow_mut().trigger_interrupt();
-    }
 }
 
 #[derive(Clone)]
@@ -342,7 +467,10 @@ fn build(
     let (chosen, mut display) = match display_opt {
         Some(d) => d,
         None => {
-            error!("failed to open any display backend ({})", declined.join("; "));
+            error!(
+                "failed to open any display backend ({})",
+                declined.join("; ")
+            );
             return None;
         }
     };
@@ -396,6 +524,38 @@ where
 {
     pub mem: GuestMemory,
     pub ctrl_queue: Q,
+    pub cursor_queue: Option<Q>,
+}
+
+fn return_fenced_descriptors(
+    completed: Vec<ReturnDescriptor>,
+    ctrl_queue: &dyn QueueReader,
+    cursor_queue: Option<&dyn QueueReader>,
+) {
+    let mut signal_ctrl = false;
+    let mut signal_cursor = false;
+    for desc in completed {
+        match desc.queue {
+            GpuQueue::Control => {
+                ctrl_queue.add_used(desc.desc_chain, desc.len);
+                signal_ctrl = true;
+            }
+            GpuQueue::Cursor => {
+                // Only the built-in worker processes cursor messages; its
+                // activation always supplies the shared cursor queue.
+                cursor_queue
+                    .expect("cursor descriptor without its activation queue")
+                    .add_used(desc.desc_chain, desc.len);
+                signal_cursor = true;
+            }
+        }
+    }
+    if signal_ctrl {
+        ctrl_queue.signal_used();
+    }
+    if signal_cursor {
+        cursor_queue.unwrap().signal_used();
+    }
 }
 
 /// Create a handler that writes into the completed fence queue
@@ -407,45 +567,88 @@ where
     Q: QueueReader + Send + Clone + 'static,
 {
     RutabagaFenceHandler::new(move |completed_fence: RutabagaFence| {
-        let mut signal = false;
+        native_ahb_release::native_ahb_trace(format_args!(
+            "fence r={} seq={} ring={}",
+            completed_fence.ctx_id,
+            completed_fence.fence_id,
+            completed_fence.ring_idx
+        ));
+        let resources = fence_handler_resources.lock();
+        let ring = match completed_fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
+            0 => VirtioGpuRing::Global,
+            _ => VirtioGpuRing::ContextSpecific {
+                ctx_id: completed_fence.ctx_id,
+                ring_idx: completed_fence.ring_idx,
+            },
+        };
 
-        if let Some(ref fence_handler_resources) = *fence_handler_resources.lock() {
-            // Limits the lifetime of `fence_state`:
+        let mut fence_state = fence_state.lock();
+        if fence_state.renderer_error.is_some() {
+            return;
+        }
+        if ring == VirtioGpuRing::Global
+            && fence_state.uses_global_tokens
+            && !fence_state.global_tokens.complete(completed_fence.fence_id)
+        {
+            // Never interpret unknown/late guest cookies as progress.
+            return;
+        }
+        if let VirtioGpuRing::ContextSpecific { ctx_id, ring_idx } = ring {
+            if fence_state.uses_global_tokens
+                && !fence_state
+                    .context_tokens
+                    .complete(ctx_id, ring_idx, completed_fence.fence_id)
             {
-                let ring = match completed_fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
-                    0 => VirtioGpuRing::Global,
-                    _ => VirtioGpuRing::ContextSpecific {
-                        ctx_id: completed_fence.ctx_id,
-                        ring_idx: completed_fence.ring_idx,
-                    },
-                };
-
-                let mut fence_state = fence_state.lock();
-                // TODO(dverkamp): use `drain_filter()` when it is stabilized
-                let mut i = 0;
-                while i < fence_state.descs.len() {
-                    if fence_state.descs[i].ring == ring
-                        && fence_state.descs[i].fence_id <= completed_fence.fence_id
-                    {
-                        let completed_desc = fence_state.descs.remove(i);
-                        fence_handler_resources
-                            .ctrl_queue
-                            .add_used(completed_desc.desc_chain, completed_desc.len);
-                        signal = true;
-                    } else {
-                        i += 1;
-                    }
-                }
-
-                // Update the last completed fence for this context
-                fence_state
-                    .completed_fences
-                    .insert(ring, completed_fence.fence_id);
+                return;
             }
-
-            if signal {
-                fence_handler_resources.ctrl_queue.signal_used();
+        }
+        fence_state
+            .queue
+            .complete_renderer(ring, completed_fence.fence_id);
+        // Suspend does not necessarily stop backend callbacks. Keep
+        // completion state while queues are unavailable, then publish
+        // these same descriptors when that activation resumes.
+        if let Some(ref resources) = *resources {
+            return_fenced_descriptors(
+                fence_state.queue.drain_ready(),
+                &resources.ctrl_queue,
+                resources
+                    .cursor_queue
+                    .as_ref()
+                    .map(|q| q as &dyn QueueReader),
+            );
+        }
+        if fence_state.waiting_for_context_destroy || fence_state.waiting_for_reset {
+            if let Some(event) = &fence_state.context_retirement_event {
+                let _ = event.signal();
             }
+        }
+    })
+}
+
+pub fn create_fence_error_handler(
+    fence_state: Arc<Mutex<FenceState>>,
+) -> RutabagaFenceErrorHandler {
+    RutabagaFenceErrorHandler::new(move |failure: RutabagaFenceError| {
+        let Ok(ring_idx) = u8::try_from(failure.ring_idx) else {
+            return;
+        };
+        let mut state = fence_state.lock();
+        if failure.error >= 0
+            || state.renderer_error.is_some()
+            || !state
+                .context_tokens
+                .contains(failure.ctx_id, ring_idx, failure.fence_id)
+        {
+            return;
+        }
+        state.renderer_error = Some(failure);
+        state.queue.stop();
+        // Wake even when no context destroy is parked, including inactive
+        // queues. Keep tokens/descriptors and never invoke renderer teardown
+        // from its synchronous callback thread.
+        if let Some(event) = &state.context_retirement_event {
+            let _ = event.signal();
         }
     })
 }
@@ -453,124 +656,474 @@ where
 pub struct ReturnDescriptor {
     pub desc_chain: DescriptorChain,
     pub len: u32,
+    queue: GpuQueue,
+    ctx_id: u32,
 }
 
-/// A RESOURCE_FLUSH whose virtio fence completion is parked on a display fence: the zero-copy
-/// flip handed back a sync_file that signals when the display has finished reading the flipped
-/// buffer, and the guest (which dma_fence-waits this virtio fence in its plane update) must not
-/// reuse the dmabuf before then.  The descriptor itself already sits in `fence_state.descs`;
-/// this records what to complete and when to give up.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum GpuQueue {
+    Control,
+    Cursor,
+}
+
+/// A RESOURCE_FLUSH whose virtio fence completion is parked on a typed display completion signal:
+/// the zero-copy flip signals when the display has finished reading the flipped buffer, and the
+/// guest (which dma_fence-waits this virtio fence in its plane update) must not reuse the dmabuf
+/// before then. The descriptor already sits in `fence_state.queue`; this records what to complete
+/// and when to give up.
 struct PendingFlipFence {
-    ring: VirtioGpuRing,
+    resource_id: u32,
     fence_id: u64,
-    fence: SafeDescriptor,
-    /// Safety valve: a display that never signals (surface torn down mid-flip, HWC stall) must
-    /// not freeze the guest compositor.  Past this instant the fence is completed regardless.
-    deadline: std::time::Instant,
+    // None: a direct native presentation already acknowledged acceptance;
+    // this reader now gates only explicit per-buffer reuse observations.
+    ticket: Option<u64>,
+    fence: FlipCompletionFence,
+    /// A deadline requests VM recovery; it never makes this buffer reusable.
+    deadline: Option<std::time::Instant>,
     /// Whether the fd has been added to the worker's WaitContext yet.
     registered: bool,
 }
 
-/// How long a flip completion fence may stay unsignaled before it is force-completed.  Three
-/// 120Hz vsyncs -- generous for a healthy display, small enough that a torn-down surface only
-/// hiccups the guest instead of stalling it (the guest side waits with its own multi-second
-/// timeout, which would otherwise be the visible failure).
-const FLIP_FENCE_TIMEOUT: Duration = Duration::from_millis(25);
+struct DeferredContextDestroy {
+    hdr: virtio_gpu_ctrl_hdr,
+    descriptor: ReturnDescriptor,
+    deadline: std::time::Instant,
+}
+
+/// This is a hang watchdog, not presentation pacing or a successful completion.
+/// Allow delayed/loaded displays to signal normally instead of releasing their
+/// source buffers after an arbitrary number of vsyncs.
+const FLIP_FENCE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound on how long the GPU worker sleeps before re-checking the control queue itself.
+const CTRL_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(any(target_os = "android", target_os = "linux"))]
+#[derive(Default)]
+#[repr(C)]
+struct SyncFileInfo {
+    name: [u8; 32],
+    status: i32,
+    flags: u32,
+    num_fences: u32,
+    pad: u32,
+    sync_fence_info: u64,
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+base::ioctl_iowr_nr!(SYNC_IOC_FILE_INFO, 0x3e, 4, SyncFileInfo);
+
+/// POLLIN includes failed dma_fences. Query the sync_file's aggregate status
+/// before granting reuse: 1 is success, 0 is active, and a negative value is
+/// a backend error. No individual fence-info array is needed.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn flip_fence_signaled(fence: &FlipCompletionFence) -> anyhow::Result<bool> {
+    let mut pfd = libc::pollfd {
+        fd: fence.as_raw_descriptor(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: pfd is valid for one element throughout this nonblocking call.
+    let result = unsafe { libc::poll(&mut pfd, 1, 0) };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(error).context("polling display completion fence");
+    }
+    if pfd.revents & (libc::POLLERR | libc::POLLNVAL | libc::POLLHUP) != 0 {
+        return Err(anyhow!("display fence poll error flags {:#x}", pfd.revents));
+    }
+    if result == 0 || pfd.revents & libc::POLLIN == 0 {
+        return Ok(false);
+    }
+    match fence {
+        FlipCompletionFence::SyncFile(fd) => {
+            let mut info = SyncFileInfo::default();
+            // SAFETY: the mutable buffer matches the sync_file UAPI. num_fences=0
+            // requests only the aggregate status, without a userspace array pointer.
+            if unsafe { base::ioctl_with_mut_ref(fd, SYNC_IOC_FILE_INFO, &mut info) } < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    return Ok(false);
+                }
+                return Err(error).context("querying display sync_file status");
+            }
+            match info.status {
+                0 => Ok(false),
+                1 => Ok(true),
+                status => Err(anyhow!("display sync_file failed with status {}", status)),
+            }
+        }
+        FlipCompletionFence::AndroidReleaseEvent(fd) => {
+            let mut value = 0u64;
+            // SAFETY: value is valid writable storage and the descriptor is an
+            // explicitly typed eventfd owned by the caller.
+            let read = unsafe {
+                libc::read(
+                    fd.as_raw_descriptor(),
+                    (&mut value as *mut u64).cast(),
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if read == std::mem::size_of::<u64>() as isize && value != 0 {
+                Ok(true)
+            } else {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::Interrupted
+                {
+                    Ok(false)
+                } else {
+                    Err(error).context("reading Android display release event")
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn flip_fence_signaled(_fence: &FlipCompletionFence) -> anyhow::Result<bool> {
+    Err(anyhow!(
+        "display sync_file fences require a Linux or Android host"
+    ))
+}
 
 pub struct Frontend {
     fence_state: Arc<Mutex<FenceState>>,
     virtio_gpu: VirtioGpu,
     pending_flip_fences: Vec<PendingFlipFence>,
+    next_flip_ticket: u64,
+    display_failed: bool,
+    maps_global_fences: bool,
+    context_retirement_event: Event,
+    deferred_context_destroy: Option<DeferredContextDestroy>,
+    native_ahb_release: NativeAhbReleaseState,
+    native_ahb_paging: NativeAhbPagingState,
+    native_blt: native_blt::NativeBltState,
+    native_blt_negotiated: bool,
+    native_geometry_negotiated: bool,
+    #[cfg(test)]
+    native_geometry_test_enabled: bool,
+    /// The guest's flip worker waits synchronously on this descriptor's
+    /// response: raise its interrupt now, not after the rest of the batch.
+    signal_response_now: bool,
+    display_timing_negotiated: bool,
 }
 
 impl Frontend {
-    fn new(virtio_gpu: VirtioGpu, fence_state: Arc<Mutex<FenceState>>) -> Frontend {
-        Frontend {
+    fn new(virtio_gpu: VirtioGpu, fence_state: Arc<Mutex<FenceState>>) -> anyhow::Result<Frontend> {
+        let maps_global_fences = virtio_gpu.uses_virgl_global_fences();
+        fence_state.lock().uses_global_tokens = maps_global_fences;
+        let context_retirement_event = Event::new()?;
+        fence_state.lock().context_retirement_event = Some(context_retirement_event.try_clone()?);
+        Ok(Frontend {
             fence_state,
             virtio_gpu,
             pending_flip_fences: Vec::new(),
+            next_flip_ticket: 0,
+            display_failed: false,
+            maps_global_fences,
+            context_retirement_event,
+            deferred_context_destroy: None,
+            native_ahb_release: NativeAhbReleaseState::default(),
+            native_ahb_paging: NativeAhbPagingState::default(),
+            native_blt: Default::default(),
+            native_blt_negotiated: false,
+            native_geometry_negotiated: false,
+            #[cfg(test)]
+            native_geometry_test_enabled: false,
+            signal_response_now: false,
+            display_timing_negotiated: false,
+        })
+    }
+
+    fn context_has_pending_work(&self, ctx_id: u32) -> bool {
+        let state = self.fence_state.lock();
+        state.context_tokens.has_context(ctx_id)
+            || state.queue.any_pending(|desc| desc.ctx_id == ctx_id)
+            || self.pending_flip_fences.iter().any(|reader| reader.ticket.is_some())
+    }
+
+    fn finish_context_destroy(
+        &mut self,
+        mut pending: DeferredContextDestroy,
+    ) -> Option<ReturnDescriptor> {
+        let ctx_id = pending.hdr.ctx_id.to_native();
+        let response = match self.virtio_gpu.destroy_context(ctx_id) {
+            Ok(response) => {
+                self.fence_state.lock().queue.completed_renderer.retain(|ring, _|
+                    !matches!(ring, VirtioGpuRing::ContextSpecific { ctx_id: old, .. } if *old == ctx_id));
+                response
+            }
+            Err(response) => response,
+        };
+        let fenced = pending.hdr.flags.to_native() & VIRTIO_GPU_FLAG_FENCE != 0;
+        let (flags, cookie, response_ctx, ring_idx) = if fenced {
+            (
+                pending.hdr.flags.to_native(),
+                pending.hdr.fence_id.to_native(),
+                ctx_id,
+                pending.hdr.ring_idx,
+            )
+        } else {
+            (0, 0, 0, 0)
+        };
+        pending.descriptor.len = response
+            .encode(
+                flags,
+                cookie,
+                response_ctx,
+                ring_idx,
+                &mut pending.descriptor.desc_chain.writer,
+            )
+            .unwrap_or(0);
+        if fenced {
+            let ring = if flags & VIRTIO_GPU_FLAG_INFO_RING_IDX == 0 {
+                VirtioGpuRing::Global
+            } else {
+                VirtioGpuRing::ContextSpecific { ctx_id, ring_idx }
+            };
+            // Teardown itself completes this command; creating another context
+            // fence after destroying that context would always fail.
+            self.fence_state
+                .lock()
+                .queue
+                .push_complete(ring, pending.descriptor);
+            None
+        } else {
+            Some(pending.descriptor)
         }
+    }
+
+    fn process_context_destroy_request(
+        &mut self,
+        hdr: virtio_gpu_ctrl_hdr,
+        desc_chain: DescriptorChain,
+        source: GpuQueue,
+    ) -> Option<ReturnDescriptor> {
+        let pending = DeferredContextDestroy {
+            hdr,
+            descriptor: ReturnDescriptor {
+                desc_chain,
+                len: 0,
+                queue: source,
+                ctx_id: hdr.ctx_id.to_native(),
+            },
+            deadline: std::time::Instant::now() + FLIP_FENCE_TIMEOUT,
+        };
+        // Enable the wakeup before observing pending work, so a callback cannot
+        // disappear between the check and parking the teardown descriptor.
+        self.fence_state.lock().waiting_for_context_destroy = true;
+        if self.context_has_pending_work(hdr.ctx_id.to_native()) {
+            self.deferred_context_destroy = Some(pending);
+            None
+        } else {
+            self.fence_state.lock().waiting_for_context_destroy = false;
+            self.finish_context_destroy(pending)
+        }
+    }
+
+    /// Resume a parked teardown before processing newer resource mutations.
+    /// Only teardown serializes command intake; ordinary frame traffic does not.
+    pub fn process_context_retirement(
+        &mut self,
+        mem: &GuestMemory,
+        ctrl_queue: &dyn QueueReader,
+        cursor_queue: Option<&dyn QueueReader>,
+    ) -> anyhow::Result<()> {
+        self.fence_state.lock().check_renderer()?;
+        if self.display_failed {
+            return Err(anyhow!("GPU recovery already pending"));
+        }
+        let Some(pending) = self.deferred_context_destroy.as_ref() else {
+            return Ok(());
+        };
+        if self.context_has_pending_work(pending.hdr.ctx_id.to_native()) {
+            if std::time::Instant::now() >= pending.deadline {
+                self.display_failed = true;
+                self.fence_state.lock().queue.stop();
+                return Err(anyhow!(
+                    "context {} teardown timed out; resources remain owned",
+                    pending.hdr.ctx_id.to_native()
+                ));
+            }
+            return Ok(());
+        }
+        let pending = self.deferred_context_destroy.take().unwrap();
+        self.fence_state.lock().waiting_for_context_destroy = false;
+        if let Some(desc) = self.finish_context_destroy(pending) {
+            return_fenced_descriptors(vec![desc], ctrl_queue, cursor_queue);
+        }
+        return_fenced_descriptors(
+            self.fence_state.lock().queue.drain_ready(),
+            ctrl_queue,
+            cursor_queue,
+        );
+        if self.process_queue(mem, ctrl_queue) {
+            ctrl_queue.signal_used();
+        }
+        if let Some(cursor_queue) = cursor_queue {
+            if self.process_cursor_queue(mem, cursor_queue) {
+                cursor_queue.signal_used();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn context_retirement_event(&self) -> Result<Event> {
+        self.context_retirement_event.try_clone()
+    }
+
+    pub fn context_retirement_deadline(&self) -> Option<std::time::Instant> {
+        self.deferred_context_destroy
+            .as_ref()
+            .map(|pending| pending.deadline)
+    }
+
+    pub fn check_quiescent(&self) -> anyhow::Result<()> {
+        let state = self.fence_state.lock();
+        state.check_renderer()?;
+        if self.display_failed
+            || self.deferred_context_destroy.is_some()
+            || !self.pending_flip_fences.is_empty()
+            || self.virtio_gpu.has_deferred_native_ahb()
+            || self.native_ahb_release.has_waiters()
+            || !state.queue.is_empty()
+            || !state.global_tokens.is_empty()
+            || !state.context_tokens.is_empty()
+        {
+            return Err(anyhow!("GPU still owns descriptors or pending work"));
+        }
+        Ok(())
     }
 
     /// Registers any not-yet-registered flip fences with the worker's WaitContext so their
     /// signal wakes the worker exactly when the display is done, rather than on the timeout.
-    fn register_flip_fences(&mut self, wait_ctx: &WaitContext<WorkerToken>) {
+    fn register_flip_fences(&mut self, wait_ctx: &WaitContext<WorkerToken>) -> anyhow::Result<()> {
         for pending in self.pending_flip_fences.iter_mut() {
             if !pending.registered {
-                // Registration failure is not fatal: the deadline path still completes it.
-                if let Err(e) = wait_ctx.add(&pending.fence, WorkerToken::FlipFence) {
-                    base::warn!("failed to poll flip fence, falling back to timeout: {}", e);
-                }
+                wait_ctx
+                    .add(&pending.fence, WorkerToken::FlipFence)
+                    .context("registering display completion fence")?;
                 pending.registered = true;
             }
         }
+        Ok(())
     }
 
     /// The nearest deadline among pending flip fences, if any -- the worker bounds its wait by
-    /// this so an unsignaled fence cannot stall the guest past `FLIP_FENCE_TIMEOUT`.
+    /// this so the hang watchdog runs even when no other event wakes the worker.
     fn next_flip_fence_deadline(&self) -> Option<std::time::Instant> {
-        self.pending_flip_fences.iter().map(|f| f.deadline).min()
+        self.pending_flip_fences
+            .iter()
+            .filter_map(|f| f.deadline)
+            .chain(self.context_retirement_deadline())
+            .chain(self.native_ahb_present_retry_deadline())
+            .min()
     }
 
-    /// Completes every pending flip fence that has signaled or passed its deadline.  Returns
-    /// whether any completion was delivered (the caller then signals the ctrl queue).
+    /// Complete only successfully signaled fences. On timeout/error keep all
+    /// ownership and let the worker request recovery without publishing reuse.
     fn complete_flip_fences(
         &mut self,
         ctrl_queue: &dyn QueueReader,
+        cursor_queue: &dyn QueueReader,
         wait_ctx: &WaitContext<WorkerToken>,
-    ) -> bool {
+    ) -> anyhow::Result<()> {
+        self.complete_flip_fences_with(ctrl_queue, cursor_queue, wait_ctx, flip_fence_signaled)
+    }
+
+    fn complete_flip_fences_with(
+        &mut self,
+        ctrl_queue: &dyn QueueReader,
+        cursor_queue: &dyn QueueReader,
+        wait_ctx: &WaitContext<WorkerToken>,
+        is_signaled: impl FnMut(&FlipCompletionFence) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()> {
+        self.complete_flip_fences_impl(ctrl_queue, cursor_queue, Some(wait_ctx), is_signaled)
+    }
+
+    fn complete_flip_fences_impl(
+        &mut self,
+        ctrl_queue: &dyn QueueReader,
+        cursor_queue: &dyn QueueReader,
+        wait_ctx: Option<&WaitContext<WorkerToken>>,
+        mut is_signaled: impl FnMut(&FlipCompletionFence) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<()> {
         let now = std::time::Instant::now();
-        let mut any = false;
         let mut i = 0;
         while i < self.pending_flip_fences.len() {
             let pending = &self.pending_flip_fences[i];
-            // A sync_file reads as POLLIN once its fence signals.
-            let mut pfd = libc::pollfd {
-                fd: pending.fence.as_raw_descriptor(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: pfd points at a valid pollfd for the duration of the call.
-            let signaled = unsafe { libc::poll(&mut pfd, 1, 0) } > 0;
-            if !signaled && now < pending.deadline {
+            let signaled = is_signaled(&pending.fence)?;
+            if !signaled && pending.deadline.is_none_or(|deadline| now < deadline) {
+                i += 1;
+                continue;
+            }
+            if !signaled && pending.ticket.is_none() {
+                // A native AHB reader holds no virtio descriptor, only the
+                // guest's next write to that AHB. Keep it owned and waiting:
+                // the guest's own release WAIT stays pending, which is
+                // recoverable, while ending the VM over one unreleased
+                // SurfaceControl buffer is not.
+                error!(
+                    "NATIVE-AHB: release of res {} sequence {} still pending after {:?}; \
+                     keeping it owned (scanout={} readers={} waiters={})",
+                    pending.resource_id,
+                    pending.fence_id,
+                    FLIP_FENCE_TIMEOUT,
+                    self.virtio_gpu.is_scanout_resource(pending.resource_id),
+                    self.pending_flip_fences.len(),
+                    self.native_ahb_release.waiting_count()
+                );
+                self.pending_flip_fences[i].deadline = None;
                 i += 1;
                 continue;
             }
             if !signaled {
-                base::warn!(
-                    "flip fence {} timed out after {:?}; completing anyway",
+                return Err(anyhow!(
+                    "flip fence {} timed out after {:?}; source remains owned by display",
                     pending.fence_id,
                     FLIP_FENCE_TIMEOUT
-                );
+                ));
             }
             let pending = self.pending_flip_fences.remove(i);
             if pending.registered {
-                let _ = wait_ctx.delete(&pending.fence);
-            }
-            // Mirror create_fence_handler: deliver every descriptor at or below this fence on
-            // the same ring, then advance the ring's completed counter.
-            let mut fence_state = self.fence_state.lock();
-            let mut j = 0;
-            while j < fence_state.descs.len() {
-                if fence_state.descs[j].ring == pending.ring
-                    && fence_state.descs[j].fence_id <= pending.fence_id
-                {
-                    let completed = fence_state.descs.remove(j);
-                    ctrl_queue.add_used(completed.desc_chain, completed.len);
-                    any = true;
-                } else {
-                    j += 1;
+                if let Some(wait_ctx) = wait_ctx {
+                    let _ = wait_ctx.delete(&pending.fence);
                 }
             }
-            let completed = fence_state
-                .completed_fences
-                .entry(pending.ring.clone())
-                .or_insert(0);
-            if pending.fence_id > *completed {
-                *completed = pending.fence_id;
+            let resource_still_pending = self
+                .pending_flip_fences
+                .iter()
+                .any(|f| f.resource_id == pending.resource_id);
+            if pending.ticket.is_none() && !resource_still_pending {
+                self.note_native_ahb_released(pending.resource_id, pending.fence_id);
             }
+            self.virtio_gpu
+                .release_deferred_native_ahb(pending.resource_id, resource_still_pending);
+            if pending.ticket.is_none() {
+                let completed = self.complete_native_ahb_waits(pending.resource_id);
+                return_fenced_descriptors(completed, ctrl_queue, Some(cursor_queue));
+                continue;
+            }
+            // One command may start several scanout/cursor readers. A single
+            // successful reader cannot release their shared source allocation.
+            if self
+                .pending_flip_fences
+                .iter()
+                .any(|f| f.ticket == pending.ticket)
+            {
+                continue;
+            }
+            // A display fence releases only its own source buffer. It cannot
+            // complete earlier renderer work or advance a renderer watermark.
+            let mut fence_state = self.fence_state.lock();
+            fence_state.queue.complete_display(pending.ticket.unwrap());
+            let completed = fence_state.queue.drain_ready();
+            // Signal before observing another fence, which may report failure.
+            return_fenced_descriptors(completed, ctrl_queue, Some(cursor_queue));
         }
-        any
+        Ok(())
     }
 
     /// Returns the internal connection to the compositor and its associated state.
@@ -587,7 +1140,15 @@ impl Frontend {
     pub fn process_resource_bridge(&mut self, resource_bridge: &Tube) -> anyhow::Result<()> {
         let response = match resource_bridge.recv() {
             Ok(ResourceRequest::GetBuffer { id }) => self.virtio_gpu.export_resource(id),
-            Ok(ResourceRequest::GetFence { seqno }) => self.virtio_gpu.export_fence(seqno),
+            Ok(ResourceRequest::GetFence { seqno }) => {
+                if self.maps_global_fences {
+                    // Guest cookies are not host tokens. Enable this only with
+                    // an export/alias registry and safe backend fd ownership.
+                    ResourceResponse::Invalid
+                } else {
+                    self.virtio_gpu.export_fence(seqno)
+                }
+            }
             Err(e) => return Err(e).context("Error receiving resource bridge request"),
         };
 
@@ -610,9 +1171,21 @@ impl Frontend {
         cmd: GpuCommand,
         reader: &mut Reader,
     ) -> VirtioGpuResult {
-        self.virtio_gpu.force_ctx_0();
+        let is_drm_submit = matches!(
+            &cmd,
+            GpuCommand::CmdSubmit3d(info)
+                if self.virtio_gpu.context_uses_capset(
+                    info.hdr.ctx_id.to_native(),
+                    RUTABAGA_CAPSET_DRM,
+                )
+        );
+        if !is_drm_submit && !matches!(&cmd, GpuCommand::GetDisplayTiming(_)) {
+            self.virtio_gpu.force_ctx_0();
+        }
 
         match cmd {
+            // Read-only timing is intercepted before renderer/fence handling.
+            GpuCommand::GetDisplayTiming(_) | GpuCommand::NativeBlt(_) | GpuCommand::QueryNativeBlt(_) => Err(GpuResponse::ErrInvalidParameter),
             GpuCommand::GetDisplayInfo(_) => Ok(GpuResponse::OkDisplayInfo(
                 self.virtio_gpu.display_info().to_vec(),
             )),
@@ -633,19 +1206,50 @@ impl Frontend {
                 };
 
                 self.virtio_gpu
-                    .resource_create_3d(resource_id, resource_create_3d)
+                    .resource_create_2d(resource_id, resource_create_3d)
             }
             GpuCommand::ResourceUnref(info) => {
-                self.virtio_gpu
-                    .unref_resource(mem, info.resource_id.to_native())
+                let resource_id = info.resource_id.to_native();
+                if self.native_blt.poisoned.contains(&resource_id) { return Err(GpuResponse::ErrUnspec); }
+                if self.native_ahb_present_pending(resource_id) {
+                    // A retained PRESENT still owns this exact identity.
+                    return Err(GpuResponse::ErrInvalidParameter);
+                }
+                let has_pending_reader = self
+                    .pending_flip_fences
+                    .iter()
+                    .any(|pending| pending.resource_id == resource_id);
+                if has_pending_reader {
+                    self.virtio_gpu.defer_native_ahb_drop(resource_id);
+                }
+                let result = self.virtio_gpu.unref_resource(mem, resource_id);
+                if result.is_ok() {
+                    self.native_ahb_release.sequences.remove(&resource_id);
+                    self.native_ahb_paging.poisoned.remove(&resource_id);
+                }
+                result
             }
-            GpuCommand::SetScanout(info) => self.virtio_gpu.set_scanout(
-                info.r,
-                info.scanout_id.to_native(),
-                info.resource_id.to_native(),
-                None,
-            ),
+            GpuCommand::SetScanout(info) => {
+                native_ahb_release::native_ahb_trace(format_args!(
+                    "scanout r={} seq=0",
+                    info.resource_id.to_native()
+                ));
+                self.virtio_gpu.set_scanout(
+                    info.r,
+                    info.scanout_id.to_native(),
+                    info.resource_id.to_native(),
+                    None,
+                )
+            }
             GpuCommand::ResourceFlush(info) => {
+                if self.virtio_gpu.native_resource_geometry(info.resource_id.to_native()).is_some()
+                    || self.native_ahb_release.sequences.contains_key(&info.resource_id.to_native())
+                    || self.native_ahb_present_pending(info.resource_id.to_native())
+                    || self.native_ahb_paging.poisoned.contains(&info.resource_id.to_native()) {
+                    // Once opted into independent native release observations,
+                    // the same resource cannot mix in unsequenced legacy flips.
+                    return Err(GpuResponse::ErrInvalidParameter);
+                }
                 self.virtio_gpu.flush_resource(info.resource_id.to_native())
             }
             GpuCommand::TransferToHost2d(info) => {
@@ -787,6 +1391,9 @@ impl Frontend {
                     .transfer_read(ctx_id, resource_id, transfer, None)
             }
             GpuCommand::CmdSubmit3d(info) => {
+                if self.maps_global_fences && info.num_in_fences.to_native() != 0 {
+                    return Err(GpuResponse::ErrInvalidParameter);
+                }
                 if reader.available_bytes() != 0 {
                     let num_in_fences = info.num_in_fences.to_native() as usize;
                     let cmd_size = info.size.to_native() as usize;
@@ -811,6 +1418,12 @@ impl Frontend {
                     }
 
                     if reader.read_exact(&mut cmd_buf[..]).is_ok() {
+                        native_ahb_release::native_ahb_trace(format_args!(
+                            "submit r={} seq={} bytes={}",
+                            ctx_id,
+                            info.hdr.fence_id.to_native(),
+                            cmd_size
+                        ));
                         self.virtio_gpu
                             .submit_command(ctx_id, &mut cmd_buf[..], &fence_ids[..])
                     } else {
@@ -859,9 +1472,35 @@ impl Frontend {
                     mem,
                 )
             }
+            GpuCommand::ResourceCreateNativeAhb(hdr, info) => {
+                if reader.available_bytes() != 0
+                    || info.version.to_native() != VIRTIO_GPU_NATIVE_AHB_REQUEST_VERSION
+                    || info.size.to_native() != VIRTIO_GPU_NATIVE_AHB_REQUEST_SIZE
+                    || info.flags.to_native() != 0
+                {
+                    return Err(GpuResponse::ErrInvalidParameter);
+                }
+                self.virtio_gpu.resource_create_native_ahb_v2(
+                    hdr.ctx_id.to_native(),
+                    info.resource_id.to_native(),
+                    info.width.to_native(),
+                    info.height.to_native(),
+                    info.fourcc.to_native(),
+                )
+            }
+            // These own descriptor completion independently of renderer fences.
+            GpuCommand::PresentNativeAhb(_) | GpuCommand::WaitNativeAhbRelease(_) | GpuCommand::RefreshNativeAhb(_)
+            | GpuCommand::ConfigureNativeGeometry(_) | GpuCommand::QueryNativeGeometry(_)
+            | GpuCommand::QueryNativeProfile(_) | GpuCommand::ConfigureNativeProfile(_)
+            | GpuCommand::BindNativeGeometry(_) | GpuCommand::PresentNativeGeometry(_)
+            | GpuCommand::RefreshNativeGeometry(_)
+            | GpuCommand::PageNativeAhb(_) => {
+                Err(GpuResponse::ErrInvalidParameter)
+            }
             GpuCommand::SetScanoutBlob(info) => {
                 let scanout_id = info.scanout_id.to_native();
                 let resource_id = info.resource_id.to_native();
+                native_ahb_release::native_ahb_trace(format_args!("scanout-blob r={} seq=0", resource_id));
                 let virtio_gpu_format = info.format.to_native();
                 let width = info.width.to_native();
                 let height = info.height.to_native();
@@ -911,30 +1550,209 @@ impl Frontend {
 
     /// Processes virtio messages on `queue`.
     pub fn process_queue(&mut self, mem: &GuestMemory, queue: &dyn QueueReader) -> bool {
+        self.process_queue_from(mem, queue, GpuQueue::Control)
+    }
+
+    fn process_cursor_queue(&mut self, mem: &GuestMemory, queue: &dyn QueueReader) -> bool {
+        self.process_queue_from(mem, queue, GpuQueue::Cursor)
+    }
+
+    fn process_queue_from(
+        &mut self,
+        mem: &GuestMemory,
+        queue: &dyn QueueReader,
+        source: GpuQueue,
+    ) -> bool {
+        if self.display_failed || self.deferred_context_destroy.is_some() {
+            return false;
+        }
         let mut signal_used = false;
-        while let Some(desc) = queue.pop() {
-            if let Some(ret_desc) = self.process_descriptor(mem, desc) {
-                queue.add_used(ret_desc.desc_chain, ret_desc.len);
-                signal_used = true;
+        loop {
+            if self.display_failed || self.fence_state.lock().renderer_error.is_some() {
+                break;
+            }
+            let Some(desc) = queue.pop() else {
+                break;
+            };
+            let returned = self.process_descriptor(mem, desc, source);
+            let urgent = std::mem::take(&mut self.signal_response_now);
+            if let Some(ret_desc) = returned {
+                let mut state = self.fence_state.lock();
+                if state.renderer_error.is_some() {
+                    state.queue.push_complete(VirtioGpuRing::Global, ret_desc);
+                } else {
+                    queue.add_used(ret_desc.desc_chain, ret_desc.len);
+                    signal_used = true;
+                    if urgent {
+                        // Guest flips and VidMm paging wait on these responses.
+                        // Publish their IRQ before processing another descriptor:
+                        // later rendering or teardown can delay the whole batch.
+                        queue.signal_used();
+                        signal_used = false;
+                    }
+                }
+            }
+            if self.deferred_context_destroy.is_some() {
+                break;
             }
         }
 
+        // An inline renderer callback may precede response publication. Drain
+        // here as well, retaining same-ring order behind pending display work.
+        for completed in self
+            .fence_state
+            .lock()
+            .queue
+            .drain_ready_if(|d| d.queue == source)
+        {
+            queue.add_used(completed.desc_chain, completed.len);
+            signal_used = true;
+        }
+
+        // This batch may have parked teardown behind an inline completion
+        // that the drain above just retired. Recheck even without another
+        // guest kick or backend callback; never wait until the watchdog.
+        if self.deferred_context_destroy.is_some() {
+            let _ = self.context_retirement_event.signal();
+        }
+
         signal_used
+    }
+
+    fn process_display_timing(
+        &mut self,
+        info: virtio_gpu_get_display_timing,
+        mut desc_chain: DescriptorChain,
+        source: GpuQueue,
+    ) -> ReturnDescriptor {
+        // A diagnostic query cannot create a renderer fence or mutate context
+        // state. Validate the whole plain request and output capacity first.
+        let response = if source != GpuQueue::Control
+            || info.hdr.flags.to_native() != 0
+            || info.hdr.ctx_id.to_native() != 0
+            || info.hdr.fence_id.to_native() != 0
+            || info.hdr.ring_idx != 0
+            || info.hdr.padding != [0; 3]
+            || desc_chain.reader.available_bytes() != 0
+            || desc_chain.writer.available_bytes() < 112
+            || !self.display_timing_negotiated
+            || info.version.to_native() != 1
+            || info.scanout_id.to_native() != 0
+            || info.cookie.to_native() == 0
+        {
+            GpuResponse::ErrInvalidParameter
+        } else {
+            self.virtio_gpu.display_timing().map(|sample| GpuResponse::OkDisplayTiming {
+                cookie: info.cookie.to_native(), sample: sample.into(),
+            }).unwrap_or(GpuResponse::ErrUnspec)
+        };
+        let len = response.encode(0, 0, 0, 0, &mut desc_chain.writer).unwrap_or(0);
+        ReturnDescriptor { desc_chain, len, queue: source, ctx_id: 0 }
     }
 
     fn process_descriptor(
         &mut self,
         mem: &GuestMemory,
         mut desc_chain: DescriptorChain,
+        source: GpuQueue,
     ) -> Option<ReturnDescriptor> {
+        let decoded = GpuCommand::decode(&mut desc_chain.reader);
+        // Keep the actual decoded packet identity alive through native bridge
+        // admission. The C++ state is disabled by default and owns trace bounds.
+        let _fifo_trace = decoded.as_ref().ok().and_then(|cmd| {
+            let (resource, sequence) = match cmd {
+                GpuCommand::ResourceFlush(info) => (info.resource_id.to_native(), 0),
+                GpuCommand::PresentNativeAhb(info) | GpuCommand::RefreshNativeAhb(info) =>
+                    (info.resource_id.to_native(), info.sequence.to_native()),
+                GpuCommand::PresentNativeGeometry(info) | GpuCommand::RefreshNativeGeometry(info) =>
+                    (info.operation.resource_id.to_native(), info.operation.sequence.to_native()),
+                GpuCommand::NativeBlt(info) => (info.destination.resource_id.to_native(), 0),
+                _ => return None,
+            };
+            let hdr = cmd.ctrl_hdr();
+            Some(gpu_display::NativeFifoTraceScope::begin(hdr.type_.to_native(), resource,
+                sequence, hdr.fence_id.to_native(), hdr.ctx_id.to_native(), hdr.ring_idx as u32,
+                hdr.flags.to_native(), desc_chain.index() as u32))
+        });
+        self.signal_response_now = matches!(
+            &decoded,
+            Ok(GpuCommand::NativeBlt(_) | GpuCommand::QueryNativeBlt(_) | GpuCommand::PresentNativeAhb(_)
+                | GpuCommand::PageNativeAhb(_)
+                | GpuCommand::WaitNativeAhbRelease(_)
+                | GpuCommand::RefreshNativeAhb(_)
+                | GpuCommand::ConfigureNativeGeometry(_) | GpuCommand::QueryNativeGeometry(_)
+                | GpuCommand::QueryNativeProfile(_) | GpuCommand::ConfigureNativeProfile(_)
+                | GpuCommand::BindNativeGeometry(_) | GpuCommand::PresentNativeGeometry(_)
+                | GpuCommand::RefreshNativeGeometry(_)
+                | GpuCommand::SetScanout(_)
+                | GpuCommand::SetScanoutBlob(_))
+        );
+        if let Ok(cmd @ (GpuCommand::ConfigureNativeGeometry(_) | GpuCommand::QueryNativeGeometry(_)
+                | GpuCommand::QueryNativeProfile(_) | GpuCommand::ConfigureNativeProfile(_)
+                | GpuCommand::BindNativeGeometry(_) | GpuCommand::PresentNativeGeometry(_)
+                | GpuCommand::RefreshNativeGeometry(_))) = &decoded {
+            return self.process_native_geometry(*cmd, desc_chain, source);
+        }
+        if let Ok(GpuCommand::QueryNativeBlt(info)) = &decoded {
+            return Some(self.process_native_blt_query(*info,desc_chain,source));
+        }
+        if let Ok(GpuCommand::NativeBlt(info)) = &decoded {
+            return Some(self.process_native_blt(mem,*info,desc_chain,source));
+        }
+        if let Ok(GpuCommand::PageNativeAhb(info)) = &decoded {
+            return Some(self.process_native_ahb_paging(*info, desc_chain, source));
+        }
+        if let Ok(GpuCommand::GetDisplayTiming(info)) = &decoded {
+            return Some(self.process_display_timing(*info, desc_chain, source));
+        }
+        if let Ok(GpuCommand::PresentNativeAhb(info) | GpuCommand::WaitNativeAhbRelease(info)
+                  | GpuCommand::RefreshNativeAhb(info)) = &decoded {
+            return self.process_native_ahb_operation(*info, desc_chain, source);
+        }
+        if self.maps_global_fences {
+            if let Ok(GpuCommand::CtxDestroy(info)) = &decoded {
+                if info.hdr.flags.to_native() & VIRTIO_GPU_FLAG_FENCE_HOST_SHAREABLE == 0 {
+                    return self.process_context_destroy_request(info.hdr, desc_chain, source);
+                }
+            }
+        }
         let reader = &mut desc_chain.reader;
         let writer = &mut desc_chain.writer;
         let mut resp = Err(GpuResponse::ErrUnspec);
         let mut gpu_cmd = None;
         let mut len = 0;
-        match GpuCommand::decode(reader) {
+        let mut global_token = None;
+        let mut context_token = None;
+        let mut command_ctx_id = 0;
+        let mut command_rejected = false;
+        match decoded {
             Ok(cmd) => {
-                resp = self.process_gpu_command(mem, cmd, reader);
+                let hdr = cmd.ctrl_hdr();
+                let flags = hdr.flags.to_native();
+                command_ctx_id = hdr.ctx_id.to_native();
+                if self.maps_global_fences {
+                    if flags & VIRTIO_GPU_FLAG_FENCE_HOST_SHAREABLE != 0 {
+                        command_rejected = true;
+                        resp = Err(GpuResponse::ErrInvalidParameter);
+                    } else if flags & (VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX)
+                        == VIRTIO_GPU_FLAG_FENCE
+                    {
+                        // Reserve before command execution: exhaustion must
+                        // not acknowledge work already submitted to the GPU.
+                        global_token = self.fence_state.lock().global_tokens.reserve();
+                        command_rejected = global_token.is_none();
+                    } else if flags & VIRTIO_GPU_FLAG_FENCE != 0 {
+                        context_token = self
+                            .fence_state
+                            .lock()
+                            .context_tokens
+                            .reserve(command_ctx_id, hdr.ring_idx);
+                        command_rejected = context_token.is_none();
+                    }
+                }
+                if !command_rejected {
+                    resp = self.process_gpu_command(mem, cmd, reader);
+                }
                 gpu_cmd = Some(cmd);
             }
             Err(e) => debug!("descriptor decode error: {}", e),
@@ -995,13 +1813,15 @@ impl Frontend {
             }
         };
 
-        // A flush that performed a zero-copy flip parks its display completion fence in
-        // virtio_gpu; collect it here regardless of FLAG_FENCE so a stale fence can never leak
-        // onto a later, unrelated command.  Without FLAG_FENCE it is dropped -- closed without
-        // waiting, which is the pre-fence behaviour the legacy guest path expects.
-        let flip_fence = self.virtio_gpu.take_pending_flip_fence();
+        // Retain every display reader, even on error, without FLAG_FENCE or
+        // without response space. Returning the descriptor grants reuse too.
+        let flip_fences = self.virtio_gpu.take_pending_flip_fences();
 
-        if writer.available_bytes() != 0 {
+        if writer.available_bytes() != 0
+            || global_token.is_some()
+            || context_token.is_some()
+            || !flip_fences.is_empty()
+        {
             let mut fence_id = 0;
             let mut ctx_id = 0;
             let mut flags = 0;
@@ -1017,7 +1837,15 @@ impl Frontend {
             // A fenced flush with a display fence skips rutabaga entirely: its virtio fence
             // completes when the display fence fires (see complete_flip_fences), not when the
             // renderer is done.  This is what backpressures the guest compositor to the display.
-            let mut deferred_flip: Option<SafeDescriptor> = None;
+            let deferred_flip = !flip_fences.is_empty();
+            if deferred_flip {
+                if let Some(token) = global_token.take() {
+                    self.fence_state.lock().global_tokens.cancel(token);
+                }
+                if let Some(token) = context_token.take() {
+                    self.fence_state.lock().context_tokens.cancel(token);
+                }
+            }
             if let Some(cmd) = gpu_cmd {
                 let ctrl_hdr = cmd.ctrl_hdr();
                 if ctrl_hdr.flags.to_native() & VIRTIO_GPU_FLAG_FENCE != 0 {
@@ -1026,12 +1854,17 @@ impl Frontend {
                     ctx_id = ctrl_hdr.ctx_id.to_native();
                     ring_idx = ctrl_hdr.ring_idx;
 
-                    if let Some(fence) = flip_fence {
-                        deferred_flip = Some(fence);
+                    if command_rejected {
+                        // No command was executed and no renderer fence exists.
+                    } else if deferred_flip {
+                        // Display readers own completion of this descriptor.
                     } else {
                         let fence = RutabagaFence {
                             flags,
-                            fence_id,
+                            fence_id: global_token
+                                .map(u64::from)
+                                .or(context_token)
+                                .unwrap_or(fence_id),
                             ctx_id,
                             ring_idx,
                         };
@@ -1041,6 +1874,15 @@ impl Frontend {
                                 gpu_response
                             }
                             Err(fence_resp) => {
+                                let mut state = self.fence_state.lock();
+                                if state.renderer_error.is_none() {
+                                    if let Some(token) = global_token.take() {
+                                        state.global_tokens.cancel(token);
+                                    }
+                                    if let Some(token) = context_token.take() {
+                                        state.context_tokens.cancel(token);
+                                    }
+                                }
                                 warn!("create_fence {} -> {:?}", fence_id, fence_resp);
                                 fence_resp
                             }
@@ -1056,51 +1898,77 @@ impl Frontend {
                 Err(e) => debug!("ctrl queue response encode error: {}", e),
             }
 
-            if let Some(fence) = deferred_flip {
+            if deferred_flip {
                 let ring = match flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
                     0 => VirtioGpuRing::Global,
                     _ => VirtioGpuRing::ContextSpecific { ctx_id, ring_idx },
                 };
-                self.fence_state.lock().descs.push(FenceDescriptor {
-                    ring: ring.clone(),
-                    fence_id,
-                    desc_chain,
-                    len,
-                });
-                self.pending_flip_fences.push(PendingFlipFence {
+                let ticket = self.next_flip_ticket;
+                self.next_flip_ticket = ticket.checked_add(1).expect("display ticket exhausted");
+                self.fence_state.lock().queue.push_display(
                     ring,
-                    fence_id,
-                    fence,
-                    deadline: std::time::Instant::now() + FLIP_FENCE_TIMEOUT,
-                    registered: false,
-                });
+                    ticket,
+                    ReturnDescriptor {
+                        desc_chain,
+                        len,
+                        queue: source,
+                        ctx_id: command_ctx_id,
+                    },
+                );
+                let deadline = std::time::Instant::now() + FLIP_FENCE_TIMEOUT;
+                for fence in flip_fences {
+                    self.pending_flip_fences.push(PendingFlipFence {
+                        resource_id: fence.resource_id,
+                        fence_id,
+                        ticket: Some(ticket),
+                        fence: fence.fence,
+                        deadline: Some(deadline),
+                        registered: false,
+                    });
+                }
                 return None;
             }
 
-            if fence_created {
+            if flags & VIRTIO_GPU_FLAG_FENCE != 0 {
                 let ring = match flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
                     0 => VirtioGpuRing::Global,
                     _ => VirtioGpuRing::ContextSpecific { ctx_id, ring_idx },
                 };
 
-                // In case the fence is signaled immediately after creation, don't add a return
-                // FenceDescriptor.
-                let mut fence_state = self.fence_state.lock();
-                if fence_id > *fence_state.completed_fences.get(&ring).unwrap_or(&0) {
-                    fence_state.descs.push(FenceDescriptor {
+                // Never bypass an earlier display dependency, even if the
+                // renderer called back inline. process_queue drains ready work.
+                let descriptor = ReturnDescriptor {
+                    desc_chain,
+                    len,
+                    queue: source,
+                    ctx_id: command_ctx_id,
+                };
+                let mut state = self.fence_state.lock();
+                if fence_created {
+                    state.queue.push_renderer(
                         ring,
-                        fence_id,
-                        desc_chain,
-                        len,
-                    });
-
-                    return None;
+                        global_token
+                            .map(u64::from)
+                            .or(context_token)
+                            .unwrap_or(fence_id),
+                        descriptor,
+                    );
+                } else {
+                    // Preserve the encoded create_fence error while obeying
+                    // earlier display dependencies on the same timeline.
+                    state.queue.push_complete(ring, descriptor);
                 }
+                return None;
             }
 
             // No fence (or already completed fence), respond now.
         }
-        Some(ReturnDescriptor { desc_chain, len })
+        Some(ReturnDescriptor {
+            desc_chain,
+            len,
+            queue: source,
+            ctx_id: command_ctx_id,
+        })
     }
 
     pub fn event_poll(&self) {
@@ -1123,6 +1991,9 @@ enum WorkerToken {
     /// A zero-copy flip's completion fence signaled; one token covers every pending fence and
     /// the handler polls each to find the signaled ones (they are few and short-lived).
     FlipFence,
+    ContextRetirement,
+    /// The VMM's simplefb bridge offered a frame (see `ExternalScanout`).
+    ExternalFrame,
     #[cfg(windows)]
     DisplayDescriptorRequest,
 }
@@ -1177,6 +2048,9 @@ struct WorkerSnapshot {
 
 struct WorkerActivateRequest {
     resources: GpuActivationResources,
+    display_timing_negotiated: bool,
+    native_geometry_negotiated: bool,
+    native_blt_negotiated: bool,
 }
 
 enum WorkerRequest {
@@ -1197,7 +2071,7 @@ struct GpuActivationResources {
     mem: GuestMemory,
     interrupt: Interrupt,
     ctrl_queue: SharedQueueReader,
-    cursor_queue: LocalQueueReader,
+    cursor_queue: SharedQueueReader,
 }
 
 struct GpuDeactivationResources {
@@ -1205,6 +2079,12 @@ struct GpuDeactivationResources {
 }
 
 struct Worker {
+    native_refresh_event: Arc<AtomicBool>,
+    last_native_refresh_generation: u64,
+    unkicked_ctrl_drains: u64,
+    ctrl_resignals: u64,
+    native_profile_event: Arc<AtomicBool>,
+    last_native_profile: Option<native_geometry::ProfileObservation>,
     request_receiver: mpsc::Receiver<WorkerRequest>,
     response_sender: mpsc::Sender<anyhow::Result<WorkerResponse>>,
     exit_evt_wrtube: SendTube,
@@ -1218,6 +2098,9 @@ struct Worker {
     #[cfg(windows)]
     gpu_display_wait_descriptor_ctrl_rd: RecvTube,
     activation_resources: Option<GpuActivationResources>,
+    /// Frames from the VMM's simplefb bridge, shown while the guest is not displaying through
+    /// this device (see `ExternalScanout`).
+    external_scanout: Option<Arc<ExternalScanout>>,
 }
 
 #[derive(Copy, Clone)]
@@ -1239,6 +2122,8 @@ impl Worker {
         display_backends: Vec<DisplayBackend>,
         display_params: Vec<GpuDisplayParameters>,
         display_event: Arc<AtomicBool>,
+        native_refresh_event: Arc<AtomicBool>,
+        native_profile_event: Arc<AtomicBool>,
         mapper: Arc<Mutex<Option<Box<dyn SharedMemoryMapper>>>>,
         event_devices: Vec<EventDevice>,
         external_blob: bool,
@@ -1256,12 +2141,15 @@ impl Worker {
         #[cfg(windows)] gpu_display_wait_descriptor_ctrl_wr: SendTube,
         snapshot_scratch_directory: Option<PathBuf>,
         dmabuf_import_capped: bool,
+        external_scanout: Option<Arc<ExternalScanout>>,
     ) -> anyhow::Result<Worker> {
         let fence_state = Arc::new(Mutex::new(Default::default()));
         let fence_handler_resources = Arc::new(Mutex::new(None));
         let fence_handler =
             create_fence_handler(fence_handler_resources.clone(), fence_state.clone());
-        let rutabaga = rutabaga_builder.build(fence_handler, rutabaga_server_descriptor)?;
+        let rutabaga = rutabaga_builder
+            .set_fence_error_handler(create_fence_error_handler(fence_state.clone()))
+            .build(fence_handler, rutabaga_server_descriptor)?;
         let mut virtio_gpu = build(
             &display_backends,
             display_params,
@@ -1288,6 +2176,12 @@ impl Worker {
         }
 
         Ok(Worker {
+                native_refresh_event,
+                last_native_refresh_generation: 0,
+                unkicked_ctrl_drains: 0,
+                ctrl_resignals: 0,
+            native_profile_event,
+            last_native_profile: None,
             request_receiver,
             response_sender,
             exit_evt_wrtube,
@@ -1295,12 +2189,13 @@ impl Worker {
             resource_bridges,
             suspend_evt,
             kill_evt,
-            state: Frontend::new(virtio_gpu, fence_state.clone()),
+            state: Frontend::new(virtio_gpu, fence_state.clone())?,
             fence_state,
             fence_handler_resources,
             #[cfg(windows)]
             gpu_display_wait_descriptor_ctrl_rd,
             activation_resources: None,
+            external_scanout,
         })
     }
 
@@ -1309,27 +2204,50 @@ impl Worker {
         // a `WorkerRequest::Activate`, the worker will remain in `run_until_sleep_or_exit()`
         // until suspended via `kill_evt` or `suspend_evt` being signaled.
         //
-        // A guest with no virtio-gpu driver resets the device on its way out of the firmware and
-        // never activates it again -- Windows, whose Basic Display Driver only knows the linear
-        // framebuffer the firmware left behind. This thread then parks here for the rest of the
-        // VM's life, which is correct: that guest is painting the simplefb screen, and the
-        // simplefb screen has its own exporter to paint it on. This device's screen keeps the
-        // last frame the firmware put there, and nothing about that is this thread's to fix.
+        // "Inactive" is not the same as "nothing to display". A guest with no virtio-gpu driver
+        // resets the device on its way out of the firmware and never activates it again -- that
+        // is exactly what Windows does, whose Basic Display Driver only knows the linear
+        // framebuffer the firmware left behind -- and the simplefb bridge feeding that
+        // framebuffer to this device is still running. Waiting on the request channel alone would
+        // park this thread for the rest of the VM's life with the firmware's last frame frozen on
+        // screen, which is the one case the whole arbitration exists for. So while there is a
+        // bridge, wait with a timeout and serve it in between.
         loop {
-            let request = match self.request_receiver.recv() {
-                Ok(r) => r,
-                Err(_) => {
-                    info!("virtio gpu worker connection ended, exiting.");
-                    return;
+            let request = if self.external_scanout.is_some() && !self.state.display_failed {
+                match self.request_receiver.recv_timeout(EXTERNAL_IDLE_POLL) {
+                    Ok(r) => r,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if let Some(external) = self.external_scanout.clone() {
+                            serve_external_scanout(&external, &mut self.state.virtio_gpu);
+                        }
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        info!("virtio gpu worker connection ended, exiting.");
+                        return;
+                    }
+                }
+            } else {
+                match self.request_receiver.recv() {
+                    Ok(r) => r,
+                    Err(_) => {
+                        info!("virtio gpu worker connection ended, exiting.");
+                        return;
+                    }
                 }
             };
 
             match request {
                 WorkerRequest::Activate(request) => {
                     let response = self.on_activate(request).map(|_| WorkerResponse::Ok);
+                    let activated = response.is_ok();
                     self.response_sender
                         .send(response)
                         .expect("failed to send gpu worker response for activate");
+
+                    if !activated {
+                        continue;
+                    }
 
                     let stop_reason = self
                         .run_until_sleep_or_exit()
@@ -1368,11 +2286,23 @@ impl Worker {
     }
 
     fn on_activate(&mut self, request: WorkerActivateRequest) -> anyhow::Result<()> {
+        self.fence_state.lock().check_renderer()?;
+        if self.state.display_failed {
+            return Err(anyhow!("display recovery requires VM teardown"));
+        }
+        if request.native_geometry_negotiated {
+            // Profile discovery and the first CONFIGURE must not depend on
+            // a prior SET_SCANOUT/resource, which itself needs that profile.
+            // Prepare before installing any new guest callback/queue targets.
+            self.state.virtio_gpu.prepare_native_scanout_profile()
+                .map_err(|error| anyhow!("failed to prepare native profile: {:?}", error))?;
+        }
         self.fence_handler_resources
             .lock()
             .replace(FenceHandlerActivationResources {
                 mem: request.resources.mem.clone(),
                 ctrl_queue: request.resources.ctrl_queue.clone(),
+                cursor_queue: Some(request.resources.cursor_queue.clone()),
             });
 
         self.state
@@ -1380,12 +2310,55 @@ impl Worker {
             .resume(&request.resources.mem)
             .context("gpu worker failed to activate virtio frontend")?;
 
+        return_fenced_descriptors(
+            self.fence_state.lock().queue.drain_ready(),
+            &request.resources.ctrl_queue,
+            Some(&request.resources.cursor_queue),
+        );
         self.activation_resources = Some(request.resources);
+        self.state.display_timing_negotiated = request.display_timing_negotiated;
+        self.state.native_geometry_negotiated = request.native_geometry_negotiated;
+        self.state.native_blt_negotiated = request.native_blt_negotiated;
+
+        // Reconcile once after every activation, including headless bootstrap
+        // or wake from suspend. No active AHB/resource is required.
+        self.last_native_profile = None;
+        if Self::observe_native_scanout_profile(
+            &mut self.state, &mut self.last_native_profile, &self.native_profile_event,
+        ) {
+            self.activation_resources.as_ref().unwrap().interrupt.signal_config_changed();
+        }
 
         Ok(())
     }
 
+    fn cancel_native_refreshes(&mut self) {
+        let completed = self.state.cancel_native_ahb_refreshes();
+        if let Some(active) = self.activation_resources.as_ref() {
+            // Cancellation must not publish through a renderer failure that
+            // already stopped this activation. Deactivation reports it below.
+            let _ = self.state.publish_native_ahb_completions(completed,
+                &active.ctrl_queue, Some(&active.cursor_queue));
+        } else {
+            assert!(completed.is_empty(), "refresh descriptors require their old activation");
+        }
+    }
+
+    fn observe_native_refresh_attachment(state: &mut Frontend, last_generation: &mut u64,
+                                          event: &AtomicBool) -> bool {
+        let generation = state.display().borrow().native_refresh_generation();
+        if generation == 0 || generation == *last_generation {
+            return false;
+        }
+        *last_generation = generation;
+        // Event carries no ownership grant. Guest reservation is mandatory.
+        event.store(true, Ordering::Release);
+        true
+    }
+
     fn on_suspend(&mut self) -> anyhow::Result<GpuDeactivationResources> {
+        self.cancel_native_refreshes();
+        self.check_display_deactivation()?;
         self.state
             .virtio_gpu
             .suspend()
@@ -1399,7 +2372,10 @@ impl Worker {
                     Ok(x) => x.into_inner(),
                     Err(_) => panic!("too many refs on ctrl_queue"),
                 },
-                activation_resources.cursor_queue.queue.into_inner(),
+                match Arc::try_unwrap(activation_resources.cursor_queue.queue) {
+                    Ok(x) => x.into_inner(),
+                    Err(_) => panic!("too many refs on cursor_queue"),
+                },
             ])
         } else {
             None
@@ -1409,25 +2385,274 @@ impl Worker {
     }
 
     fn on_reset(&mut self) -> anyhow::Result<()> {
+        self.on_reset_with_drain_timeout(FLIP_FENCE_TIMEOUT)
+    }
+
+    fn on_reset_with_drain_timeout(&mut self, timeout: Duration) -> anyhow::Result<()> {
+        self.cancel_native_refreshes();
+        let renderer_ok = self.fence_state.lock().renderer_error.is_none();
+        if !self.state.display_failed && renderer_ok {
+            if let Err(error) = self.drain_display_for_reset(
+                timeout, VirtioGpu::request_display_detach_for_reset,
+            ) {
+                error!("GPU reset display drain failed: {:#}", error);
+                self.state.display_failed = true;
+            }
+        }
+        self.check_display_deactivation()?;
+        if self.state.maps_global_fences {
+            let mut fences = self.fence_state.lock();
+            if !fences.queue.is_empty()
+                || !fences.global_tokens.is_empty()
+                || !fences.context_tokens.is_empty()
+            {
+                // Old descriptors cannot be written to a new activation's
+                // virtqueue. Keep them until renderer/VM teardown is proven.
+                fences.queue.stop();
+                self.state.display_failed = true;
+                let _ = self.exit_evt_wrtube.send::<VmEventType>(&VmEventType::Exit);
+                return Err(anyhow!("cannot reset GPU with pending renderer fences"));
+            }
+        }
         // Deactivate without tearing down: release the virtqueues/interrupt and the fence
         // handler's activation resources, but keep the worker thread + rutabaga/render server
         // alive so the next activate() succeeds. (rutabaga is intentionally NOT suspended here --
         // on_activate() resumes unconditionally, which already happens on the very first activate,
         // so an unpaired resume is safe.)
-        self.fence_handler_resources.lock().take();
-        self.activation_resources = None;
         // Drop all guest resources/contexts so the next guest (e.g. the OS after UEFI firmware
         // used then reset the device) can recreate resource ids from a clean slate.
-        self.state
-            .virtio_gpu
-            .reset()
-            .context("failed to reset VirtioGpu")?;
+        if let Err(error) = self.state.virtio_gpu.reset() {
+            // Keep the activation's queues and remaining owners on failure.
+            // A half-reset device cannot safely resume or acknowledge a new
+            // resource-id generation. Request teardown instead of looping on
+            // guest queue writes against the old transport state.
+            self.state.display_failed = true;
+            self.fence_state.lock().queue.stop();
+            let _ = self.exit_evt_wrtube.send::<VmEventType>(&VmEventType::Exit);
+            return Err(error).context("failed to reset VirtioGpu");
+        }
+        self.state.native_ahb_release.reset_resource_identities()?;
+        self.state.display_timing_negotiated = false;
+        self.state.native_geometry_negotiated = false;
+        self.state.native_blt_negotiated = false;
+        self.state.native_blt.poisoned.clear();
+        self.last_native_profile = None;
+        self.native_profile_event.store(false, Ordering::Release);
+        self.state.native_ahb_paging.poisoned.clear();
+        self.fence_handler_resources.lock().take();
+        self.activation_resources = None;
         Ok(())
     }
 
+    /// Sleep stopped guest command intake but kept the old activation alive.
+    /// Request actual compositor detach, then observe genuine display and
+    /// renderer completions. No guest queue, bridge or external frame is
+    /// admitted here, and all callbacks still target the old activation.
+    fn drain_display_for_reset(
+        &mut self,
+        timeout: Duration,
+        request_detach: impl FnMut(&mut VirtioGpu) -> bool,
+    ) -> anyhow::Result<()> {
+        // Arm before testing tokens so a concurrent last completion cannot
+        // disappear between the check and wait. Wakeups alone never retire work.
+        self.fence_state.lock().waiting_for_reset = true;
+        let result = self.drain_reset_owners(timeout, request_detach);
+        self.fence_state.lock().waiting_for_reset = false;
+        result
+    }
+
+    fn drain_reset_owners(
+        &mut self,
+        timeout: Duration,
+        mut request_detach: impl FnMut(&mut VirtioGpu) -> bool,
+    ) -> anyhow::Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        let renderer_event = self.state.context_retirement_event()?;
+        let wait = WaitContext::build_with(&[
+            (&self.kill_evt, WorkerToken::Kill),
+            (&renderer_event, WorkerToken::ContextRetirement),
+        ])?;
+        // These bits described the event loop's now-destroyed WaitContext.
+        for reader in &mut self.state.pending_flip_fences {
+            reader.registered = false;
+        }
+        let mut detach_requested = false;
+        loop {
+            // Drop this lock before the backend request, fence polling, and
+            // especially before waiting: renderer callbacks also need it.
+            self.fence_state.lock().check_renderer()?;
+            if !detach_requested {
+                detach_requested = request_detach(&mut self.state.virtio_gpu);
+            }
+            if let Some(active) = self.activation_resources.as_ref() {
+                self.state.complete_flip_fences_impl(
+                    &active.ctrl_queue,
+                    &active.cursor_queue,
+                    Some(&wait),
+                    flip_fence_signaled,
+                )?;
+            } else if !self.state.pending_flip_fences.is_empty() {
+                return Err(anyhow!("reset readers have no owning activation"));
+            }
+            let renderer_drained = {
+                let fences = self.fence_state.lock();
+                fences.check_renderer()?;
+                !self.state.maps_global_fences || (fences.queue.is_empty()
+                    && fences.global_tokens.is_empty() && fences.context_tokens.is_empty())
+            };
+            let owned_pending = self.state.virtio_gpu.poll_native_blt_outputs()?;
+            if detach_requested && self.state.pending_flip_fences.is_empty() && !owned_pending && renderer_drained {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!(
+                    "GPU reset drain exceeded {:?}: detach_requested={} readers={} owned_pending={} renderer_drained={}",
+                    timeout, detach_requested, self.state.pending_flip_fences.len(), owned_pending, renderer_drained
+                ));
+            }
+            self.state.register_flip_fences(&wait)?;
+            // Owned output releases use a bounded nonblocking sweep. They are
+            // not guest resource FlipFence entries and must not be mistaken for
+            // drained ownership merely because detach admission succeeded.
+            let interval = if detach_requested && !owned_pending {
+                remaining
+            } else {
+                remaining.min(Duration::from_millis(10))
+            };
+            for event in wait.wait_timeout(interval)? {
+                match event.token {
+                    WorkerToken::Kill => return Err(anyhow!("VM teardown interrupted display drain")),
+                    WorkerToken::ContextRetirement => { renderer_event.wait()?; }
+                    WorkerToken::FlipFence => (),
+                    _ => unreachable!("no guest command events are registered during reset"),
+                }
+            }
+        }
+    }
+
+    /// Detach requests alone never prove asynchronous reads have stopped.
+    /// Preserve resources and request VM exit if any ownership remains after
+    /// the reset drain (or the nonblocking suspend completion sweep).
+    fn check_display_deactivation(&mut self) -> anyhow::Result<()> {
+        let owned_pending = match self.state.virtio_gpu.poll_native_blt_outputs() {
+            Ok(pending) => pending,
+            Err(error) => {
+                error!("owned Blt deactivation completion failed: {error:#}");
+                self.state.display_failed = true;
+                true
+            }
+        };
+        // Sleep leaves the event loop before its completion sweep. A release
+        // may already be ready, or arrive while the reset request is dequeued.
+        // Observe it once using the old activation's queues before checking
+        // ownership. The old WaitContext is gone; poll is nonblocking and only
+        // genuine successful fences can retire readers. Do not admit new work.
+        if !self.state.display_failed && self.fence_state.lock().renderer_error.is_none() {
+            if let Some(active) = self.activation_resources.as_ref() {
+                if let Err(error) = self.state.complete_flip_fences_impl(
+                    &active.ctrl_queue,
+                    &active.cursor_queue,
+                    None,
+                    flip_fence_signaled,
+                ) {
+                    error!("GPU deactivation completion sweep failed: {:#}", error);
+                    self.state.display_failed = true;
+                }
+            }
+        }
+        if self.state.display_failed
+            || self.fence_state.lock().renderer_error.is_some()
+            || owned_pending
+            || !self.state.pending_flip_fences.is_empty()
+            || self.state.native_ahb_release.has_waiters()
+            || self.state.virtio_gpu.has_deferred_native_ahb()
+            || self.state.deferred_context_destroy.is_some()
+        {
+            error!(
+                "GPU deactivation blocked: display_failed={} renderer_error={:?} \
+                 flip_readers={} native_readers={} native_waiters={} deferred_ahb={} \
+                 deferred_context={:?}",
+                self.state.display_failed,
+                self.fence_state.lock().renderer_error,
+                self.state.pending_flip_fences.len(),
+                self.state.pending_flip_fences.iter().filter(|reader| reader.ticket.is_none()).count(),
+                self.state.native_ahb_release.waiting_count(),
+                self.state.virtio_gpu.has_deferred_native_ahb(),
+                self.state.deferred_context_destroy.as_ref().map(|pending| pending.hdr.ctx_id.to_native()),
+            );
+            for reader in self.state.pending_flip_fences.iter().take(8) {
+                error!(
+                    "GPU deactivation reader: res={} sequence={} ticket={:?} \
+                     scanout={} registered={} deadline_armed={} deadline_expired={}",
+                    reader.resource_id,
+                    reader.fence_id,
+                    reader.ticket,
+                    self.state.virtio_gpu.is_scanout_resource(reader.resource_id),
+                    reader.registered,
+                    reader.deadline.is_some(),
+                    reader.deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline),
+                );
+            }
+            self.state.display_failed = true;
+            self.fence_state.lock().queue.stop();
+            let _ = self.exit_evt_wrtube.send::<VmEventType>(&VmEventType::Exit);
+            return Err(anyhow!(
+                "cannot deactivate GPU with unresolved display ownership"
+            ));
+        }
+        Ok(())
+    }
+
+    fn hold_failed_display(&mut self, error: anyhow::Error) -> anyhow::Result<WorkerStopReason> {
+        error!("GPU completion failed: {:#}; requesting VM exit", error);
+        self.state.display_failed = true;
+        self.fence_state.lock().queue.stop();
+        // Do not return a successful GPU fence or drop the frontend here.
+        // Keep renderer resources, imports and descriptors until VM teardown.
+        if let Err(e) = self.exit_evt_wrtube.send::<VmEventType>(&VmEventType::Exit) {
+            error!("failed to request VM exit after display failure: {}", e);
+        }
+        let mut reported_wait_error = false;
+        loop {
+            // Event::wait_timeout uses the existing event descriptor/handle;
+            // it does not allocate another epoll fd in an fd-exhaustion path.
+            match self.kill_evt.wait_timeout(Duration::from_millis(100)) {
+                Ok(base::EventWaitResult::Signaled) => return Ok(WorkerStopReason::Kill),
+                Ok(base::EventWaitResult::TimedOut) => (),
+                Err(e) => {
+                    if !reported_wait_error {
+                        error!(
+                            "failed waiting for VM teardown; retaining display resources: {}",
+                            e
+                        );
+                        reported_wait_error = true;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            if matches!(
+                self.suspend_evt.wait_timeout(Duration::ZERO),
+                Ok(base::EventWaitResult::Signaled)
+            ) {
+                // on_reset/on_suspend reject while retaining the same frontend.
+                return Ok(WorkerStopReason::Sleep);
+            }
+        }
+    }
+
     fn on_snapshot(&mut self) -> anyhow::Result<WorkerSnapshot> {
+        if self.state.display_failed
+            || !self.state.pending_flip_fences.is_empty()
+            || self.state.virtio_gpu.has_deferred_native_ahb()
+            || self.state.deferred_context_destroy.is_some()
+        {
+            return Err(anyhow!(
+                "cannot snapshot GPU with unresolved display ownership"
+            ));
+        }
         Ok(WorkerSnapshot {
-            fence_state_snapshot: self.fence_state.lock().snapshot(),
+            fence_state_snapshot: self.fence_state.lock().snapshot()?,
             virtio_gpu_snapshot: self
                 .state
                 .virtio_gpu
@@ -1437,9 +2662,19 @@ impl Worker {
     }
 
     fn on_restore(&mut self, snapshot: WorkerSnapshot) -> anyhow::Result<()> {
+        if self.state.display_failed
+            || self.state.virtio_gpu.has_native_blt_output_state()
+            || !self.state.pending_flip_fences.is_empty()
+            || self.state.virtio_gpu.has_deferred_native_ahb()
+            || self.state.deferred_context_destroy.is_some()
+        {
+            return Err(anyhow!(
+                "cannot restore GPU with unresolved display ownership"
+            ));
+        }
         self.fence_state
             .lock()
-            .restore(snapshot.fence_state_snapshot);
+            .restore(snapshot.fence_state_snapshot)?;
 
         self.state
             .virtio_gpu
@@ -1450,6 +2685,13 @@ impl Worker {
     }
 
     fn run_until_sleep_or_exit(&mut self) -> anyhow::Result<WorkerStopReason> {
+        let renderer_status = self.fence_state.lock().check_renderer();
+        if let Err(e) = renderer_status {
+            return self.hold_failed_display(e);
+        }
+        if self.state.display_failed {
+            return self.hold_failed_display(anyhow!("display ownership is still unresolved"));
+        }
         let activation_resources = self
             .activation_resources
             .as_ref()
@@ -1469,7 +2711,7 @@ impl Worker {
         let cursor_evt = activation_resources
             .cursor_queue
             .queue
-            .borrow()
+            .lock()
             .event()
             .try_clone()
             .context("failed to clone queue event")?;
@@ -1493,6 +2735,8 @@ impl Worker {
         .context("failed creating gpu worker WaitContext")?;
 
         let poll_desc: SafeDescriptor;
+        let context_retirement_event = self.state.context_retirement_event()?;
+        event_manager.add(&context_retirement_event, WorkerToken::ContextRetirement)?;
         if let Some(desc) = self.state.virtio_gpu.poll_descriptor() {
             poll_desc = desc;
             event_manager
@@ -1500,8 +2744,27 @@ impl Worker {
                 .context("failed adding poll event to WaitContext")?;
         }
 
+        let external_evt = self
+            .external_scanout
+            .as_ref()
+            .map(|e| e.event().try_clone());
+        if let Some(Ok(evt)) = &external_evt {
+            event_manager
+                .add(evt, WorkerToken::ExternalFrame)
+                .context("failed adding the external scanout event to WaitContext")?;
+        }
+
         self.resource_bridges
             .add_to_wait_context(&mut event_manager.wait_ctx);
+
+        // Registrations belonged to the previous WaitContext before sleep.
+        // Every new event loop must register outstanding sync_files again.
+        for pending in &mut self.state.pending_flip_fences {
+            pending.registered = false;
+        }
+        if let Err(e) = self.state.register_flip_fences(&event_manager.wait_ctx) {
+            return self.hold_failed_display(e);
+        }
 
         // TODO(davidriley): The entire main loop processing is somewhat racey and incorrect with
         // respect to cursor vs control queue processing.  As both currently and originally
@@ -1512,26 +2775,37 @@ impl Worker {
         // isn't used so this isn't a huge issue.
 
         loop {
+            let renderer_status = self.fence_state.lock().check_renderer();
+            if let Err(e) = renderer_status {
+                return self.hold_failed_display(e);
+            }
             // A pending flip fence bounds the wait: its fd wakes us the moment the display is
-            // done, and the deadline turns a fence that never fires into a bounded hiccup
-            // instead of a frozen guest compositor.
-            let events = match self.state.next_flip_fence_deadline() {
-                Some(deadline) => {
-                    let timeout = deadline
-                        .saturating_duration_since(std::time::Instant::now())
-                        .max(Duration::from_millis(1));
-                    event_manager
-                        .wait_ctx
-                        .wait_timeout(timeout)
-                        .context("failed polling for gpu worker events")?
-                }
-                None => event_manager
-                    .wait_ctx
-                    .wait()
-                    .context("failed polling for gpu worker events")?,
-            };
+            // done. The deadline requests recovery without falsely completing
+            // display work or permitting the guest to reuse its source buffer.
+            // Teardown retirement at the end of the previous iteration can
+            // resume queue work and issue new display reads. Register those
+            // before waiting as well, not just in the completion sweep.
+            if let Err(e) = self.state.register_flip_fences(&event_manager.wait_ctx) {
+                return self.hold_failed_display(e);
+            }
+            // Never sleep longer than CTRL_QUEUE_POLL_INTERVAL: every wake below also drains the
+            // control queue, so a guest request whose kick never arrived is still answered.
+            let timeout = self
+                .state
+                .next_flip_fence_deadline()
+                .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap_or(CTRL_QUEUE_POLL_INTERVAL)
+                .clamp(Duration::from_millis(1), CTRL_QUEUE_POLL_INTERVAL);
+            let events = event_manager
+                .wait_ctx
+                .wait_timeout(timeout)
+                .context("failed polling for gpu worker events")?;
 
             let mut signal_used_cursor = false;
+            let renderer_status = self.fence_state.lock().check_renderer();
+            if let Err(e) = renderer_status {
+                return self.hold_failed_display(e);
+            }
             let mut signal_used_ctrl = false;
             let mut ctrl_available = false;
             let mut display_available = false;
@@ -1553,6 +2827,16 @@ impl Worker {
 
             for event in events.iter().filter(|e| e.is_readable) {
                 match event.token {
+                    WorkerToken::ExternalFrame => {
+                        // The simplefb bridge has a frame. It only offers one while the guest is
+                        // not displaying through this device, and `present_external` checks that
+                        // again here, in the thread that owns the display -- so the two sources
+                        // can never be mid-frame at the same time.
+                        if let Some(external) = self.external_scanout.clone() {
+                            let _ = external.event().wait();
+                            serve_external_scanout(&external, &mut self.state.virtio_gpu);
+                        }
+                    }
                     WorkerToken::CtrlQueue => {
                         let _ = ctrl_evt.wait();
                         // Set flag that control queue is available to be read, but defer reading
@@ -1561,7 +2845,7 @@ impl Worker {
                     }
                     WorkerToken::CursorQueue => {
                         let _ = cursor_evt.wait();
-                        if self.state.process_queue(
+                        if self.state.process_cursor_queue(
                             &activation_resources.mem,
                             &activation_resources.cursor_queue,
                         ) {
@@ -1621,6 +2905,9 @@ impl Worker {
                         // Handled by the completion sweep after queue processing; the wake-up
                         // itself is all this event needed to accomplish.
                     }
+                    WorkerToken::ContextRetirement => {
+                        let _ = context_retirement_event.wait();
+                    }
                     WorkerToken::Sleep => {
                         return Ok(WorkerStopReason::Sleep);
                     }
@@ -1641,6 +2928,10 @@ impl Worker {
                     }
                     ProcessDisplayResult::Success => (),
                 };
+                needs_config_interrupt |= Self::observe_native_refresh_attachment(
+                    &mut self.state, &mut self.last_native_refresh_generation, &self.native_refresh_event);
+                needs_config_interrupt |= Self::observe_native_scanout_profile(
+                    &mut self.state, &mut self.last_native_profile, &self.native_profile_event);
             }
 
             if ctrl_available
@@ -1649,6 +2940,32 @@ impl Worker {
                     .process_queue(&activation_resources.mem, &activation_resources.ctrl_queue)
             {
                 signal_used_ctrl = true;
+            } else if !ctrl_available
+                && self
+                    .state
+                    .process_queue(&activation_resources.mem, &activation_resources.ctrl_queue)
+            {
+                // Work was waiting in the ring without a kick: a lost notification would
+                // otherwise park it until the guest happens to kick again, which a synchronous
+                // waiter never does (logon TDRs, 2026-10-03).
+                signal_used_ctrl = true;
+                self.unkicked_ctrl_drains += 1;
+                if self.unkicked_ctrl_drains <= 16 || self.unkicked_ctrl_drains.is_power_of_two() {
+                    warn!("CTRL-QUEUE-POLL: answered control requests that arrived without a kick (count={})",
+                        self.unkicked_ctrl_drains);
+                }
+            }
+
+            // Republish who owns the display after every batch of guest commands. This is where
+            // ownership actually changes -- a scanout bound or unbound, a device reset at OS
+            // handover -- and the bridge reads the flag to decide whether to bother producing a
+            // frame at all. Updating it only when a frame arrives would make the first "the guest
+            // owns it" observation permanent: the bridge stops offering, nothing wakes this
+            // thread, and the flag can never go back. That is exactly the handover this exists
+            // for (firmware paints through virtio-gpu, then Windows, which has no virtio-gpu
+            // driver, never binds a scanout again).
+            if let Some(external) = &self.external_scanout {
+                external.set_guest_owns(self.state.virtio_gpu.guest_owns_display());
             }
 
             // Process the entire control queue before the resource bridge in case a resource is
@@ -1661,18 +2978,34 @@ impl Worker {
                 .process_resource_bridges(&mut self.state, &mut event_manager.wait_ctx);
 
             // Flip fences: register the ones queue processing just parked, then complete every
-            // one that signaled (or expired).  Runs every iteration -- the wait above was woken
+            // one that successfully signaled. Runs every iteration -- the wait above was woken
             // either by the fence fd itself or bounded by its deadline.
-            self.state.register_flip_fences(&event_manager.wait_ctx);
-            if self
+            let flip_result = self
                 .state
-                .complete_flip_fences(&activation_resources.ctrl_queue, &event_manager.wait_ctx)
-            {
-                signal_used_ctrl = true;
-            }
-
+                .register_flip_fences(&event_manager.wait_ctx)
+                .and_then(|_| {
+                    self.state.complete_flip_fences(
+                        &activation_resources.ctrl_queue,
+                        &activation_resources.cursor_queue,
+                        &event_manager.wait_ctx,
+                    )
+                });
+            // Queue processing above may already have published used entries.
+            // Deliver those interrupts even if the fence sweep failed; recovery
+            // retains only work whose ownership has not yet been released.
             if signal_used_ctrl {
                 activation_resources.ctrl_queue.signal_used();
+            } else if ctrl_available {
+                // The guest kicked, so it observed our earlier completions.
+            } else if events.is_empty() && activation_resources.interrupt.resignal_pending_used() {
+                // EVENT_IDX may suppress Queue::trigger_interrupt after a completion. Retry the
+                // already-published used-ring interrupt only while the guest ISR remains set;
+                // this is a no-op for MSI-X and ordinary level IRQs.
+                self.ctrl_resignals += 1;
+                if self.ctrl_resignals <= 16 || self.ctrl_resignals.is_power_of_two() {
+                    warn!("CTRL-QUEUE-RESIGNAL: re-raised the control queue interrupt (count={})",
+                        self.ctrl_resignals);
+                }
             }
 
             if signal_used_cursor {
@@ -1681,6 +3014,21 @@ impl Worker {
 
             if needs_config_interrupt {
                 activation_resources.interrupt.signal_config_changed();
+            }
+
+            if let Err(e) = flip_result {
+                return self.hold_failed_display(e);
+            }
+            if let Err(e) = self.state.process_native_ahb_present_retries(std::time::Instant::now(),
+                &activation_resources.ctrl_queue, Some(&activation_resources.cursor_queue)) {
+                return self.hold_failed_display(e);
+            }
+            if let Err(e) = self.state.process_context_retirement(
+                &activation_resources.mem,
+                &activation_resources.ctrl_queue,
+                Some(&activation_resources.cursor_queue),
+            ) {
+                return self.hold_failed_display(e);
             }
         }
     }
@@ -1726,15 +3074,16 @@ pub enum DisplayBackend {
         /// This binding's own absolute pointer and keyboard, parked until the sink is built.
         ///
         /// Behind an `Arc<Mutex<..>>` because of what this enum is: a CLONEABLE entry in a
-        /// try-in-turn chain whose `build` takes `&self`. An `EventDevice` owns a socket and can be
-        /// neither cloned nor moved out of a `&self`, so the devices are parked here and taken by
-        /// whichever `build` call succeeds. The chain stops at the first success, so they are taken
-        /// at most once; if this entry declines, the next backend leaves them alone and they are
-        /// dropped with the config.
+        /// try-in-turn chain whose `build` takes `&self`. An `EventDevice` owns a socket and can
+        /// be neither cloned nor moved out of a `&self`, so the devices are parked here
+        /// and taken by whichever `build` call succeeds. The chain stops at the first
+        /// success, so they are taken at most once; if this entry declines, the next
+        /// backend leaves them alone and they are dropped with the config.
         ///
-        /// Empty inside means `view-only=true` -- a binding that was given no input devices -- which
-        /// is a different thing from devices already taken, but neither can reach a second `build`.
-        /// The lock is an artifact of `&self`, not of sharing: after `build`, one thread owns them.
+        /// Empty inside means `view-only=true` -- a binding that was given no input devices --
+        /// which is a different thing from devices already taken, but neither can reach a
+        /// second `build`. The lock is an artifact of `&self`, not of sharing: after
+        /// `build`, one thread owns them.
         vnc_input: Arc<Mutex<VncBindingInput>>,
     },
 }
@@ -1811,6 +3160,32 @@ impl DisplayBackend {
     }
 }
 
+/// How long the worker parks on the request channel before looking at the simplefb bridge again,
+/// while no driver has the device activated. The bridge produces at 30 fps, so this is one frame:
+/// long enough that a device nobody is displaying through costs nothing, short enough that a
+/// Windows desktop is not a third of a second behind itself.
+const EXTERNAL_IDLE_POLL: Duration = Duration::from_millis(33);
+
+/// Take whatever the simplefb bridge is offering and put it on the display.
+///
+/// Both callers are the gpu worker thread: the event loop while the device is active, and the
+/// request loop while it is not. Ownership is re-evaluated on the way out, because this is the
+/// only place it is evaluated at all -- the bridge only ever reads the flag.
+fn serve_external_scanout(external: &ExternalScanout, virtio_gpu: &mut VirtioGpu) {
+    let (w, h, stride, fourcc) = (
+        external.width(),
+        external.height(),
+        external.stride(),
+        external.fourcc(),
+    );
+    external.take_frame(|frame| {
+        if let Err(e) = virtio_gpu.present_external(w, h, stride, fourcc, frame) {
+            error!("failed to present an external frame: {:?}", e);
+        }
+    });
+    external.set_guest_owns(virtio_gpu.guest_owns_display());
+}
+
 pub struct Gpu {
     exit_evt_wrtube: SendTube,
     pub gpu_control_tube: Option<Tube>,
@@ -1826,7 +3201,11 @@ pub struct Gpu {
     display_params: Vec<GpuDisplayParameters>,
     /// What the guest is told in `virtio_gpu_config.num_scanouts`. Zero means render-only.
     num_scanouts: u32,
+    /// Frames from the VMM's simplefb bridge, if this VM has one (see `ExternalScanout`).
+    external_scanout: Option<Arc<ExternalScanout>>,
     display_event: Arc<AtomicBool>,
+    native_refresh_event: Arc<AtomicBool>,
+    native_profile_event: Arc<AtomicBool>,
     rutabaga_builder: RutabagaBuilder,
     pci_address: Option<PciAddress>,
     pci_bar_size: u64,
@@ -1836,6 +3215,9 @@ pub struct Gpu {
     #[cfg(windows)]
     wndproc_thread: Option<WindowProcedureThread>,
     base_features: u64,
+    display_timing_negotiated: bool,
+    acked_geometry_features: u64,
+    acked_blt_features: u64,
     udmabuf: bool,
     rutabaga_server_descriptor: Option<SafeDescriptor>,
     #[cfg(windows)]
@@ -1866,8 +3248,8 @@ pub struct Gpu {
 /// The worker sits between a guest that is blocked on a fence and a GPU that has already finished:
 /// every millisecond it spends waiting for a timeslice is a millisecond added to frame latency. It
 /// is also, unlike a vcpu, guaranteed to block rather than spin -- its whole loop is
-/// `WaitContext::wait()` plus blocking KGSL ioctls -- so a high priority costs nothing when there is
-/// no work and cannot monopolize a CPU when there is.
+/// `WaitContext::wait()` plus blocking KGSL ioctls -- so a high priority costs nothing when there
+/// is no work and cannot monopolize a CPU when there is.
 #[cfg(any(target_os = "android", target_os = "linux"))]
 const DEFAULT_GPU_RT_LEVEL: u16 = 97;
 
@@ -1940,6 +3322,7 @@ impl Gpu {
         channels: &BTreeMap<String, PathBuf>,
         #[cfg(windows)] wndproc_thread: WindowProcedureThread,
         #[cfg(any(target_os = "android", target_os = "linux"))] gpu_cgroup_path: Option<&PathBuf>,
+        external_scanout: Option<Arc<ExternalScanout>>,
     ) -> Gpu {
         let mut display_params = gpu_parameters.display_params.clone();
         // Zero configured displays is a real configuration, not an oversight: the picture comes
@@ -2025,7 +3408,10 @@ impl Gpu {
             display_backends,
             display_params,
             num_scanouts,
+            external_scanout,
             display_event: Arc::new(AtomicBool::new(false)),
+            native_refresh_event: Arc::new(AtomicBool::new(false)),
+            native_profile_event: Arc::new(AtomicBool::new(false)),
             rutabaga_builder,
             pci_address: gpu_parameters.pci_address,
             pci_bar_size: gpu_parameters.pci_bar_size,
@@ -2035,6 +3421,9 @@ impl Gpu {
             #[cfg(windows)]
             wndproc_thread: Some(wndproc_thread),
             base_features,
+            display_timing_negotiated: false,
+            acked_geometry_features: 0,
+            acked_blt_features: 0,
             udmabuf: gpu_parameters.udmabuf,
             rutabaga_server_descriptor,
             #[cfg(windows)]
@@ -2075,6 +3464,7 @@ impl Gpu {
         let rutabaga = self
             .rutabaga_builder
             .clone()
+            .set_fence_error_handler(create_fence_error_handler(fence_state.clone()))
             .build(fence_handler, rutabaga_server_descriptor)
             .map_err(|e| error!("failed to build rutabaga {}", e))
             .ok()?;
@@ -2105,7 +3495,9 @@ impl Gpu {
                 .expect("failed to import event device");
         }
 
-        Some(Frontend::new(virtio_gpu, fence_state))
+        Frontend::new(virtio_gpu, fence_state)
+            .map_err(|e| error!("failed to create GPU frontend: {e}"))
+            .ok()
     }
 
     // This is not invoked when running with vhost-user GPU.
@@ -2137,6 +3529,8 @@ impl Gpu {
         let display_backends = self.display_backends.clone();
         let display_params = self.display_params.clone();
         let display_event = self.display_event.clone();
+        let native_refresh_event = self.native_refresh_event.clone();
+        let native_profile_event = self.native_profile_event.clone();
         let event_devices = self.event_devices.take().expect("missing event_devices");
         let external_blob = self.external_blob;
         let fixed_blob_mapping = self.fixed_blob_mapping;
@@ -2174,6 +3568,7 @@ impl Gpu {
         let (worker_request_sender, worker_request_receiver) = mpsc::channel();
         let (worker_response_sender, worker_response_receiver) = mpsc::channel();
 
+        let external_scanout = self.external_scanout.clone();
         let worker_thread = WorkerThread::start("v_gpu", move |kill_evt| {
             #[cfg(any(target_os = "android", target_os = "linux"))]
             if let Some(cgroup_path) = gpu_cgroup_path {
@@ -2187,6 +3582,8 @@ impl Gpu {
                 display_backends,
                 display_params,
                 display_event,
+                native_refresh_event,
+                native_profile_event,
                 mapper,
                 event_devices,
                 external_blob,
@@ -2207,6 +3604,7 @@ impl Gpu {
                 gpu_display_wait_descriptor_ctrl_wr,
                 snapshot_scratch_directory,
                 dmabuf_import_capped,
+                external_scanout,
             )
             .expect("Failed to create virtio gpu worker thread");
 
@@ -2250,6 +3648,12 @@ impl Gpu {
 
         if self.display_event.load(Ordering::Relaxed) {
             events_read |= VIRTIO_GPU_EVENT_DISPLAY;
+        }
+        if self.native_refresh_event.load(Ordering::Acquire) {
+            events_read |= VIRTIO_GPU_EVENT_NATIVE_AHB_REFRESH;
+        }
+        if self.native_profile_event.load(Ordering::Acquire) {
+            events_read |= VIRTIO_GPU_EVENT_NATIVE_SCANOUT_PROFILE;
         }
 
         let num_capsets = match self.capset_mask {
@@ -2361,16 +3765,52 @@ impl VirtioDevice for Gpu {
                 virtio_gpu_features |= 1 << VIRTIO_GPU_F_CREATE_GUEST_HANDLE;
             }
 
-            // New experimental/unstable feature, not upstreamed.
-            // Safe to enable because guest must explicitly opt-in.
-            virtio_gpu_features |= 1 << VIRTIO_GPU_F_FENCE_PASSING;
+            // Virgl global cookies are mapped to private host tokens. Its
+            // export/input alias contract is not implemented yet. Use the
+            // same capset selection as renderer initialization, not just mode.
+            if self.rutabaga_builder.default_component_type()
+                != RutabagaComponentType::VirglRenderer
+            {
+                virtio_gpu_features |= 1 << VIRTIO_GPU_F_FENCE_PASSING;
+            }
+
+            // CROSVM_NATIVE_AHB=0 withholds the host-owned scanout protocol,
+            // so a guest whose Native AHB path is broken still boots on the
+            // ordinary guest-backed display path and can be repaired.
+            if std::env::var("CROSVM_NATIVE_AHB").map_or(true, |value| value != "0") {
+                virtio_gpu_features |= 1 << VIRTIO_GPU_F_NATIVE_AHB_V2;
+                virtio_gpu_features |= 1 << VIRTIO_GPU_F_NATIVE_AHB_RELEASE;
+                virtio_gpu_features |= 1 << VIRTIO_GPU_F_NATIVE_AHB_PAGING;
+                if cfg!(feature = "android_display") &&
+                    std::env::var("CROSVM_DISPLAY_TIMING").is_ok_and(|value| value == "1") {
+                    virtio_gpu_features |= 1 << VIRTIO_GPU_F_DISPLAY_TIMING;
+                }
+            }
         }
 
-        self.base_features | virtio_gpu_features
+        // Default-off paired diagnostic only. Host transport availability is
+        // separate from guest producer readiness and an attached usable profile.
+        let geometry_diagnostic = std::env::var("CROSVM_NATIVE_SCANOUT_GEOMETRY_DIAGNOSTIC").ok();
+        let generated = native_geometry::geometry_feature_mask(
+            virtio_gpu_features,
+            virtio_gpu_features,
+            cfg!(feature = "android_display"),
+            geometry_diagnostic.as_deref(),
+        );
+        native_blt::blt_feature_mask(
+            // Geometry was likewise validated against actual generated bits.
+            (self.base_features & !(1 << VIRTIO_GPU_F_NATIVE_AHB_GEOMETRY)) | generated,
+            generated,
+            cfg!(feature = "android_display"),
+            self.rutabaga_builder.default_component_type() == RutabagaComponentType::VirglRenderer,
+        )
     }
 
     fn ack_features(&mut self, value: u64) {
-        let _ = value;
+        self.display_timing_negotiated |=
+            value & self.features() & (1 << VIRTIO_GPU_F_DISPLAY_TIMING) != 0;
+        self.acked_geometry_features |= value & self.features() & native_geometry::GEOMETRY_REQUIRED_FEATURES;
+        self.acked_blt_features |= value & self.features() & native_blt::BLT_REQUIRED_FEATURES;
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
@@ -2382,6 +3822,12 @@ impl VirtioDevice for Gpu {
         copy_config(cfg.as_mut_bytes(), offset, data, 0);
         if (cfg.events_clear.to_native() & VIRTIO_GPU_EVENT_DISPLAY) != 0 {
             self.display_event.store(false, Ordering::Relaxed);
+        }
+        if (cfg.events_clear.to_native() & VIRTIO_GPU_EVENT_NATIVE_AHB_REFRESH) != 0 {
+            self.native_refresh_event.store(false, Ordering::Release);
+        }
+        if (cfg.events_clear.to_native() & VIRTIO_GPU_EVENT_NATIVE_SCANOUT_PROFILE) != 0 {
+            self.native_profile_event.store(false, Ordering::Release);
         }
     }
 
@@ -2413,12 +3859,17 @@ impl VirtioDevice for Gpu {
         }
 
         let ctrl_queue = SharedQueueReader::new(queues.remove(&0).unwrap());
-        let cursor_queue = LocalQueueReader::new(queues.remove(&1).unwrap());
+        let cursor_queue = SharedQueueReader::new(queues.remove(&1).unwrap());
 
         self.worker_request_sender
             .as_ref()
             .context("worker thread missing on activate?")?
             .send(WorkerRequest::Activate(WorkerActivateRequest {
+                display_timing_negotiated: self.display_timing_negotiated,
+                native_geometry_negotiated: native_geometry::geometry_negotiated(
+                    self.features(), self.acked_geometry_features),
+                native_blt_negotiated: native_blt::blt_negotiated(
+                    self.features(), self.acked_blt_features),
                 resources: GpuActivationResources {
                     mem,
                     interrupt,
@@ -2466,6 +3917,60 @@ impl VirtioDevice for Gpu {
             } else {
                 MemCacheType::CacheCoherent
             };
+            if matches!(
+                self.rutabaga_component,
+                RutabagaComponentType::VirglRenderer
+            ) {
+                let arena_fd = env::var("CROSVM_DRM2KGSL_ARENA_FD")
+                    .ok()
+                    .and_then(|value| value.parse::<RawDescriptor>().ok());
+                let arena_offset = env::var("CROSVM_DRM2KGSL_ARENA_FD_OFFSET")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok());
+                let arena_size = env::var("CROSVM_DRM2KGSL_ARENA_SIZE")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok());
+                if let (Some(fd), Some(offset), Some(size)) = (arena_fd, arena_offset, arena_size) {
+                    if size > DRM2KGSL_BAR_BASE_GUARD && size <= self.pci_bar_size {
+                        if let (Some(source_offset), Some(source_size)) = (
+                            offset.checked_add(DRM2KGSL_BAR_BASE_GUARD),
+                            size.checked_sub(DRM2KGSL_BAR_BASE_GUARD),
+                        ) {
+                            if let Ok(descriptor) = base::clone_descriptor(&base::Descriptor(fd)) {
+                                // drm2kgsl sub-allocates blob zero from the arena suffix. The BAR
+                                // is registered before VM start, so the renderer must never
+                                // replace those pages after Gunyah installs the stage-2 mapping.
+                                info!(
+                                    "drm2kgsl: eagerly backing BAR suffix offset={:#x} size={:#x} from arena fd={} offset={:#x}",
+                                    DRM2KGSL_BAR_BASE_GUARD,
+                                    source_size,
+                                    fd,
+                                    source_offset,
+                                );
+                                return SharedMemoryPrepareType::SingleMappingEager(
+                                    cache_type,
+                                    VmMemorySource::Descriptor {
+                                        descriptor,
+                                        offset: source_offset,
+                                        size: source_size,
+                                    },
+                                    DRM2KGSL_BAR_BASE_GUARD,
+                                );
+                            }
+                        }
+                    } else if size <= DRM2KGSL_BAR_BASE_GUARD {
+                        error!(
+                            "drm2kgsl BAR size {:#x} is not larger than the {:#x} base guard",
+                            size, DRM2KGSL_BAR_BASE_GUARD,
+                        );
+                    } else if size > self.pci_bar_size {
+                        error!(
+                            "drm2kgsl BAR backing size {:#x} exceeds pci-bar-size {:#x}",
+                            size, self.pci_bar_size
+                        );
+                    }
+                }
+            }
             SharedMemoryPrepareType::SingleMappingOnFirst(cache_type)
         } else {
             SharedMemoryPrepareType::DynamicPerMapping
@@ -2664,6 +4169,10 @@ impl VirtioDevice for Gpu {
         // keeping the thread + render server alive, so the OS's activate() succeeds and it starts
         // from a clean resource-id space. (Full teardown happens in Drop instead.)
         if self.worker_thread.is_none() {
+            self.display_timing_negotiated = false;
+            self.acked_geometry_features = 0;
+            self.acked_blt_features = 0;
+            self.native_profile_event.store(false, Ordering::Release);
             return Ok(());
         }
         let was_active = matches!(self.worker_state, WorkerState::Active);
@@ -2694,6 +4203,10 @@ impl VirtioDevice for Gpu {
             }
         }
         self.worker_state = WorkerState::Inactive;
+        self.display_timing_negotiated = false;
+        self.acked_geometry_features = 0;
+        self.acked_blt_features = 0;
+        self.native_profile_event.store(false, Ordering::Release);
         Ok(())
     }
 }

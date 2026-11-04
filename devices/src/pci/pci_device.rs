@@ -15,6 +15,7 @@ use base::warn;
 use base::MemoryMapping;
 use base::RawDescriptor;
 use base::SharedMemory;
+use hypervisor::Vm;
 use remain::sorted;
 use resources::Error as SystemAllocatorFaliure;
 use resources::SystemAllocator;
@@ -363,6 +364,18 @@ pub trait PciDevice: Send + Suspendable {
     /// - these BARs represent normal memory.
     fn allocate_device_bars(&mut self, _resources: &mut SystemAllocator) -> Result<Vec<BarRange>> {
         Ok(Vec::new())
+    }
+
+    /// Installs device memory that must exist before the VM starts.
+    ///
+    /// BAR allocation runs before the VM memory control loop, so implementations must perform
+    /// pre-start mappings directly through `vm` instead of issuing a synchronous control request.
+    fn prepare_device_memory(
+        &mut self,
+        _vm: &mut dyn Vm,
+        _resources: &mut SystemAllocator,
+    ) -> Result<Option<vm_control::VmMappedMemoryRegion>> {
+        Ok(None)
     }
 
     /// Returns the configuration of a base address register, if present.
@@ -760,6 +773,13 @@ impl<T: PciDevice + ?Sized> PciDevice for Box<T> {
     }
     fn allocate_device_bars(&mut self, resources: &mut SystemAllocator) -> Result<Vec<BarRange>> {
         (**self).allocate_device_bars(resources)
+    }
+    fn prepare_device_memory(
+        &mut self,
+        vm: &mut dyn Vm,
+        resources: &mut SystemAllocator,
+    ) -> Result<Option<vm_control::VmMappedMemoryRegion>> {
+        (**self).prepare_device_memory(vm, resources)
     }
     fn get_bar_configuration(&self, bar_num: usize) -> Option<PciBarConfiguration> {
         (**self).get_bar_configuration(bar_num)

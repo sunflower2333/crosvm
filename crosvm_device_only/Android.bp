@@ -120,6 +120,10 @@ rust_binary {
         "libenumn",
         "libremain",
     ],
+    // Rust's native dependency propagation does not include static/shared
+    // dependencies of libcrosvm_android_display_client. Link its platform
+    // mapper allocator explicitly in this non-APEX executable.
+    static_libs: ["libcrosvm_shared_ahb_allocation"],
     visibility: ["//visibility:public"],
     arch: {
         x86_64: {
@@ -136,6 +140,7 @@ rust_binary {
         android: {
             shared_libs: [
                 "libprocessgroup",
+                "libui",
             ],
         },
     },

@@ -30,6 +30,7 @@ use log::warn;
 
 use crate::generated::virgl_renderer_bindings::*;
 use crate::renderer_utils::*;
+use crate::rutabaga_core::NativeResourceAttachment;
 use crate::rutabaga_core::RutabagaComponent;
 use crate::rutabaga_core::RutabagaContext;
 use crate::rutabaga_core::RutabagaResource;
@@ -41,6 +42,47 @@ use crate::rutabaga_os::RawDescriptor;
 use crate::rutabaga_utils::*;
 
 type Query = virgl_renderer_export_query;
+
+#[repr(C)]
+#[derive(Default)]
+struct NativeResourceInfo {
+    version: u32,
+    size: u32,
+    ctx_id: u32,
+    res_id: u32,
+    allocation_size: u64,
+    dma_device: u64,
+    dma_inode: u64,
+    kernel_flags: u64,
+    map_info: u32,
+    reserved: u32,
+}
+const _: () = assert!(size_of::<NativeResourceInfo>() == 56);
+extern "C" {
+    fn virgl_renderer_ctx_attach_resource_checked(
+        ctx_id: u32,
+        res_id: u32,
+        info: *mut NativeResourceInfo,
+    ) -> c_int;
+    fn virgl_renderer_ctx_detach_resource_checked(ctx_id: u32, res_id: u32) -> c_int;
+    fn virgl_renderer_ctx_prepare_native_reset(ctx_id: u32) -> c_int;
+}
+
+fn dma_identity(fd: RawDescriptor, size: u64) -> RutabagaResult<(u64, u64)> {
+    let mut identity = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: stat points to initialized writable storage; fd is borrowed.
+    if unsafe { libc::fstat(fd, identity.as_mut_ptr()) } != 0 {
+        return Err(RutabagaError::InvalidRutabagaHandle);
+    }
+    // SAFETY: successful fstat initialized the complete stat record.
+    let identity = unsafe { identity.assume_init() };
+    // SAFETY: descriptor remains owned by the caller and lseek changes no bytes.
+    let actual_size = unsafe { libc::lseek64(fd, 0, libc::SEEK_END) };
+    if actual_size <= 0 || actual_size as u64 != size || identity.st_ino == 0 {
+        return Err(RutabagaError::InvalidRutabagaHandle);
+    }
+    Ok((identity.st_dev as u64, identity.st_ino as u64))
+}
 
 fn dup(rd: RawDescriptor) -> RutabagaResult<OwnedDescriptor> {
     // SAFETY:
@@ -60,6 +102,7 @@ pub struct VirglRenderer {}
 
 struct VirglRendererContext {
     ctx_id: u32,
+    capset_id: u32,
 }
 
 fn import_resource(resource: &mut RutabagaResource) -> RutabagaResult<()> {
@@ -166,8 +209,81 @@ impl RutabagaContext for VirglRendererContext {
         }
     }
 
+    fn attach_host_dmabuf(
+        &mut self,
+        resource: &mut RutabagaResource,
+    ) -> RutabagaResult<NativeResourceAttachment> {
+        if self.capset_id != RUTABAGA_CAPSET_DRM
+            || !resource.blob
+            || resource.blob_mem != RUTABAGA_BLOB_MEM_HOST3D
+        {
+            return Err(RutabagaError::Unsupported);
+        }
+        let handle = resource
+            .handle
+            .as_ref()
+            .ok_or(RutabagaError::InvalidRutabagaHandle)?;
+        if handle.handle_type != RUTABAGA_HANDLE_TYPE_MEM_DMABUF {
+            return Err(RutabagaError::InvalidRutabagaHandle);
+        }
+        let (device, inode) = dma_identity(handle.os_handle.as_raw_descriptor(), resource.size)?;
+        let mut info = NativeResourceInfo {
+            version: 1,
+            size: 56,
+            ..Default::default()
+        };
+        // SAFETY: live resource/context and correctly sized writable output;
+        // checked API reports real KGSL object import, identity, size and flags.
+        let ret = unsafe {
+            virgl_renderer_ctx_attach_resource_checked(self.ctx_id, resource.resource_id, &mut info)
+        };
+        ret_to_res(ret)?;
+        if info.version != 1
+            || info.size != 56
+            || info.ctx_id != self.ctx_id
+            || info.res_id != resource.resource_id
+            || info.allocation_size != resource.size
+            || info.dma_device != device
+            || info.dma_inode != inode
+            || info.reserved != 0
+            || !matches!(
+                info.map_info,
+                RUTABAGA_MAP_CACHE_CACHED | RUTABAGA_MAP_CACHE_WC | RUTABAGA_MAP_CACHE_UNCACHED
+            )
+        {
+            return Err(RutabagaError::InvalidRutabagaHandle);
+        }
+        Ok(NativeResourceAttachment {
+            ctx_id: info.ctx_id,
+            resource_id: info.res_id,
+            allocation_size: info.allocation_size,
+            dma_device: device,
+            dma_inode: inode,
+            kernel_flags: info.kernel_flags,
+            map_info: info.map_info,
+        })
+    }
+
     fn component_type(&self) -> RutabagaComponentType {
         RutabagaComponentType::VirglRenderer
+    }
+
+    fn detach_host_dmabuf(&mut self, resource: &RutabagaResource) -> RutabagaResult<()> {
+        // SAFETY: both context and resource remain owned by Rutabaga until
+        // checked retirement succeeds. This call does not consume the fd.
+        ret_to_res(unsafe {
+            virgl_renderer_ctx_detach_resource_checked(self.ctx_id, resource.resource_id)
+        })
+    }
+
+    fn prepare_native_reset(&mut self) -> RutabagaResult<()> {
+        // SAFETY: reset stopped guest intake and drained genuine display/GPU
+        // use; the live context and every resource remain owned on error.
+        ret_to_res(unsafe { virgl_renderer_ctx_prepare_native_reset(self.ctx_id) })
+    }
+
+    fn capset_id(&self) -> Option<u32> {
+        Some(self.capset_id)
     }
 
     fn context_create_fence(
@@ -196,11 +312,19 @@ impl RutabagaContext for VirglRendererContext {
 
 impl Drop for VirglRendererContext {
     fn drop(&mut self) {
+        info!(
+            "virglrenderer context drop begin: ctx_id={} capset_id={}",
+            self.ctx_id, self.capset_id
+        );
         // SAFETY:
         // The context is safe to destroy because nothing else can be referencing it.
         unsafe {
             virgl_renderer_context_destroy(self.ctx_id);
         }
+        info!(
+            "virglrenderer context drop complete: ctx_id={} capset_id={}",
+            self.ctx_id, self.capset_id
+        );
     }
 }
 
@@ -288,6 +412,29 @@ unsafe extern "C" fn get_server_fd(cookie: *mut c_void, version: u32) -> c_int {
     .unwrap_or_else(|_| abort())
 }
 
+unsafe extern "C" fn write_context_fence_error(
+    cookie: *mut c_void,
+    ctx_id: u32,
+    ring_idx: u32,
+    fence_id: u64,
+    error: i32,
+) {
+    catch_unwind(|| {
+        assert!(!cookie.is_null());
+        // SAFETY: init installs this cookie for the entire renderer lifetime.
+        let cookie = unsafe { &*(cookie as *const RutabagaCookie) };
+        if let Some(handler) = &cookie.fence_error_handler {
+            handler.call(RutabagaFenceError {
+                ctx_id,
+                ring_idx,
+                fence_id,
+                error,
+            });
+        }
+    })
+    .unwrap_or_else(|_| abort())
+}
+
 const VIRGL_RENDERER_CALLBACKS: &virgl_renderer_callbacks = &virgl_renderer_callbacks {
     version: 3,
     write_fence: Some(write_fence),
@@ -298,6 +445,14 @@ const VIRGL_RENDERER_CALLBACKS: &virgl_renderer_callbacks = &virgl_renderer_call
     write_context_fence: Some(write_context_fence),
     get_server_fd: Some(get_server_fd),
     get_egl_display: None,
+    write_context_fence_error: None,
+};
+
+// Keep the table alive: the C library stores its address rather than copying it.
+const VIRGL_RENDERER_ERROR_CALLBACKS: &virgl_renderer_callbacks = &virgl_renderer_callbacks {
+    version: 5,
+    write_context_fence_error: Some(write_context_fence_error),
+    ..*VIRGL_RENDERER_CALLBACKS
 };
 
 /// Retrieves metadata suitable for export about this resource. If "export_fd" is true,
@@ -333,7 +488,10 @@ fn virgl_pool_windows() -> &'static [(u64, u64)] {
             (va != 0 && size != 0).then_some((va, size))
         };
         let mut v = Vec::new();
-        if let Some(w) = read("CROSVM_DRM2KGSL_ARENA_HOST_VA", "CROSVM_DRM2KGSL_ARENA_SIZE") {
+        if let Some(w) = read(
+            "CROSVM_DRM2KGSL_ARENA_HOST_VA",
+            "CROSVM_DRM2KGSL_ARENA_SIZE",
+        ) {
             v.push(w);
         }
         if let Some(w) = read("VENUS_POOL_HOST_VA", "VENUS_POOL_SIZE") {
@@ -374,6 +532,7 @@ impl VirglRenderer {
     pub fn init(
         virglrenderer_flags: VirglRendererFlags,
         fence_handler: RutabagaFenceHandler,
+        fence_error_handler: Option<RutabagaFenceErrorHandler>,
         render_server_fd: Option<OwnedDescriptor>,
     ) -> RutabagaResult<Box<dyn RutabagaComponent>> {
         if cfg!(debug_assertions) {
@@ -426,9 +585,15 @@ impl VirglRenderer {
         // Otherwise, Resource and Context would become invalid because their lifetime is not tied
         // to the Renderer instance. Doing so greatly simplifies the ownership for users of this
         // library.
+        let callbacks = if fence_error_handler.is_some() {
+            VIRGL_RENDERER_ERROR_CALLBACKS
+        } else {
+            VIRGL_RENDERER_CALLBACKS
+        };
         let cookie = Box::into_raw(Box::new(RutabagaCookie {
             render_server_fd,
             fence_handler: Some(fence_handler),
+            fence_error_handler,
             debug_handler: None,
         }));
 
@@ -439,7 +604,7 @@ impl VirglRenderer {
             virgl_renderer_init(
                 cookie as *mut c_void,
                 virglrenderer_flags.into(),
-                transmute(VIRGL_RENDERER_CALLBACKS),
+                transmute(callbacks),
             )
         };
 
@@ -790,6 +955,60 @@ impl RutabagaComponent for VirglRenderer {
         ret_to_res(ret)
     }
 
+    fn import_host_dmabuf(
+        &mut self,
+        resource_id: u32,
+        size: u64,
+        handle: RutabagaHandle,
+    ) -> RutabagaResult<RutabagaResource> {
+        if resource_id == 0 || handle.handle_type != RUTABAGA_HANDLE_TYPE_MEM_DMABUF {
+            return Err(RutabagaError::InvalidRutabagaHandle);
+        }
+        let identity = dma_identity(handle.os_handle.as_raw_descriptor(), size)?;
+        let imported = handle.os_handle.try_clone()?;
+        let args = virgl_renderer_resource_import_blob_args {
+            res_handle: resource_id,
+            blob_mem: RUTABAGA_BLOB_MEM_HOST3D,
+            fd_type: VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF,
+            fd: imported.as_raw_descriptor(),
+            size,
+        };
+        // SAFETY: exact imported descriptor is owned and size checked; Virgl
+        // takes its ownership only on success. Failure leaves it with Rust.
+        let ret = unsafe { virgl_renderer_resource_import_blob(&args) };
+        ret_to_res(ret)?;
+        let _ = imported.into_raw_descriptor();
+        let roundtrip = self.export_blob(resource_id).and_then(|exported| {
+            if exported.handle_type != RUTABAGA_HANDLE_TYPE_MEM_DMABUF
+                || dma_identity(exported.os_handle.as_raw_descriptor(), size)? != identity
+            {
+                return Err(RutabagaError::InvalidRutabagaHandle);
+            }
+            Ok(())
+        });
+        if let Err(error) = roundtrip {
+            // No context has attached or used this new global descriptor.
+            self.unref_resource(resource_id);
+            return Err(error);
+        }
+        Ok(RutabagaResource {
+            resource_id,
+            handle: Some(Arc::new(handle)),
+            blob: true,
+            blob_mem: RUTABAGA_BLOB_MEM_HOST3D,
+            blob_flags: RUTABAGA_BLOB_FLAG_USE_MAPPABLE | RUTABAGA_BLOB_FLAG_USE_SHAREABLE,
+            map_info: None,
+            info_2d: None,
+            info_3d: None,
+            vulkan_info: None,
+            backing_iovecs: None,
+            component_mask: 1 << (RutabagaComponentType::VirglRenderer as u8),
+            size,
+            mapping: None,
+            pool_offset: None,
+        })
+    }
+
     #[allow(unused_variables)]
     fn create_blob(
         &mut self,
@@ -799,6 +1018,25 @@ impl RutabagaComponent for VirglRenderer {
         mut iovec_opt: Option<Vec<RutabagaIovec>>,
         handle_opt: Option<RutabagaHandle>,
     ) -> RutabagaResult<RutabagaResource> {
+        // Native-display blobs are allocated by crosvm's Android gralloc
+        // bridge first. Import that exact DMA-BUF as the virgl resource so
+        // guest rendering and SurfaceControl share one allocation. The
+        // ordinary create_blob path ignores host handles for HOST3D and would
+        // silently create a different backing, so fail closed here.
+        if resource_create_blob.blob_flags & RUTABAGA_BLOB_FLAG_USE_NATIVE_AHB != 0 {
+            if resource_create_blob.blob_mem != RUTABAGA_BLOB_MEM_HOST3D
+                || iovec_opt.as_ref().is_some_and(|iovecs| !iovecs.is_empty())
+            {
+                return Err(RutabagaError::InvalidRutabagaHandle);
+            }
+            let handle = handle_opt.ok_or(RutabagaError::InvalidRutabagaHandle)?;
+            let mut resource = self.import_host_dmabuf(resource_id, resource_create_blob.size, handle)?;
+            // Preserve the native identity through the generic dispatcher so
+            // CTX_ATTACH uses checked DMA import and never the void fallback.
+            resource.blob_flags |= RUTABAGA_BLOB_FLAG_USE_NATIVE_AHB;
+            return Ok(resource);
+        }
+
         let mut iovec_ptr = null_mut();
         let mut num_iovecs = 0;
         if let Some(ref mut iovecs) = iovec_opt {
@@ -814,37 +1052,40 @@ impl RutabagaComponent for VirglRenderer {
         // Errors are not fatal here on purpose. -ENOTSUP means this context does not implement
         // guest-allocated blobs, in which case create_blob below behaves exactly as it did
         // before and the resource is backed the old way.
-        if let Some(ref handle) = handle_opt {
-            if handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_DMABUF {
-                // Hand over a DUP, not the descriptor itself. virgl_renderer_resource_set_guest_blob_fd
-                // takes ownership, and `handle` still owns os_handle and closes it when this
-                // function returns -- passing the raw fd makes both sides close the same one.
-                //
-                // The second close lands on whatever inherited that fd number in between, which
-                // is a long-lived socket often enough to matter: it showed up as the VNC server
-                // failing a read with EBADF and dropping its client, a symptom with nothing in it
-                // to suggest a blob descriptor.
-                let dup_fd = handle.os_handle.try_clone()?.into_raw_descriptor();
-                // SAFETY: dup_fd is a fresh descriptor this call gives away; nothing here closes it.
-                let ret = unsafe {
-                    virgl_renderer_resource_set_guest_blob_fd(
-                        ctx_id,
-                        resource_create_blob.blob_id,
-                        dup_fd,
-                    )
-                };
-                if ret != 0 {
-                    // SAFETY: ownership only transfers on success, so the dup is still ours.
-                    unsafe { libc::close(dup_fd) };
-                    // -ENOTSUP just means this context does not implement guest-allocated
-                    // blobs, which is not a problem: create_blob below behaves as before.
-                    if ret != -(libc::ENOTSUP as i32) {
-                        log::warn!(
-                            "set_guest_blob_fd(ctx={} blob_id={}) failed: {}",
+        if resource_create_blob.blob_mem == RUTABAGA_BLOB_MEM_HOST3D_GUEST {
+            if let Some(ref handle) = handle_opt {
+                if handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_DMABUF {
+                    // Hand over a DUP, not the descriptor itself. virgl_renderer_resource_set_guest_blob_fd
+                    // takes ownership, and `handle` still owns os_handle and closes it when this
+                    // function returns -- passing the raw fd makes both sides close the same one.
+                    //
+                    // The second close lands on whatever inherited that fd number in between, which
+                    // is a long-lived socket often enough to matter: it showed up as the VNC server
+                    // failing a read with EBADF and dropping its client, a symptom with nothing in it
+                    // to suggest a blob descriptor.
+                    let dup_fd = handle.os_handle.try_clone()?.into_raw_descriptor();
+                    // SAFETY: dup_fd is a fresh descriptor this call gives away; nothing here closes it.
+                    let ret = unsafe {
+                        virgl_renderer_resource_set_guest_blob_fd(
                             ctx_id,
                             resource_create_blob.blob_id,
-                            ret
-                        );
+                            dup_fd,
+                        )
+                    };
+                    if ret != 0 {
+                        // SAFETY: ownership only transfers on success, so the dup is still ours.
+                        unsafe { libc::close(dup_fd) };
+                        // -ENOTSUP just means this context does not implement guest-allocated
+                        // blobs, which is not a problem: create_blob below behaves as before.
+                        if ret != -(libc::ENOTSUP as i32) {
+                            log::warn!(
+                                "set_guest_blob_fd(ctx={} blob_id={}) failed: {}",
+                                ctx_id,
+                                resource_create_blob.blob_id,
+                                ret
+                            );
+                            return Err(RutabagaError::ComponentError(ret));
+                        }
                     }
                 }
             }
@@ -964,6 +1205,9 @@ impl RutabagaComponent for VirglRenderer {
             }
         };
         ret_to_res(ret)?;
-        Ok(Box::new(VirglRendererContext { ctx_id }))
+        Ok(Box::new(VirglRendererContext {
+            ctx_id,
+            capset_id: context_init & RUTABAGA_CONTEXT_INIT_CAPSET_ID_MASK,
+        }))
     }
 }

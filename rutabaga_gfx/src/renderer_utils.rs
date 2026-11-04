@@ -7,6 +7,7 @@
 use crate::rutabaga_os::OwnedDescriptor;
 use crate::rutabaga_utils::RutabagaDebugHandler;
 use crate::rutabaga_utils::RutabagaError;
+use crate::rutabaga_utils::RutabagaFenceErrorHandler;
 use crate::rutabaga_utils::RutabagaFenceHandler;
 use crate::rutabaga_utils::RutabagaResult;
 
@@ -31,5 +32,6 @@ pub fn ret_to_res(ret: i32) -> RutabagaResult<()> {
 pub struct RutabagaCookie {
     pub render_server_fd: Option<OwnedDescriptor>,
     pub fence_handler: Option<RutabagaFenceHandler>,
+    pub fence_error_handler: Option<RutabagaFenceErrorHandler>,
     pub debug_handler: Option<RutabagaDebugHandler>,
 }

@@ -8,6 +8,7 @@
 
 #![cfg(feature = "gfxstream")]
 
+use std::collections::BTreeMap;
 use std::convert::TryInto;
 use std::ffi::CString;
 use std::io::IoSliceMut;
@@ -20,7 +21,6 @@ use std::panic::catch_unwind;
 use std::process::abort;
 use std::ptr::null;
 use std::ptr::null_mut;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -432,6 +432,7 @@ impl Gfxstream {
         let mut cookie = Box::new(RutabagaCookie {
             render_server_fd: None,
             fence_handler: Some(fence_handler),
+            fence_error_handler: None,
             debug_handler,
         });
 

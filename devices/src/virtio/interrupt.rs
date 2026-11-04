@@ -61,8 +61,8 @@ impl InterruptInner {
     fn update_interrupt_status(&self, interrupt_status_mask: u32) -> bool {
         // Set bit in ISR and inject the interrupt if it was not already pending.
         // Don't need to inject the interrupt if the guest hasn't processed it.
-        // In hypervisors where interrupt_status is updated asynchronously, inject the
-        // interrupt even if the previous interrupt appears to be already pending.
+        // An auto-ack IRQ chip (Gunyah) clears the line on delivery, independently of this
+        // ISR. It has no EOI resample to reassert a still-pending ISR, so signal each update.
         self.interrupt_status
             .fetch_or(interrupt_status_mask as usize, Ordering::SeqCst)
             == 0
@@ -132,6 +132,27 @@ impl Interrupt {
         self.signal(vector, INTERRUPT_STATUS_USED_RING)
     }
 
+    /// Retry a used-ring notification already published on an auto-ack INTx line.
+    /// EVENT_IDX can suppress Queue::trigger_interrupt when no new used entry was added;
+    /// Gunyah has already cleared the bell and has no EOI resample, so this direct retry is
+    /// required while the guest ISR bit remains pending.
+    pub fn resignal_pending_used(&self) -> bool {
+        if self.inner.pm_state.lock().suspended {
+            return false;
+        }
+        let Transport::Pci { pci } = &self.inner.transport else {
+            return false;
+        };
+        if !pci.irq_evt_lvl.auto_ack()
+            || pci.msix_config.as_ref().is_some_and(|config| config.lock().enabled())
+            || self.read_interrupt_status() & INTERRUPT_STATUS_USED_RING as u8 == 0
+        {
+            return false;
+        }
+        pci.irq_evt_lvl.trigger().unwrap();
+        true
+    }
+
     /// Notify the driver that the device configuration has changed.
     pub fn signal_config_changed(&self) {
         match &self.inner.as_ref().transport {
@@ -148,7 +169,9 @@ impl Interrupt {
     /// Get the event to signal resampling is needed if it exists.
     fn get_resample_evt(&self) -> Option<&Event> {
         match &self.inner.as_ref().transport {
-            Transport::Pci { pci } => Some(pci.irq_evt_lvl.get_resample()),
+            Transport::Pci { pci } if !pci.irq_evt_lvl.auto_ack() => {
+                Some(pci.irq_evt_lvl.get_resample())
+            }
             _ => None,
         }
     }
@@ -176,7 +199,7 @@ impl Interrupt {
         Interrupt {
             inner: Arc::new(InterruptInner {
                 interrupt_status: AtomicUsize::new(0),
-                async_intr_status: false,
+                async_intr_status: irq_evt_lvl.auto_ack(),
                 transport: Transport::Pci {
                     pci: TransportPci {
                         irq_evt_lvl,
@@ -205,7 +228,7 @@ impl Interrupt {
         Interrupt {
             inner: Arc::new(InterruptInner {
                 interrupt_status: AtomicUsize::new(snapshot.interrupt_status),
-                async_intr_status: false,
+                async_intr_status: irq_evt_lvl.auto_ack(),
                 transport: Transport::Pci {
                     pci: TransportPci {
                         irq_evt_lvl,
@@ -460,5 +483,96 @@ fn interrupt_resample_thread(kill_evt: Event, interrupt: Interrupt) {
                 Token::Kill => return,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use base::EventWaitResult;
+
+    use super::*;
+
+    fn new_interrupt(event: IrqLevelEvent) -> Interrupt {
+        Interrupt::new(event, None, VIRTIO_MSI_NO_VECTOR,
+            #[cfg(target_arch = "x86_64")] None)
+    }
+
+    fn assert_signal(interrupt: &Interrupt, expected: bool) {
+        let result = interrupt.get_interrupt_evt()
+            .wait_timeout(Duration::ZERO).unwrap();
+        assert_eq!(matches!(result, EventWaitResult::Signaled), expected);
+    }
+
+    #[test]
+    fn auto_ack_retriggers_after_delivery_before_guest_clears_isr() {
+        let event = IrqLevelEvent::new_with_auto_ack().unwrap();
+        let interrupt = new_interrupt(event.try_clone().unwrap());
+        assert!(interrupt.spawn_resample_thread().is_none());
+        for _ in 0..256 {
+            interrupt.signal_used_queue(VIRTIO_MSI_NO_VECTOR);
+            // The chip has delivered and auto-acked the line, but the guest has not read ISR.
+            assert_signal(&interrupt, true);
+            assert_eq!(interrupt.read_interrupt_status(), INTERRUPT_STATUS_USED_RING as u8);
+        }
+        interrupt.signal_config_changed();
+        assert_signal(&interrupt, true);
+        assert_eq!(interrupt.read_and_reset_interrupt_status(),
+                   (INTERRUPT_STATUS_USED_RING | INTERRUPT_STATUS_CONFIG_CHANGED) as u8);
+        interrupt.signal_used_queue(VIRTIO_MSI_NO_VECTOR);
+        assert_signal(&interrupt, true);
+    }
+
+    #[test]
+    fn ordinary_level_line_coalesces_and_reasserts_on_eoi() {
+        let event = IrqLevelEvent::new().unwrap();
+        let interrupt = new_interrupt(event.try_clone().unwrap());
+        let worker = interrupt.spawn_resample_thread().unwrap();
+        interrupt.signal_used_queue(VIRTIO_MSI_NO_VECTOR);
+        assert_signal(&interrupt, true);
+        interrupt.signal_config_changed();
+        assert_signal(&interrupt, false);
+        event.trigger_resample().unwrap();
+        assert!(matches!(interrupt.get_interrupt_evt().wait_timeout(Duration::from_secs(1))
+            .unwrap(), EventWaitResult::Signaled));
+        interrupt.read_and_reset_interrupt_status();
+        event.trigger_resample().unwrap();
+        assert!(matches!(interrupt.get_interrupt_evt().wait_timeout(Duration::from_millis(10))
+            .unwrap(), EventWaitResult::TimedOut));
+        worker.stop();
+    }
+
+    #[test]
+    fn restored_pending_isr_keeps_auto_ack_semantics() {
+        let original = new_interrupt(IrqLevelEvent::new_with_auto_ack().unwrap());
+        original.signal_used_queue(VIRTIO_MSI_NO_VECTOR);
+        let restored = Interrupt::new_from_snapshot(
+            IrqLevelEvent::new_with_auto_ack().unwrap(), None, VIRTIO_MSI_NO_VECTOR,
+            original.snapshot(), #[cfg(target_arch = "x86_64")] None);
+        assert!(restored.spawn_resample_thread().is_none());
+        restored.signal_used_queue(VIRTIO_MSI_NO_VECTOR);
+        assert_signal(&restored, true);
+    }
+
+    #[test]
+    fn suspended_auto_ack_interrupts_are_deferred() {
+        let interrupt = new_interrupt(IrqLevelEvent::new_with_auto_ack().unwrap());
+        interrupt.set_suspended(true);
+        interrupt.signal_used_queue(VIRTIO_MSI_NO_VECTOR);
+        assert_signal(&interrupt, false);
+        assert_eq!(interrupt.read_interrupt_status(), 0);
+        interrupt.set_suspended(false);
+        assert_signal(&interrupt, true);
+    }
+
+    #[test]
+    fn enabled_msix_does_not_assert_intx_or_set_isr() {
+        let interrupt = Interrupt::new_for_test_with_msix();
+        interrupt.get_msix_config().as_ref().unwrap().lock()
+            .write_msix_capability(2, &0x8000u16.to_le_bytes());
+        interrupt.signal_used_queue(0);
+        assert_signal(&interrupt, false);
+        assert_eq!(interrupt.read_interrupt_status(), 0);
     }
 }

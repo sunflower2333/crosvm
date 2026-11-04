@@ -52,6 +52,7 @@ extern "C" {
 #define RUTABAGA_BLOB_FLAG_USE_MAPPABLE 1
 #define RUTABAGA_BLOB_FLAG_USE_SHAREABLE 2
 #define RUTABAGA_BLOB_FLAG_USE_CROSS_DEVICE 4
+#define RUTABAGA_BLOB_FLAG_USE_NATIVE_AHB 16
 
 /**
  * Mapped memory caching flags (see virtio_gpu spec)

@@ -39,5 +39,8 @@ thiserror = "1"
 vm_control_product = { path = "../vendor/generic/vm_control", package = "vm_control_product" }
 vm_memory = { path = "../vm_memory" }
 
+[dev-dependencies]
+tempfile = "3"
+
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3"

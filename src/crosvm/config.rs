@@ -787,7 +787,6 @@ pub struct PreAllocConfig {
     /// the round trip this route exists to avoid. Its own Drm2KgslPool region + `drm2kgsl_host` DT
     /// node. Only meaningful with `--gpu backend=virglrenderer`.
     pub drm_host_mb: Option<u64>,
-
     /// venus (vkr) HOST-allocated pool size (MB): where the venus transport shmems (per-instance
     /// ring + CS/reply chunks) are served from. The vkr pool merge is landed (virglrenderer vkr
     /// sub-allocates every blob_id==0 shmem from this region and publishes map_ptr, so the guest
@@ -1050,6 +1049,10 @@ pub struct Config {
     pub display_window_mouse: bool,
     pub dump_device_tree_blob: Option<PathBuf>,
     pub dynamic_power_coefficient: BTreeMap<usize, u32>,
+    /// Dedicated EDK2 preload pool size in MiB (`--edk2-preload-mb`). It has no boot-time shared
+    /// prefix. Firmware requests one runtime RWX SHARE for the complete range, accepts it, and
+    /// promotes only this pool to System RAM before Linux boots. Zero or absent disables the pool.
+    pub edk2_preload_mb: Option<u64>,
     pub enable_fw_cfg: bool,
     pub enable_hwp: bool,
     pub executable_path: Option<Executable>,
@@ -1290,6 +1293,7 @@ impl Default for Config {
             display_window_mouse: false,
             dump_device_tree_blob: None,
             dynamic_power_coefficient: BTreeMap::new(),
+            edk2_preload_mb: None,
             enable_fw_cfg: false,
             enable_hwp: false,
             executable_path: None,
@@ -1639,6 +1643,14 @@ pub fn validate_config(cfg: &mut Config) -> std::result::Result<(), String> {
         return Err("Executable is not specified".to_string());
     }
 
+    if let Some(mb) = cfg.edk2_preload_mb {
+        if mb != 0 && (mb < 2 || mb % 2 != 0) {
+            return Err(
+                "`edk2-preload-mb` must be 0 or a multiple of 2 MiB".to_string(),
+            );
+        }
+    }
+
     if cfg.plugin_root.is_some() && !executable_is_plugin(&cfg.executable_path) {
         return Err("`plugin-root` requires `plugin`".to_string());
     }
@@ -1935,6 +1947,35 @@ mod tests {
     /// A `--simplefb` that parses; the geometry is never used by these tests, only its presence.
     #[cfg(any(feature = "vnc", feature = "android_display"))]
     const SIMPLEFB_ARG: &str = "width=1280,height=720";
+
+    #[test]
+    fn validate_edk2_preload_size() {
+        for mb in ["0", "2", "6", "100"] {
+            let command = crate::crosvm::cmdline::RunCommand::from_args(
+                &[],
+                &["--edk2-preload-mb", mb, "/dev/null"],
+            )
+            .unwrap();
+            let result: Result<Config, String> = command.try_into();
+            assert!(result.is_ok(), "{mb} MiB should be accepted");
+        }
+
+        for mb in ["1", "3", "99"] {
+            let command = crate::crosvm::cmdline::RunCommand::from_args(
+                &[],
+                &["--edk2-preload-mb", mb, "/dev/null"],
+            )
+            .unwrap();
+            let result: Result<Config, String> = command.try_into();
+            assert!(
+                matches!(
+                    result,
+                    Err(ref error) if error.contains("must be 0 or a multiple of 2 MiB")
+                ),
+                "{mb} MiB should be rejected"
+            );
+        }
+    }
 
     #[test]
     fn parse_cpu_opts() {

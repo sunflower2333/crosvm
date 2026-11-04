@@ -573,15 +573,29 @@ fn create_virtio_devices(
             let event_devices =
                 create_display_window_input_devices(cfg, gpu_display_w, gpu_display_h, &mut devs)?;
 
-            // `event_devices` above is the X11 display window's, if any were asked for, and nothing
-            // else. A VNC exporter bound to this screen gets its own pair instead, built here and
-            // carried to whichever backend in the chain opens.
-            //
-            // Bound to a local rather than written inline in the call below: both it and the
-            // `devs.push` around the call want `&mut devs`, and the argument is evaluated inside
-            // the push's borrow.
             #[cfg(feature = "vnc")]
             let vnc_input = create_vnc_binding_input(cfg, DisplayScreen::Gpu0, &mut devs)?;
+
+            // This device set belongs to the GPU display. The SimpleFB bridge presents on the
+            // exporter bound to its own screen, so it never feeds this device.
+            let external_scanout = match cfg.simplefb.as_ref() {
+                Some(sfb) => {
+                    let bpp: u32 = match sfb.format.as_str() {
+                        "r8g8b8" => 3,
+                        "r5g6b5" => 2,
+                        _ => 4,
+                    };
+                    let scanout = virtio::ExternalScanout::new(
+                        sfb.width,
+                        sfb.height,
+                        sfb.width * bpp,
+                        simplefb_display::simplefb_format_fourcc(sfb.format.as_str()),
+                    )
+                        .context("failed to create the simplefb scanout")?;
+                    Some(scanout)
+                }
+                None => None,
+            };
 
             let (gpu_control_host_tube, gpu_control_device_tube) =
                 Tube::pair().context("failed to create gpu tube")?;
@@ -596,6 +610,7 @@ fn create_virtio_devices(
                 event_devices,
                 #[cfg(feature = "vnc")]
                 vnc_input,
+                external_scanout,
             )?;
             devs.push(gpu_dev);
         }
@@ -2380,13 +2395,40 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         }
     }
 
-    let components = setup_vm_components(&cfg)?;
+    // The EDK2 preload pool is deliberately independent of GPU pre-allocation. Always override
+    // the legacy environment variable so an inherited value cannot enable it without the CLI.
+    std::env::set_var(
+        "DROIDVM_EDK2_PRELOAD_MB",
+        cfg.edk2_preload_mb.unwrap_or(0).to_string(),
+    );
 
     let hypervisor = cfg
         .hypervisor
         .clone()
         .or_else(get_default_hypervisor)
         .context("no enabled hypervisor")?;
+
+    #[cfg(all(
+        feature = "gpu",
+        feature = "gunyah",
+        any(target_arch = "arm", target_arch = "aarch64")
+    ))]
+    if matches!(&hypervisor, HypervisorKind::Gunyah { .. })
+        && gpu::uses_drm2kgsl_prebacked_bar(&cfg)
+    {
+        // Gunyah cannot expose the same physical pages at both the historical pool GPA and the
+        // VirtIO PCI BAR GPA. Mark the arena host-only before GuestMemory is handed to Gunyah;
+        // the BAR preparation later installs the sole guest-visible stage-2 mapping.
+        std::env::set_var("CROSVM_DRM2KGSL_BAR_PREBACKED", "1");
+    } else {
+        std::env::remove_var("CROSVM_DRM2KGSL_BAR_PREBACKED");
+        std::env::remove_var("CROSVM_DRM2KGSL_BAR_GPA");
+        std::env::remove_var("CROSVM_DRM2KGSL_BAR_SIZE");
+    }
+
+    // GPU construction happens inside setup_vm_components and reads the pre-backed flag when it
+    // chooses the fixed BAR mapper. Publish it before constructing any devices.
+    let components = setup_vm_components(&cfg)?;
 
     debug!("creating hypervisor: {:?}", hypervisor);
 
@@ -2561,6 +2603,39 @@ where
 
     #[cfg(feature = "vnc")]
     let mut simplefb_vnc_input = VncBindingInput::default();
+
+    // PCI BARs are allocated while Arch::build_vm generates the PCI root, before aarch64's FDT
+    // pass exports pool metadata. Publish the drm2kgsl arena now so virtio-gpu can use its exact
+    // fd-backed pages for the host-visible BAR instead of preparing an anonymous arena first.
+    #[cfg(all(feature = "gpu", any(target_arch = "arm", target_arch = "aarch64")))]
+    for region in vm.get_memory().regions() {
+        if region.options.purpose == vm_memory::MemoryRegionPurpose::Drm2KgslPool {
+            let fd = region.shm.as_raw_descriptor();
+            std::env::set_var("CROSVM_DRM2KGSL_ARENA_FD", fd.to_string());
+            std::env::set_var(
+                "CROSVM_DRM2KGSL_ARENA_FD_OFFSET",
+                region.shm_offset.to_string(),
+            );
+            std::env::set_var(
+                "CROSVM_DRM2KGSL_ARENA_HOST_VA",
+                (region.host_addr as u64).to_string(),
+            );
+            if std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_none() {
+                std::env::set_var(
+                    "CROSVM_DRM2KGSL_ARENA_GPA",
+                    format!("{:#x}", region.guest_addr.offset()),
+                );
+            }
+            std::env::set_var(
+                "CROSVM_DRM2KGSL_ARENA_SIZE",
+                (region.size as u64).to_string(),
+            );
+            info!(
+                "GPU-POOL-EARLY: published Drm2KgslPool fd={} off={:#x} size={:#x} before PCI BAR allocation",
+                fd, region.shm_offset, region.size
+            );
+        }
+    }
 
     let mut devices = create_devices(
         &cfg,
@@ -4191,14 +4266,6 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         #[cfg(not(feature = "android_display"))]
         let android_service: Option<(String, crate::crosvm::config::TransportCap)> = None;
 
-        // No binding, no thread. A framebuffer nobody asked to see costs nothing to not look at,
-        // and there is no longer anywhere for its frames to go by default: they used to be handed
-        // to the GPU device's display, which is what the exporter bindings replace. (The step-5
-        // liveness rate is for a screen that is bound but unwatched -- a sink attached with no
-        // client -- not for one nothing has bound at all.)
-        // The transport ceiling travels with the binding, not with the screen: it says how far this
-        // one exporter may go, so it is read off whichever entry bound to `simplefb` and handed to
-        // the bridge alongside the target it describes.
         let (target, transport_cap) = match android_service {
             Some((service_name, transport_cap)) => (
                 simplefb_display::SimplefbDisplayTarget::Android { service_name },
@@ -4510,6 +4577,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         .unwrap();
 
     let (vm_memory_handler_control, vm_memory_handler_control_for_thread) = Tube::pair()?;
+    let pre_mapped_memory_regions = std::mem::take(&mut linux.pre_mapped_memory_regions);
     let vm_memory_handler_thread = std::thread::Builder::new()
         .name("vm_memory_handler_thread".into())
         .spawn({
@@ -4527,6 +4595,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                     iommu_client,
                     vm_memory_handler_control_for_thread,
                     gunyah_accept_host_tube,
+                    pre_mapped_memory_regions,
                 )
             }
         })
@@ -5223,6 +5292,7 @@ fn vm_memory_handler_thread(
     mut iommu_client: Option<VmMemoryRequestIommuClient>,
     handler_control: Tube,
     gunyah_accept_tube: Option<Tube>,
+    pre_mapped_memory_regions: Vec<vm_control::VmMappedMemoryRegion>,
 ) -> anyhow::Result<()> {
     #[derive(EventToken)]
     enum Token {
@@ -5241,7 +5311,7 @@ fn vm_memory_handler_thread(
             .context("failed to add descriptor to wait context")?;
     }
 
-    let mut region_state: VmMemoryRegionState = Default::default();
+    let mut region_state = VmMemoryRegionState::with_mapped_regions(pre_mapped_memory_regions);
 
     'wait: loop {
         let events = {

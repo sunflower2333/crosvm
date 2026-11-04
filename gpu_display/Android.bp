@@ -18,6 +18,59 @@ package {
     default_applicable_licenses: ["external_crosvm_license"],
 }
 
+// Deterministic display dependency for the ARM64 frontend protocol tests.
+rust_library {
+    name: "libgpu_display_native_blt_test",
+    defaults: ["crosvm_defaults"],
+    host_supported: true,
+    crate_name: "gpu_display",
+    cargo_env_compat: true,
+    cargo_pkg_version: "0.1.0",
+    crate_root: "src/lib.rs",
+    edition: "2021",
+    features: [
+        "android_display",
+        "android_display_stub",
+        "gfxstream",
+        "vnc",
+    ],
+    rustlibs: [
+        "libanyhow",
+        "libbase_rust",
+        "libcfg_if",
+        "liblibc",
+        "liblinux_input_sys",
+        "libserde",
+        "libsync_rust",
+        "libthiserror",
+        "libvm_control",
+        "libzerocopy",
+    ],
+    proc_macros: ["libremain"],
+    static_libs: ["libdisplay_wl", "libvnc_server_bridge"],
+
+    // added manually
+    target: {
+        host: {
+            shared_libs: ["libwayland_client", "libvncserver"],
+            features: ["android_display_stub"],
+        },
+        android: {
+            static_libs: [
+                "libwayland_client_static",
+                "libffi",
+            ],
+            shared_libs: [
+                "libc++",
+                "libbinder_ndk",
+                "libnativewindow",
+                "libvncserver",
+            ],
+        },
+    },
+    apex_available: ["com.android.virt"],
+}
+
 rust_library {
     name: "libgpu_display",
     defaults: ["crosvm_defaults"],

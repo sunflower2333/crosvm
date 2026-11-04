@@ -23,6 +23,9 @@ pub const GH_VCPU_EXIT_UNKNOWN: u32 = 0;
 pub const GH_VCPU_EXIT_MMIO: u32 = 1;
 pub const GH_VCPU_EXIT_STATUS: u32 = 2;
 pub const GH_VCPU_EXIT_PAGE_FAULT: u32 = 3;
+pub const GH_VCPU_RESUME_HANDLED: u8 = 0;
+pub const GH_VCPU_RESUME_FAULT: u8 = 1;
+pub const GH_VCPU_RESUME_RETRY: u8 = 2;
 pub const GH_ANDROID_IOCTL_TYPE: u8 = 65u8;
 pub const GH_VM_BOOT_CONTEXT_REG_SHIFT: u32 = 8;
 pub type i8 = :: std :: os :: raw :: c_schar;
@@ -205,6 +208,7 @@ pub struct gh_vcpu_run__bindgen_ty_1__bindgen_ty_1 {
     pub data: [u8; 8usize],
     pub len: u32,
     pub is_write: u8,
+    pub resume_action: u8,
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -277,3 +281,30 @@ pub struct gunyah_map_cma_mem_args {
     pub offset : u64,
     pub size : u64,
 }
+
+// Keep the mmap ABI in sync with the arm64 Gunyah UAPI. These assertions are
+// intentionally target-gated because this generated file is only consumed by
+// the Gunyah backend on ARM hosts.
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+const _: () = {
+    assert!(::std::mem::size_of::<gh_vcpu_run>() == 40);
+    assert!(::std::mem::offset_of!(gh_vcpu_run, exit_reason) == 8);
+    assert!(::std::mem::offset_of!(gh_vcpu_run, __bindgen_anon_1) == 16);
+
+    assert!(::std::mem::size_of::<gh_vcpu_run__bindgen_ty_1>() == 24);
+    assert!(::std::mem::size_of::<gh_vcpu_run__bindgen_ty_1__bindgen_ty_1>() == 24);
+    assert!(
+        ::std::mem::offset_of!(gh_vcpu_run__bindgen_ty_1__bindgen_ty_1, phys_addr) == 0
+    );
+    assert!(::std::mem::offset_of!(gh_vcpu_run__bindgen_ty_1__bindgen_ty_1, data) == 8);
+    assert!(::std::mem::offset_of!(gh_vcpu_run__bindgen_ty_1__bindgen_ty_1, len) == 16);
+    assert!(::std::mem::offset_of!(gh_vcpu_run__bindgen_ty_1__bindgen_ty_1, is_write) == 20);
+    assert!(
+        ::std::mem::offset_of!(gh_vcpu_run__bindgen_ty_1__bindgen_ty_1, resume_action) == 21
+    );
+
+    assert!(::std::mem::size_of::<gh_vcpu_run__bindgen_ty_1__bindgen_ty_3>() == 16);
+    assert!(::std::mem::offset_of!(gh_vcpu_run__bindgen_ty_1__bindgen_ty_3, phys_addr) == 0);
+    assert!(::std::mem::offset_of!(gh_vcpu_run__bindgen_ty_1__bindgen_ty_3, attempt) == 8);
+    assert!(::std::mem::offset_of!(gh_vcpu_run__bindgen_ty_1__bindgen_ty_3, resume_action) == 12);
+};

@@ -1,0 +1,4 @@
+Snapshot of AOSP packages/modules/Virtualization/libs/android_display_backend
+as deployed with crosvm (boot-memaccept-fifo02 build, 2026-10-31): the
+Android SurfaceControl/AHB display bridge, frame-rate vote, CPU/GPU clock
+floors and core_ctl hold used by the DroidVM native display.

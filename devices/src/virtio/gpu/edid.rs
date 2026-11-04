@@ -28,18 +28,28 @@ const MILLIMETERS_PER_INCH: f32 = 25.4;
 /// and to allow us to configure the resolution and refresh rate (via the preferred timing mode
 /// pixel clock).
 ///
-/// The EDID spec defines a number of methods to provide mode information, but in priority order the
-/// "detailed" timing information is first, so we provide a single block of detailed timing
-/// information and no other form of timing information.
+/// Legacy detailed timings describe modes within their encoding limits. A DisplayID extension
+/// carries the configured preferred timing when its clock or geometry exceeds those limits.
 #[repr(C)]
 pub struct EdidBytes {
-    bytes: [u8; EDID_DATA_LENGTH],
+    bytes: Vec<u8>,
 }
 
 impl EdidBytes {
     /// Creates a virtual EDID block.
     pub fn new(info: &DisplayInfo) -> VirtioGpuResult {
-        let mut edid: [u8; EDID_DATA_LENGTH] = [0; EDID_DATA_LENGTH];
+        let clock = pixel_clock_10khz(info).ok_or_else(|| {
+            ErrEdid("Display timing is outside the DisplayID type-I encoding".to_owned())
+        })?;
+        let legacy = info.width() <= 0xfff && info.height() <= 0xfff && clock <= u16::MAX as u32;
+        let mut edid = vec![
+            0;
+            if legacy {
+                EDID_DATA_LENGTH
+            } else {
+                EDID_DATA_LENGTH * 2
+            }
+        ];
 
         populate_header(&mut edid);
         populate_edid_version(&mut edid);
@@ -49,10 +59,36 @@ impl EdidBytes {
 
         // 4 available descriptor blocks
         let block0 = &mut edid[54..72];
-        populate_detailed_timing(block0, info);
+        if legacy {
+            populate_detailed_timing(block0, info, clock as u16);
+        } else {
+            // Keep a valid legacy recovery timing; the configured preferred mode
+            // lives in DisplayID with its full pixel clock and geometry.
+            let mut fallback = *info;
+            if fallback.width() > 0xfff || fallback.height() > 0xfff {
+                fallback.resolution = Resolution::new(1920, 1080);
+            }
+            fallback.refresh_rate = 60;
+            let fallback_clock = pixel_clock_10khz(&fallback).unwrap();
+            if fallback_clock > u16::MAX as u32 {
+                fallback.resolution = Resolution::new(1920, 1080);
+            }
+            populate_detailed_timing(
+                block0,
+                &fallback,
+                pixel_clock_10khz(&fallback).unwrap() as u16,
+            );
+            edid[126] = 1;
+            populate_displayid(&mut edid[128..256], info, clock);
+        }
 
         let block1 = &mut edid[72..90];
         populate_display_name(block1);
+        // An unused descriptor must use the Dummy Descriptor tag. An all-zero
+        // descriptor is malformed and can cause an otherwise valid EDID to
+        // fail monitor validation.
+        edid[93] = 0x10;
+        edid[111] = 0x10;
 
         calculate_checksum(&mut edid);
 
@@ -173,7 +209,95 @@ fn populate_display_name(edid_block: &mut [u8]) {
     edid_block[5..].clone_from_slice("CrosvmDisplay".as_bytes());
 }
 
-fn populate_detailed_timing(edid_block: &mut [u8], info: &DisplayInfo) {
+// EDID DTD uses 16-bit 10kHz units. DisplayID type-I uses 24-bit units minus
+// one. Widen BEFORE multiplication and round once at the actual 10kHz unit.
+fn pixel_clock_10khz(info: &DisplayInfo) -> Option<u32> {
+    if info.width() == 0
+        || info.height() == 0
+        || info.width() > 65536
+        || info.height() > 65536
+        || info.refresh_rate == 0
+    {
+        return None;
+    }
+    let htotal = u64::from(info.width()) + u64::from(info.horizontal_blanking);
+    let vtotal = u64::from(info.height()) + u64::from(info.vertical_blanking);
+    let clock = (u64::from(info.refresh_rate)
+        .checked_mul(htotal)?
+        .checked_mul(vtotal)?
+        .checked_add(5000)?)
+        / 10000;
+    if clock == 0 || clock > 0x1000000 {
+        None
+    } else {
+        Some(clock as u32)
+    }
+}
+
+fn populate_displayid(extension: &mut [u8], info: &DisplayInfo, clock: u32) {
+    // DisplayID 1.3 standalone virtual display. Keep product identity equal to
+    // the base EDID, describe the configured geometry, and advertise only the
+    // RGB8 virtual interface. No physical connector, HDR or audio is implied.
+    // Block payload lengths exclude their three-byte headers.
+    extension[0..5].copy_from_slice(&[0x70, 0x13, 79, 3, 0]);
+    let product = &mut extension[5..33];
+    product[0..3].copy_from_slice(&[0, 0, 25]);
+    product[3..6].copy_from_slice(b"GGL");
+    product[6..8].copy_from_slice(&1u16.to_le_bytes());
+    product[8..12].copy_from_slice(&1u32.to_le_bytes());
+    product[12..15].copy_from_slice(&[8, 22, 13]); // same week/year/name as base
+    product[15..28].copy_from_slice(b"CrosvmDisplay");
+
+    let parameters = &mut extension[33..48];
+    parameters[0..3].copy_from_slice(&[1, 0, 12]);
+    for (offset, size) in [(3, info.width_millimeters), (5, info.height_millimeters)] {
+        // Zero means unspecified when the inherited DPI-derived size cannot
+        // fit DisplayID's 0.1mm field; do not wrap into another physical size.
+        let tenths = u16::try_from(u32::from(size) * 10).unwrap_or(0);
+        parameters[offset..offset + 2].copy_from_slice(&tenths.to_le_bytes());
+    }
+    if info.width() <= u16::MAX as u32 && info.height() <= u16::MAX as u32 {
+        parameters[7..9].copy_from_slice(&(info.width() as u16).to_le_bytes());
+        parameters[9..11].copy_from_slice(&(info.height() as u16).to_le_bytes());
+    }
+    parameters[12] = 0xff; // transfer characteristics are unspecified
+    parameters[13] = ((u64::from(info.width()) * 100 / u64::from(info.height()))
+        .saturating_sub(100))
+    .min(255) as u8;
+    parameters[14] = 0x77; // eight bits per component, native and overall
+
+    extension[48..51].copy_from_slice(&[3, 0, 20]);
+    let d = &mut extension[51..71];
+    let encoded_clock = clock - 1;
+    d[0..3].copy_from_slice(&encoded_clock.to_le_bytes()[0..3]);
+    d[3] = 0x88; // preferred, progressive, no stereo, undefined aspect ratio
+    for (offset, value) in [
+        (4, info.width()),
+        (6, u32::from(info.horizontal_blanking)),
+        (8, u32::from(info.horizontal_front)),
+        (10, u32::from(info.horizontal_sync)),
+        (12, info.height()),
+        (14, u32::from(info.vertical_blanking)),
+        (16, u32::from(info.vertical_front)),
+        (18, u32::from(info.vertical_sync)),
+    ] {
+        d[offset..offset + 2].copy_from_slice(&((value - 1) as u16).to_le_bytes());
+    }
+    d[9] |= 0x80; // positive horizontal sync
+    d[17] |= 0x80; // positive vertical sync
+                   // Display Interface block: proprietary digital, one virtual link, no
+                   // standard version or content protection, RGB8 only (no YCbCr modes).
+    extension[71..84].copy_from_slice(&[0x0f, 0, 10, 0xb1, 0, 2, 0, 0, 0, 0, 0, 0, 0]);
+    // Section checksum excludes tag 0x70; EDID checksum covers all 128 bytes.
+    extension[84] = 0u8.wrapping_sub(
+        extension[1..84]
+            .iter()
+            .fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+    );
+    calculate_checksum(extension);
+}
+
+fn populate_detailed_timing(edid_block: &mut [u8], info: &DisplayInfo, clock: u16) {
     assert_eq!(edid_block.len(), 18);
 
     // Detailed timings
@@ -203,7 +327,7 @@ fn populate_detailed_timing(edid_block: &mut [u8], info: &DisplayInfo) {
     //   vtotal - Total lines
     //   htotal - Total pixels per line
     //
-    // Value here is pixel clock + 10,000, in 10khz steps.
+    // Value here is pixel clock divided by10,000, in10kHz steps.
     //
     // Pseudocode of kernel logic for vrefresh:
     //    vtotal := mode->vtotal;
@@ -213,11 +337,6 @@ fn populate_detailed_timing(edid_block: &mut [u8], info: &DisplayInfo) {
     //    if flags & DBLSCAN: refresh /= 2
     //    if vscan > 1: refresh /= vscan
     //
-    let htotal = info.width() + (info.horizontal_blanking as u32);
-    let vtotal = info.height() + (info.vertical_blanking as u32);
-    let mut clock: u16 = ((info.refresh_rate * htotal * vtotal) / 10000) as u16;
-    // Round to nearest 10khz.
-    clock = ((clock + 5) / 10) * 10;
     edid_block[0..2].copy_from_slice(&clock.to_le_bytes());
 
     let width_lsb: u8 = (info.width() & 0xFF) as u8;
@@ -378,4 +497,88 @@ fn calculate_checksum(edid: &mut [u8]) {
     }
 
     edid[127] = checksum;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(width: u32, height: u32, refresh_rate: u32) -> DisplayInfo {
+        DisplayInfo {
+            resolution: Resolution::new(width, height),
+            refresh_rate,
+            horizontal_blanking: DEFAULT_HORIZONTAL_BLANKING,
+            vertical_blanking: DEFAULT_VERTICAL_BLANKING,
+            horizontal_front: DEFAULT_HORIZONTAL_FRONT_PORCH,
+            vertical_front: DEFAULT_VERTICAL_FRONT_PORCH,
+            horizontal_sync: DEFAULT_HORIZONTAL_SYNC_PULSE,
+            vertical_sync: DEFAULT_VERTICAL_SYNC_PULSE,
+            width_millimeters: 300,
+            height_millimeters: 200,
+        }
+    }
+
+    fn bytes(info: &DisplayInfo) -> Vec<u8> {
+        match EdidBytes::new(info).unwrap() {
+            OkEdid(edid) => edid.as_bytes().to_vec(),
+            _ => panic!("missing EDID"),
+        }
+    }
+
+    #[test]
+    fn reported_7183hz_wrap_is_replaced_by_full_displayid_clock() {
+        let edid = bytes(&info(3040, 1904, 165));
+        assert_eq!(edid.len(), 256);
+        assert_eq!(edid[126], 1);
+        assert_eq!(&edid[128..133], &[0x70, 0x13, 79, 3, 0]);
+        assert_eq!(&edid[176..179], &[3, 0, 20]);
+        let units =
+            1 + u32::from(edid[179]) + (u32::from(edid[180]) << 8) + (u32::from(edid[181]) << 16);
+        assert_eq!(units * 10000, 1_160_680_000);
+        assert_ne!(u16::from_le_bytes([edid[54], edid[55]]), 50530);
+        for block in edid.chunks_exact(128) {
+            assert_eq!(
+                block.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+                0
+            );
+        }
+        assert_eq!(
+            edid[129..213]
+                .iter()
+                .fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+            0
+        );
+    }
+
+    #[test]
+    fn legacy_clock_quantizes_once_and_does_not_overflow_rounding() {
+        let edid = bytes(&info(1920, 1080, 165));
+        assert_eq!(edid.len(), 128);
+        assert_eq!(u16::from_le_bytes([edid[54], edid[55]]), 46240);
+        let mut edge = info(640, 480, 1);
+        edge.horizontal_blanking = 1;
+        edge.vertical_blanking = 1;
+        // Exact10kHz boundary and values that used to overflow clock+5.
+        for units in [65530u16, 65531, 65534, 65535] {
+            let mut dtd = [0; 18];
+            populate_detailed_timing(&mut dtd, &edge, units);
+            assert_eq!(u16::from_le_bytes([dtd[0], dtd[1]]), units);
+        }
+        assert_eq!(pixel_clock_10khz(&info(3040, 1904, 93)), Some(65420));
+        assert_eq!(bytes(&info(3040, 1904, 93)).len(), 128);
+        assert_eq!(bytes(&info(3040, 1904, 94)).len(), 256);
+    }
+
+    #[test]
+    fn high_geometry_and_wide_multiplication_remain_exact() {
+        let edid = bytes(&info(7680, 4320, 240));
+        assert_eq!(edid.len(), 256);
+        let units = pixel_clock_10khz(&info(7680, 4320, 240)).unwrap();
+        assert_eq!(u64::from(units) * 10000, 8_642_110_000);
+        assert_eq!(pixel_clock_10khz(&info(0, 1080, 60)), None);
+        assert_eq!(pixel_clock_10khz(&info(1920, 1080, 0)), None);
+        assert_eq!(pixel_clock_10khz(&info(u32::MAX, 1080, 60)), None);
+        assert_eq!(pixel_clock_10khz(&info(65536, 65536, u32::MAX)), None);
+        assert!(EdidBytes::new(&info(65537, 1080, 60)).is_err());
+    }
 }

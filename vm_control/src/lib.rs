@@ -469,6 +469,25 @@ impl VmMemorySource {
         gralloc: &mut RutabagaGralloc,
         prot: Protection,
     ) -> Result<(Box<dyn MappedRegion>, u64, Option<SafeDescriptor>)> {
+        self.map_inner(Some(gralloc), prot)
+    }
+
+    /// Map a source that does not require renderer-specific gralloc state.
+    ///
+    /// This is used for immutable PCI BAR backing installed by the VMM before device workers and
+    /// the VM memory control loop start. Vulkan imports remain a runtime-only operation.
+    pub fn map_without_gralloc(
+        self,
+        prot: Protection,
+    ) -> Result<(Box<dyn MappedRegion>, u64, Option<SafeDescriptor>)> {
+        self.map_inner(None, prot)
+    }
+
+    fn map_inner(
+        self,
+        gralloc: Option<&mut RutabagaGralloc>,
+        prot: Protection,
+    ) -> Result<(Box<dyn MappedRegion>, u64, Option<SafeDescriptor>)> {
         let (mem_region, size, descriptor) = match self {
             VmMemorySource::Descriptor {
                 descriptor,
@@ -491,6 +510,10 @@ impl VmMemorySource {
                 driver_uuid,
                 size,
             } => {
+                let gralloc = match gralloc {
+                    Some(gralloc) => gralloc,
+                    None => return Err(SysError::new(ENOTSUP)),
+                };
                 let device_id = DeviceId {
                     device_uuid,
                     driver_uuid,
@@ -674,7 +697,13 @@ fn drive_guest_accept(
 pub enum VmMemoryRequest {
     /// Prepare a shared memory region to make later operations more efficient. This
     /// may be a no-op depending on underlying platform support.
-    PrepareSharedMemoryRegion { alloc: Alloc, cache: MemCacheType },
+    PrepareSharedMemoryRegion {
+        alloc: Alloc,
+        cache: MemCacheType,
+        /// Optional immutable backing installed before the VM starts. `None` preserves the
+        /// ordinary anonymous arena whose individual mappings are populated lazily.
+        source: Option<VmMemorySource>,
+    },
     /// Register a memory to be mapped to the guest.
     RegisterMemory {
         /// Source of the memory to register (mapped file descriptor, shared memory region, etc.)
@@ -757,14 +786,34 @@ enum RegisteredMemory {
 }
 
 pub struct VmMappedMemoryRegion {
+    allocation: Alloc,
     guest_address: GuestAddress,
     slot: MemSlot,
+    allocation_offset: u64,
+    size: usize,
+    /// Eager boot backing cannot be replaced after its stage-2 mapping is installed.
+    immutable: bool,
 }
 
 #[derive(Default)]
 pub struct VmMemoryRegionState {
     mapped_regions: HashMap<Alloc, VmMappedMemoryRegion>,
     registered_memory: BTreeMap<VmMemoryRegionId, RegisteredMemory>,
+}
+
+impl VmMemoryRegionState {
+    /// Seed the handler with mappings installed before its control thread started.
+    pub fn with_mapped_regions(
+        mapped_regions: impl IntoIterator<Item = VmMappedMemoryRegion>,
+    ) -> Self {
+        Self {
+            mapped_regions: mapped_regions
+                .into_iter()
+                .map(|region| (region.allocation, region))
+                .collect(),
+            registered_memory: BTreeMap::new(),
+        }
+    }
 }
 
 fn try_map_to_prepared_region(
@@ -785,22 +834,41 @@ fn try_map_to_prepared_region(
     let VmMappedMemoryRegion {
         guest_address,
         slot,
+        allocation_offset,
+        size: mapped_size,
+        immutable,
+        ..
     } = region_state.mapped_regions.get(allocation)?;
 
-    let (descriptor, file_offset, size) = match source {
+    let source_size = match source {
+        VmMemorySource::Descriptor { size, .. }
+        | VmMemorySource::Vulkan { size, .. }
+        | VmMemorySource::ExternalMapping { size, .. } => *size,
+        VmMemorySource::SharedMemory(shm) => shm.size(),
+    };
+    let (local_offset, size) = match prepared_region_mapping(
+        *allocation_offset,
+        *mapped_size,
+        *immutable,
+        *dest_offset,
+        source_size,
+    ) {
+        Ok(Some(range)) => range,
+        // A disjoint mapping must register its own actual backing with the
+        // hypervisor. Replacing only a userspace VA cannot replace an eager
+        // Gunyah stage-2 mapping, and an independent BAR suffix is not part of
+        // the prepared control arena.
+        Ok(None) => return None,
+        Err(()) => return Some(VmMemoryResponse::Err(SysError::new(EINVAL))),
+    };
+
+    let (descriptor, file_offset) = match source {
         VmMemorySource::Descriptor {
             descriptor,
             offset,
-            size,
-        } => (
-            Descriptor(descriptor.as_raw_descriptor()),
-            *offset,
-            *size as usize,
-        ),
-        VmMemorySource::SharedMemory(shm) => {
-            let size = shm.size() as usize;
-            (Descriptor(shm.as_raw_descriptor()), 0, size)
-        }
+            ..
+        } => (Descriptor(descriptor.as_raw_descriptor()), *offset),
+        VmMemorySource::SharedMemory(shm) => (Descriptor(shm.as_raw_descriptor()), 0),
         _ => {
             error!(
                 "source {} is not compatible with fixed mapping into prepared memory region",
@@ -809,24 +877,25 @@ fn try_map_to_prepared_region(
             return Some(VmMemoryResponse::Err(SysError::new(EINVAL)));
         }
     };
-    if let Err(err) = vm.add_fd_mapping(
-        *slot,
-        *dest_offset as usize,
-        size,
-        &descriptor,
-        file_offset,
-        *prot,
-    ) {
+    if let Err(err) = vm.add_fd_mapping(*slot, local_offset, size, &descriptor, file_offset, *prot)
+    {
         return Some(VmMemoryResponse::Err(err));
     }
 
-    let guest_address = GuestAddress(guest_address.0 + dest_offset);
+    let local_offset_u64 = match u64::try_from(local_offset) {
+        Ok(offset) => offset,
+        Err(_) => return Some(VmMemoryResponse::Err(SysError::new(ERANGE))),
+    };
+    let guest_address = match guest_address.0.checked_add(local_offset_u64) {
+        Some(address) => GuestAddress(address),
+        None => return Some(VmMemoryResponse::Err(SysError::new(ERANGE))),
+    };
     let region_id = VmMemoryRegionId(guest_address);
     region_state.registered_memory.insert(
         region_id,
         RegisteredMemory::FixedMapping {
             slot: *slot,
-            offset: *dest_offset as usize,
+            offset: local_offset,
             size,
         },
     );
@@ -836,6 +905,50 @@ fn try_map_to_prepared_region(
         slot: *slot,
         accept_handle: None,
     })
+}
+
+/// Select a fixed remap or an independent mapping without changing eager
+/// backing. Overlapping eager requests fail even when entirely contained;
+/// the device publishes offsets into those existing pages without a remap.
+fn prepared_region_mapping(
+    allocation_offset: u64,
+    mapped_size: usize,
+    immutable: bool,
+    destination_offset: u64,
+    source_size: u64,
+) -> std::result::Result<Option<(usize, usize)>, ()> {
+    if source_size == 0 {
+        return Err(());
+    }
+    if immutable {
+        let prepared_end = allocation_offset
+            .checked_add(mapped_size as u64)
+            .ok_or(())?;
+        let requested_end = destination_offset.checked_add(source_size).ok_or(())?;
+        if destination_offset < prepared_end && allocation_offset < requested_end {
+            return Err(());
+        }
+        return Ok(None);
+    }
+    prepared_region_local_range(allocation_offset, mapped_size, destination_offset, source_size)
+        .map(Some)
+        .ok_or(())
+}
+
+/// Converts an allocation-relative destination into the local offset of a prepared mapping and
+/// checks that the source fits in the prepared extent. Keeping this arithmetic separate makes
+/// the fixed-map contract testable without constructing a hypervisor implementation.
+fn prepared_region_local_range(
+    allocation_offset: u64,
+    mapped_size: usize,
+    destination_offset: u64,
+    source_size: u64,
+) -> Option<(usize, usize)> {
+    let local_offset = destination_offset
+        .checked_sub(allocation_offset)
+        .and_then(|offset| usize::try_from(offset).ok())?;
+    let size = usize::try_from(source_size).ok()?;
+    (size <= mapped_size.checked_sub(local_offset)?).then_some((local_offset, size))
 }
 
 impl VmMemoryRequest {
@@ -860,7 +973,11 @@ impl VmMemoryRequest {
     ) -> VmMemoryResponse {
         use self::VmMemoryRequest::*;
         match self {
-            PrepareSharedMemoryRegion { alloc, cache } => {
+            PrepareSharedMemoryRegion {
+                alloc,
+                cache,
+                source,
+            } => {
                 // Currently the iommu_client is only used by virtio-gpu when used alongside GPU
                 // pci-passthrough.
                 //
@@ -874,7 +991,14 @@ impl VmMemoryRequest {
                     return VmMemoryResponse::Ok;
                 }
 
-                match sys::prepare_shared_memory_region(vm, sys_allocator, alloc, cache) {
+                let source = match source {
+                    Some(source) => match source.map(gralloc, Protection::read_write()) {
+                        Ok((region, _, _)) => Some(region),
+                        Err(e) => return VmMemoryResponse::Err(e),
+                    },
+                    None => None,
+                };
+                match sys::prepare_shared_memory_region(vm, sys_allocator, alloc, cache, source) {
                     Ok(region) => {
                         region_state.mapped_regions.insert(alloc, region);
                         VmMemoryResponse::Ok
@@ -952,50 +1076,51 @@ impl VmMemoryRequest {
                 // which drives the guest accept itself. `Sync` consumes the handle HERE: the
                 // in-VM accept module performs the accept over the virtio-gunyah-accept
                 // transport before we return, so the caller sees plain upstream semantics.
-                let (accept_handle, guest_synced, guest_accept_handle) = match (vm_accept, accept_handle) {
-                    (VmAccept::Sync, Some(handle)) => {
-                        let Some(accept_tube) = gunyah_accept_tube else {
-                            error!(
-                                "VmAccept::Sync attach at {:#x} but no virtio-gunyah-accept \
+                let (accept_handle, guest_synced, guest_accept_handle) =
+                    match (vm_accept, accept_handle) {
+                        (VmAccept::Sync, Some(handle)) => {
+                            let Some(accept_tube) = gunyah_accept_tube else {
+                                error!(
+                                    "VmAccept::Sync attach at {:#x} but no virtio-gunyah-accept \
                                  transport is wired up; failing",
-                                guest_addr.offset()
+                                    guest_addr.offset()
+                                );
+                                let _ = vm.runtime_unshare(guest_addr, slot, VmAccept::Off);
+                                return VmMemoryResponse::Err(SysError::new(ENODEV));
+                            };
+                            let accepted = drive_guest_accept(
+                                accept_tube,
+                                GunyahAcceptOp::Accept,
+                                handle,
+                                guest_addr.offset(),
+                                size,
                             );
-                            let _ = vm.runtime_unshare(guest_addr, slot, VmAccept::Off);
-                            return VmMemoryResponse::Err(SysError::new(ENODEV));
-                        };
-                        let accepted = drive_guest_accept(
-                            accept_tube,
-                            GunyahAcceptOp::Accept,
-                            handle,
-                            guest_addr.offset(),
-                            size,
-                        );
-                        // The VMM's own pin over this region has done its job either way: the
-                        // hypervisor owns the memory now, and on the failure path we are about
-                        // to hand it back. Release it before the unshare so the reclaim has a
-                        // single owner to wait for.
-                        vm.release_share_pin(guest_addr);
-                        if let Err(e) = accepted {
-                            // The guest never accepted; reclaim the SHARE and fail the attach.
-                            let _ = vm.runtime_unshare(guest_addr, slot, VmAccept::Off);
-                            return VmMemoryResponse::Err(e);
+                            // The VMM's own pin over this region has done its job either way: the
+                            // hypervisor owns the memory now, and on the failure path we are about
+                            // to hand it back. Release it before the unshare so the reclaim has a
+                            // single owner to wait for.
+                            vm.release_share_pin(guest_addr);
+                            if let Err(e) = accepted {
+                                // The guest never accepted; reclaim the SHARE and fail the attach.
+                                let _ = vm.runtime_unshare(guest_addr, slot, VmAccept::Off);
+                                return VmMemoryResponse::Err(e);
+                            }
+                            (None, true, Some(handle))
                         }
-                        (None, true, Some(handle))
-                    }
-                    (VmAccept::Async, Some(_)) => {
-                        error!("VmAccept::Async transport not implemented");
-                        let _ = vm.runtime_unshare(guest_addr, slot, VmAccept::Off);
-                        return VmMemoryResponse::Err(SysError::new(ENOTSUP));
-                    }
-                    // Off (caller-driven), or no handle needed (plain memslot hypervisors).
-                    // The caller drives the accept out of band, so there is no point at which we
-                    // could release the pin later; the hypervisor already holds its own from the
-                    // SHARE, which is what the probe existed to guarantee.
-                    (_, handle) => {
-                        vm.release_share_pin(guest_addr);
-                        (handle, false, None)
-                    }
-                };
+                        (VmAccept::Async, Some(_)) => {
+                            error!("VmAccept::Async transport not implemented");
+                            let _ = vm.runtime_unshare(guest_addr, slot, VmAccept::Off);
+                            return VmMemoryResponse::Err(SysError::new(ENOTSUP));
+                        }
+                        // Off (caller-driven), or no handle needed (plain memslot hypervisors).
+                        // The caller drives the accept out of band, so there is no point at which we
+                        // could release the pin later; the hypervisor already holds its own from the
+                        // SHARE, which is what the probe existed to guarantee.
+                        (_, handle) => {
+                            vm.release_share_pin(guest_addr);
+                            (handle, false, None)
+                        }
+                    };
 
                 let region_id = VmMemoryRegionId(guest_addr);
                 if let (Some(descriptor), Some(iommu_client)) = (descriptor, iommu_client) {
@@ -1215,79 +1340,80 @@ impl VmMemoryRequest {
                             VmAccept::Off
                         },
                     ) {
-                    Ok(_) => {
-                        if let Some(iommu_client) = iommu_client {
-                            if iommu_client.registered_memory.remove(&id) {
-                                let request = VirtioIOMMURequest::VfioCommand(
-                                    VirtioIOMMUVfioCommand::VfioDmabufUnmap(id),
-                                );
+                        Ok(_) => {
+                            if let Some(iommu_client) = iommu_client {
+                                if iommu_client.registered_memory.remove(&id) {
+                                    let request = VirtioIOMMURequest::VfioCommand(
+                                        VirtioIOMMUVfioCommand::VfioDmabufUnmap(id),
+                                    );
 
-                                match virtio_iommu_request(&iommu_client.tube.lock(), &request) {
-                                    Ok(VirtioIOMMUResponse::VfioResponse(
-                                        VirtioIOMMUVfioResult::Ok,
-                                    )) => VmMemoryResponse::Ok,
-                                    resp => {
-                                        error!("Unexpected message response: {:?}", resp);
-                                        VmMemoryResponse::Err(SysError::new(EINVAL))
+                                    match virtio_iommu_request(&iommu_client.tube.lock(), &request)
+                                    {
+                                        Ok(VirtioIOMMUResponse::VfioResponse(
+                                            VirtioIOMMUVfioResult::Ok,
+                                        )) => VmMemoryResponse::Ok,
+                                        resp => {
+                                            error!("Unexpected message response: {:?}", resp);
+                                            VmMemoryResponse::Err(SysError::new(EINVAL))
+                                        }
                                     }
+                                } else {
+                                    VmMemoryResponse::Ok
                                 }
                             } else {
                                 VmMemoryResponse::Ok
                             }
-                        } else {
-                            VmMemoryResponse::Ok
                         }
-                    }
-                    Err(e) => {
-                        // The guest-side release, when required, has already completed. Restore
-                        // the acceptance before returning the error; otherwise the guest would
-                        // keep treating this suffix as backed and could access an unmapped GPA.
-                        let mut guest_restore_failed = false;
-                        if !guest_synced {
-                            if let (Some(handle), Some(accept_tube)) =
-                                (guest_accept_handle, gunyah_accept_tube)
-                            {
-                                match drive_guest_accept(
-                                    accept_tube,
-                                    GunyahAcceptOp::Accept,
-                                    handle,
-                                    id.0.offset(),
-                                    size,
-                                ) {
-                                    Ok(()) => guest_synced = true,
-                                    Err(restore_err) => error!(
-                                        "failed to restore guest acceptance for {:#x} after \
+                        Err(e) => {
+                            // The guest-side release, when required, has already completed. Restore
+                            // the acceptance before returning the error; otherwise the guest would
+                            // keep treating this suffix as backed and could access an unmapped GPA.
+                            let mut guest_restore_failed = false;
+                            if !guest_synced {
+                                if let (Some(handle), Some(accept_tube)) =
+                                    (guest_accept_handle, gunyah_accept_tube)
+                                {
+                                    match drive_guest_accept(
+                                        accept_tube,
+                                        GunyahAcceptOp::Accept,
+                                        handle,
+                                        id.0.offset(),
+                                        size,
+                                    ) {
+                                        Ok(()) => guest_synced = true,
+                                        Err(restore_err) => error!(
+                                            "failed to restore guest acceptance for {:#x} after \
                                          host unshare failure ({}); mapping remains unavailable \
                                          to the guest",
-                                        id.0.offset(),
-                                        restore_err
-                                    ),
+                                            id.0.offset(),
+                                            restore_err
+                                        ),
+                                    }
+                                } else if guest_accept_handle.is_some() {
+                                    guest_restore_failed = true;
                                 }
-                            } else if guest_accept_handle.is_some() {
+                            }
+                            if guest_accept_handle.is_some() && !guest_synced {
+                                // EUCLEAN is a private crosvm/guest-driver contract: the host
+                                // mapping is retained for retry, but the guest stage-2 mapping could
+                                // not be restored. The guest must stop using this suffix.
                                 guest_restore_failed = true;
                             }
+                            region_state.registered_memory.insert(
+                                id,
+                                RegisteredMemory::DynamicMapping {
+                                    slot,
+                                    guest_synced,
+                                    guest_accept_handle,
+                                    size,
+                                },
+                            );
+                            VmMemoryResponse::Err(if guest_restore_failed {
+                                SysError::new(EUCLEAN)
+                            } else {
+                                e
+                            })
                         }
-                        if guest_accept_handle.is_some() && !guest_synced {
-                            // EUCLEAN is a private crosvm/guest-driver contract: the host
-                            // mapping is retained for retry, but the guest stage-2 mapping could
-                            // not be restored. The guest must stop using this suffix.
-                            guest_restore_failed = true;
-                        }
-                        region_state.registered_memory.insert(
-                            id,
-                            RegisteredMemory::DynamicMapping {
-                                slot,
-                                guest_synced,
-                                guest_accept_handle,
-                                size,
-                            },
-                        );
-                        VmMemoryResponse::Err(if guest_restore_failed {
-                            SysError::new(EUCLEAN)
-                        } else {
-                            e
-                        })
-                    }
                     }
                 }
                 Some(RegisteredMemory::FixedMapping { slot, offset, size }) => {
@@ -3096,4 +3222,153 @@ pub fn virtio_iommu_request(
         resp => resp,
     };
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GUARD: u64 = 2 << 20;
+    const SUFFIX_SIZE: usize = 6 << 20;
+
+    #[test]
+    fn eager_backing_rejects_replacement_and_partial_overlap() {
+        for (offset, size) in [
+            (GUARD, 4096),
+            (GUARD + 4096, 4096),
+            (GUARD - 4096, 8192),
+            (GUARD + SUFFIX_SIZE as u64 - 4096, 8192),
+            (0, GUARD + SUFFIX_SIZE as u64),
+        ] {
+            assert_eq!(
+                prepared_region_mapping(GUARD, SUFFIX_SIZE, true, offset, size),
+                Err(())
+            );
+        }
+    }
+
+    #[test]
+    fn eager_backing_allows_independent_adjacent_mappings() {
+        assert_eq!(
+            prepared_region_mapping(GUARD, SUFFIX_SIZE, true, 0, GUARD),
+            Ok(None)
+        );
+        assert_eq!(
+            prepared_region_mapping(GUARD, SUFFIX_SIZE, true, 8 << 20, 25 << 20),
+            Ok(None)
+        );
+        assert_eq!(
+            prepared_region_mapping(GUARD, SUFFIX_SIZE, true, 96 << 20, 25 << 20),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn eager_backing_rejects_invalid_extent() {
+        assert_eq!(
+            prepared_region_mapping(GUARD, SUFFIX_SIZE, true, 8 << 20, 0),
+            Err(())
+        );
+        assert_eq!(
+            prepared_region_mapping(GUARD, SUFFIX_SIZE, true, u64::MAX, 4096),
+            Err(())
+        );
+        assert_eq!(
+            prepared_region_mapping(u64::MAX, 4096, true, 0, 4096),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn ordinary_prepared_arena_retains_fixed_map_contract() {
+        assert_eq!(
+            prepared_region_mapping(0, SUFFIX_SIZE, false, 4096, 8192),
+            Ok(Some((4096, 8192)))
+        );
+        assert_eq!(
+            prepared_region_mapping(0, SUFFIX_SIZE, false, SUFFIX_SIZE as u64, 4096),
+            Err(())
+        );
+        assert_eq!(
+            prepared_region_mapping(GUARD, SUFFIX_SIZE, false, 0, 4096),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn prepared_region_range_translates_bar_offset() {
+        assert_eq!(
+            prepared_region_local_range(GUARD, SUFFIX_SIZE, GUARD, 4096),
+            Some((0, 4096))
+        );
+        assert_eq!(
+            prepared_region_local_range(GUARD, SUFFIX_SIZE, GUARD + 0x123000, 0x2000),
+            Some((0x123000, 0x2000))
+        );
+    }
+
+    #[test]
+    fn prepared_region_range_rejects_before_start_and_crossing_end() {
+        assert_eq!(
+            prepared_region_local_range(GUARD, SUFFIX_SIZE, GUARD - 4096, 4096),
+            None
+        );
+        assert_eq!(
+            prepared_region_local_range(
+                GUARD,
+                SUFFIX_SIZE,
+                GUARD + SUFFIX_SIZE as u64 - 4096,
+                8192,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn prepared_region_range_rejects_unrepresentable_size() {
+        assert_eq!(
+            prepared_region_local_range(GUARD, SUFFIX_SIZE, GUARD, u64::MAX),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_source_offset_maps_expected_file_bytes() {
+        use std::io::Write;
+
+        let mut file = tempfile::tempfile().expect("create descriptor fixture");
+        file.write_all(&[0xa5; 4096])
+            .expect("write descriptor prefix");
+        let expected = [
+            0x2000_0001u32,
+            0x2000_0002u32,
+            0x2000_0003u32,
+            0x2000_0004u32,
+        ];
+        for word in expected {
+            file.write_all(&word.to_ne_bytes())
+                .expect("write descriptor header");
+        }
+
+        let source = VmMemorySource::Descriptor {
+            descriptor: file.into(),
+            offset: 4096,
+            size: 16,
+        };
+        let (mapping, size, _) = source
+            .map_without_gralloc(Protection::read())
+            .expect("map descriptor fixture");
+        assert_eq!(size, 16);
+
+        // SAFETY: `mapping` owns a readable 16-byte mapping for this assertion.
+        let mapped = unsafe { std::slice::from_raw_parts(mapping.as_ptr(), 16) };
+        for (index, word) in expected.iter().enumerate() {
+            let start = index * 4;
+            assert_eq!(
+                u32::from_ne_bytes(mapped[start..start + 4].try_into().unwrap()),
+                *word
+            );
+        }
+    }
 }

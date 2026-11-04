@@ -17,6 +17,7 @@ use base::named_pipes::MultiPartMessagePipe;
 use base::named_pipes::OverlappedWrapper;
 use base::Error;
 use base::Event;
+use base::MappedRegion;
 use base::PipeTube;
 use hypervisor::MemCacheType;
 use hypervisor::Vm;
@@ -127,6 +128,19 @@ pub fn prepare_shared_memory_region(
     _allocator: &mut SystemAllocator,
     _alloc: Alloc,
     _cache: MemCacheType,
+    _source: Option<Box<dyn MappedRegion>>,
+) -> std::result::Result<VmMappedMemoryRegion, Error> {
+    unimplemented!()
+}
+
+pub fn prepare_shared_memory_region_at_offset(
+    _vm: &mut dyn Vm,
+    _allocator: &mut SystemAllocator,
+    _alloc: Alloc,
+    _cache: MemCacheType,
+    _guest_offset: u64,
+    _source: Option<Box<dyn MappedRegion>>,
+    _immutable: bool,
 ) -> std::result::Result<VmMappedMemoryRegion, Error> {
     unimplemented!()
 }

@@ -1375,6 +1375,13 @@ pub struct RunCommand {
     /// voltage and frequency for calculating power; in units of uW/MHz/^2
     pub dynamic_power_coefficient: Option<BTreeMap<usize, u32>>,
 
+    #[argh(option, arg_name = "MB")]
+    #[serde(skip)]
+    #[merge(strategy = overwrite_option)]
+    /// size of the dedicated EDK2 preload pool in MiB; must be a multiple of 2
+    /// (default: 0 = disabled)
+    pub edk2_preload_mb: Option<u64>,
+
     #[argh(switch)]
     #[serde(skip)] // TODO(b/255223604)
     #[merge(strategy = overwrite_option)]
@@ -3239,6 +3246,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         cfg.scsis = cmd.scsi_block;
 
         cfg.pmems = cmd.pmem;
+        cfg.edk2_preload_mb = cmd.edk2_preload_mb;
         cfg.pre_alloc = cmd.pre_alloc;
 
         if !cmd.pmem_device.is_empty() || !cmd.rw_pmem_device.is_empty() {

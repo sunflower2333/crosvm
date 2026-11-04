@@ -4,7 +4,7 @@
 #[link(name = "virglrenderer")]
 extern "C" {}
 
-pub const VIRGL_RENDERER_CALLBACKS_VERSION: u32 = 4;
+pub const VIRGL_RENDERER_CALLBACKS_VERSION: u32 = 5;
 pub const VIRGL_RENDERER_USE_EGL: u32 = 1;
 pub const VIRGL_RENDERER_THREAD_SYNC: u32 = 2;
 pub const VIRGL_RENDERER_USE_GLX: u32 = 4;
@@ -39,6 +39,7 @@ pub const VIRGL_RENDERER_BLOB_MEM_GUEST_VRAM: u32 = 4;
 pub const VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE: u32 = 1;
 pub const VIRGL_RENDERER_BLOB_FLAG_USE_SHAREABLE: u32 = 2;
 pub const VIRGL_RENDERER_BLOB_FLAG_USE_CROSS_DEVICE: u32 = 4;
+pub const VIRGL_RENDERER_BLOB_FLAG_USE_NATIVE_AHB: u32 = 16;
 pub const VIRGL_RENDERER_BLOB_FLAG_USE_DUMB_BUFFER: u32 = 8;
 pub const VIRGL_RENDERER_MAP_CACHE_MASK: u32 = 15;
 pub const VIRGL_RENDERER_MAP_CACHE_NONE: u32 = 0;
@@ -112,6 +113,15 @@ pub struct virgl_renderer_callbacks {
     >,
     pub get_egl_display: ::std::option::Option<
         unsafe extern "C" fn(cookie: *mut ::std::os::raw::c_void) -> *mut ::std::os::raw::c_void,
+    >,
+    pub write_context_fence_error: ::std::option::Option<
+        unsafe extern "C" fn(
+            cookie: *mut ::std::os::raw::c_void,
+            ctx_id: u32,
+            ring_idx: u32,
+            fence_id: u64,
+            error: i32,
+        ),
     >,
 }
 extern "C" {

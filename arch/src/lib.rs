@@ -459,6 +459,8 @@ pub struct RunnableLinuxVm<V: VmArch, Vcpu: VcpuArch> {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     pub platform_devices: Vec<Arc<Mutex<dyn BusDevice>>>,
     pub pm: Option<Arc<Mutex<dyn PmResource + Send>>>,
+    /// PCI shared-memory mappings installed before the VM memory handler thread starts.
+    pub pre_mapped_memory_regions: Vec<vm_control::VmMappedMemoryRegion>,
     /// Devices to be notified before the system resumes from the S3 suspended state.
     pub resume_notify_devices: Vec<Arc<Mutex<dyn BusResumeDevice>>>,
     pub root_config: Arc<Mutex<PciRoot>>,
@@ -732,6 +734,9 @@ pub enum DeviceRegistrationError {
     /// Failed to insert device into PCI root.
     #[error("failed to insert device into PCI root: {0}")]
     PciRootAddDevice(PciDeviceError),
+    /// Failed to install device memory before the device starts.
+    #[error("failed to prepare PCI device memory: {0}")]
+    PrepareDeviceMemory(PciDeviceError),
     #[cfg(any(target_os = "android", target_os = "linux"))]
     /// Failed to initialize proxy device for jailed device.
     #[error("failed to create proxy device: {0}")]
@@ -793,7 +798,11 @@ pub fn configure_pci_device<V: VmArch, Vcpu: VcpuArch>(
     }
 
     // Do not suggest INTx for hot-plug devices.
-    let intx_event = devices::IrqLevelEvent::new().map_err(DeviceRegistrationError::EventCreate)?;
+    let intx_event = linux
+        .irq_chip
+        .as_irq_chip()
+        .new_level_irq_event()
+        .map_err(DeviceRegistrationError::EventCreate)?;
 
     if let PreferredIrq::Fixed { pin, gsi } = device.preferred_irq() {
         resources.reserve_irq(gsi);
@@ -996,6 +1005,7 @@ pub fn generate_pci_root(
         BTreeMap<u32, String>,
         BTreeMap<PciAddress, Vec<u8>>,
         BTreeMap<PciAddress, Vec<u8>>,
+        Vec<vm_control::VmMappedMemoryRegion>,
     ),
     DeviceRegistrationError,
 > {
@@ -1020,6 +1030,16 @@ pub fn generate_pci_root(
         &device_addrs,
         &mut devices,
     )?;
+
+    let mut pre_mapped_memory_regions = Vec::new();
+    for (device, _) in devices.iter_mut() {
+        if let Some(region) = device
+            .prepare_device_memory(vm, resources)
+            .map_err(DeviceRegistrationError::PrepareDeviceMemory)?
+        {
+            pre_mapped_memory_regions.push(region);
+        }
+    }
 
     let mut root = PciRoot::new(
         vm,
@@ -1096,8 +1116,9 @@ pub fn generate_pci_root(
         };
 
         if let Some((pin, gsi)) = irq {
-            let intx_event =
-                devices::IrqLevelEvent::new().map_err(DeviceRegistrationError::EventCreate)?;
+            let intx_event = irq_chip
+                .new_level_irq_event()
+                .map_err(DeviceRegistrationError::EventCreate)?;
 
             device.assign_irq(
                 intx_event
@@ -1216,7 +1237,14 @@ pub fn generate_pci_root(
         }
     }
 
-    Ok((root, pci_irqs, pid_labels, amls, gpe_scope_amls))
+    Ok((
+        root,
+        pci_irqs,
+        pid_labels,
+        amls,
+        gpe_scope_amls,
+        pre_mapped_memory_regions,
+    ))
 }
 
 /// Errors for image loading.

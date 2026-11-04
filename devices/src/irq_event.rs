@@ -56,6 +56,10 @@ pub struct IrqLevelEvent {
     /// unit of work and that device should re-raise `trigger_evt` if additional work needs to
     /// be done.
     resample_evt: Event,
+    /// Some IRQ chips acknowledge the line on delivery without generating an EOI resample.
+    /// Devices must signal every notification on such lines, even if their ISR is still set.
+    #[serde(default)]
+    auto_ack: bool,
 }
 
 impl IrqLevelEvent {
@@ -65,7 +69,19 @@ impl IrqLevelEvent {
         Ok(IrqLevelEvent {
             trigger_evt,
             resample_evt,
+            auto_ack: false,
         })
+    }
+
+    /// Create a line which the IRQ chip automatically acknowledges on delivery.
+    pub fn new_with_auto_ack() -> Result<IrqLevelEvent> {
+        let mut event = Self::new()?;
+        event.auto_ack = true;
+        Ok(event)
+    }
+
+    pub fn auto_ack(&self) -> bool {
+        self.auto_ack
     }
 
     pub fn try_clone(&self) -> Result<IrqLevelEvent> {
@@ -74,6 +90,7 @@ impl IrqLevelEvent {
         Ok(IrqLevelEvent {
             trigger_evt,
             resample_evt,
+            auto_ack: self.auto_ack,
         })
     }
 
@@ -82,6 +99,7 @@ impl IrqLevelEvent {
         IrqLevelEvent {
             trigger_evt,
             resample_evt,
+            auto_ack: false,
         }
     }
 

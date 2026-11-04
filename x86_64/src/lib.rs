@@ -747,7 +747,7 @@ fn write_setup_data(
 /// Generate a SETUP_RNG_SEED SetupData with random seed data.
 fn setup_data_rng_seed() -> SetupData {
     let mut data = vec![0u8; 256];
-    rand::rng().fill_bytes(&mut data);
+    OsRng.fill_bytes(&mut data);
     SetupData {
         data,
         type_: SetupDataType::RngSeed,
@@ -1041,7 +1041,14 @@ impl arch::LinuxArch for X8664arch {
             .map(|(dev, jail_orig)| (dev.into_pci_device().unwrap(), jail_orig))
             .collect();
 
-        let (pci, pci_irqs, pid_debug_label_map, amls, gpe_scope_amls) = arch::generate_pci_root(
+        let (
+            pci,
+            pci_irqs,
+            pid_debug_label_map,
+            amls,
+            gpe_scope_amls,
+            pre_mapped_memory_regions,
+        ) = arch::generate_pci_root(
             pci_devices,
             irq_chip.as_irq_chip_mut(),
             mmio_bus.clone(),
@@ -1396,6 +1403,7 @@ impl arch::LinuxArch for X8664arch {
             irq_chip: irq_chip.try_box_clone().map_err(Error::CloneIrqChip)?,
             io_bus,
             mmio_bus,
+            pre_mapped_memory_regions,
             pid_debug_label_map,
             suspend_tube: (suspend_tube_send, suspend_tube_recv),
             resume_notify_devices,

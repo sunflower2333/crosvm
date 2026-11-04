@@ -201,12 +201,37 @@ impl MsixConfig {
     /// Write to the MSI-X Capability Structure.
     /// Only the top 2 bits in Message Control Word are writable.
     pub fn write_msix_capability(&mut self, offset: u64, data: &[u8]) -> MsixStatus {
-        if offset == 2 && data.len() == 2 {
-            let reg = u16::from_le_bytes([data[0], data[1]]);
+        // PCI config-space accesses may cover the capability header and the
+        // Message Control field together (for example, a DWORD write at
+        // offset 0). Merge only bytes that overlap Message Control so the
+        // read-only header and table fields remain untouched. Preserve the
+        // other control byte for partial writes.
+        let control_start = 2u64;
+        let control_end = control_start + 2;
+        let write_end = offset.saturating_add(data.len() as u64);
+        if offset < control_end && write_end > control_start {
+            let mut reg = 0u16;
+            if self.masked {
+                reg |= FUNCTION_MASK_BIT;
+            }
+            if self.enabled {
+                reg |= MSIX_ENABLE_BIT;
+            }
+            for (index, byte) in data.iter().enumerate() {
+                let byte_offset = offset.saturating_add(index as u64);
+                if (control_start..control_end).contains(&byte_offset) {
+                    let shift = ((byte_offset - control_start) * 8) as u32;
+                    let mask = 0xffu16 << shift;
+                    reg = (reg & !mask) | (u16::from(*byte) << shift);
+                }
+            }
             let old_masked = self.masked;
             let old_enabled = self.enabled;
 
             self.masked = (reg & FUNCTION_MASK_BIT) == FUNCTION_MASK_BIT;
+            if old_masked != self.masked && self.device_name.contains("gpu") {
+                base::warn!("MSIX-FUNCTION-MASK: dev={} masked {} -> {}", self.device_name, old_masked, self.masked);
+            }
             self.enabled = (reg & MSIX_ENABLE_BIT) == MSIX_ENABLE_BIT;
 
             if !old_enabled && self.enabled {
@@ -230,7 +255,7 @@ impl MsixConfig {
             } else if !old_masked && self.masked {
                 return MsixStatus::Changed;
             }
-        } else {
+        } else if !data.is_empty() {
             error!(
                 "invalid write to MSI-X Capability Structure offset {:x}",
                 offset
@@ -538,6 +563,13 @@ impl MsixConfig {
         };
 
         let new_entry = self.table_entries[index].clone();
+        if old_entry.masked() != new_entry.masked() && self.device_name.contains("gpu") {
+            base::warn!(
+                "MSIX-MASK: dev={} vector={} masked {} -> {} pending={}",
+                self.device_name, index, old_entry.masked(), new_entry.masked(),
+                self.get_pba_bit(index as u16)
+            );
+        }
 
         // This MSI-X vector is enabled for the first time.
         if self.enabled()
@@ -690,6 +722,10 @@ impl MsixConfig {
     /// inject virtual interrupt to the guest.
     pub fn trigger(&mut self, vector: u16) {
         if self.table_entries[vector as usize].masked() || self.masked() {
+            if self.device_name.contains("gpu") {
+                base::warn!("MSIX-PENDING: dev={} vector={} entry_masked={} function_masked={}",
+                    self.device_name, vector, self.table_entries[vector as usize].masked(), self.masked());
+            }
             self.set_pba_bit(vector, true);
         } else if let Some(irq) = self.irq_vec.get(vector as usize).unwrap_or(&None) {
             irq.irqfd.signal().unwrap();
@@ -888,6 +924,34 @@ mod tests {
     #[track_caller]
     fn send_ok(t: &Tube) {
         t.send(&VmIrqResponse::Ok).unwrap();
+    }
+
+    #[test]
+    fn msix_control_accepts_header_spanning_and_partial_writes() {
+        let (_unused_irqchip, config_tube) = Tube::pair().unwrap();
+        let mut cfg = MsixConfig::new(2, config_tube, 0, "test_device".to_owned());
+
+        // Firmware commonly writes the capability header and Message Control
+        // as one DWORD. Only the control byte at offset 3 changes state.
+        assert!(matches!(
+            cfg.write_msix_capability(0, &[0, 0, 0, 0x40]),
+            MsixStatus::Changed
+        ));
+        assert!(cfg.masked());
+
+        // A byte write to the high control byte must have the same effect as
+        // the legacy two-byte access, while a low control byte write leaves
+        // the function mask unchanged.
+        assert!(matches!(
+            cfg.write_msix_capability(2, &[0]),
+            MsixStatus::NothingToDo
+        ));
+        assert!(cfg.masked());
+        assert!(matches!(
+            cfg.write_msix_capability(3, &[0]),
+            MsixStatus::Changed
+        ));
+        assert!(!cfg.masked());
     }
 
     /// Tests a cold restore where there are no existing vectors at the time

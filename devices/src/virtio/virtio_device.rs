@@ -29,6 +29,11 @@ pub enum SharedMemoryPrepareType {
     /// On first attempted mapping, the entire SharedMemoryRegion is configured with declared
     /// MemCacheType.
     SingleMappingOnFirst(MemCacheType),
+    /// Before the VM starts, back a fixed subrange of the SharedMemoryRegion with this source.
+    /// Later device commands only publish offsets into that immutable backing; they must not
+    /// replace its pages after the hypervisor has installed its stage-2 mapping. The offset is
+    /// relative to the BAR.
+    SingleMappingEager(MemCacheType, VmMemorySource, u64),
     /// No mapping preparation is performed. each mapping is handled individually
     DynamicPerMapping,
 }

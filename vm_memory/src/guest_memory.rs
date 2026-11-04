@@ -167,14 +167,12 @@ pub enum MemoryRegionPurpose {
     /// BIOS/firmware ROM
     Bios,
 
-    /// DroidVM: drm2kgsl native-context arena. A third SHARE-blessed pool, treated exactly like
-    /// GpuPool for access/bless/hugepage, that virglrenderer's drm2kgsl backend sub-allocates every
-    /// GPU BO from. Distinct from GpuPool so a build carrying both renderers cannot hand the
-    /// drm2kgsl arena to gfxstream's HostVisiblePool (which is handed any GpuPool region), so the
-    /// two can be sized independently, and so it gets its own `drm2kgsl_host` DT node.
+    /// DroidVM: drm2kgsl native-context host arena. The renderer sub-allocates control/response
+    /// shmem from it. Legacy guests see a SHARE-blessed `drm2kgsl_host` pool; the Gunyah
+    /// prebacked-BAR path keeps its original GPA hidden and maps these pages only through the
+    /// VirtIO-GPU PCI BAR. It remains distinct from GpuPool so gfxstream cannot consume it.
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     Drm2KgslPool,
-
 
     /// DroidVM: a GROWABLE test pool. Declared to the guest at its full size but SHARE'd only up
     /// to `pre_alloc_size` at boot; the rest is granted at runtime over virtio-gunyah-accept's
@@ -182,6 +180,12 @@ pub enum MemoryRegionPurpose {
     /// three production pools, which are all fully pre-shared and must stay that way.
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     DynamicTestPool,
+
+    /// DroidVM: memory accepted by EDK2 before Linux boots. The range starts with no boot-time
+    /// backing and is granted as one runtime SHARE over virtio-gunyah-accept. Firmware removes
+    /// only this pool's reserved-memory node after MEM_ACCEPT succeeds.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    Edk2PreloadPool,
 
     /// DroidVM: GPU pre-alloc pool (gfxstream HOST-visible pool). Appended after
     /// guest RAM, SHARE'd (not lent) at boot on protected Gunyah so the host renderer and the guest
@@ -360,9 +364,7 @@ impl MemoryRegionOptions {
     }
 
     /// Validate the pool parameters against a region size. Returns the reason it is not usable, so
-    /// the caller can refuse at configuration time rather than at first grant -- an invalid step
-    /// otherwise surfaces as drm_buddy returning -EINVAL inside the guest, which reads as a guest
-    /// driver bug rather than a command line mistake.
+    /// the caller can refuse at configuration time rather than at first grant.
     pub fn pool_param_error(&self, size: u64) -> Option<String> {
         const MIN_STEP: u64 = 2 << 20;
         let pre_alloc = self.pre_alloc_size.unwrap_or(size);
@@ -419,8 +421,14 @@ impl MemoryRegionOptions {
         //
         // The floor is also where the pool's identity lives: it is the range a driver may touch
         // without asking, and the node that carries the pool's name, id, step and total size.
+        // EDK2 preload is intentionally different: firmware owns its zero-floor node and accepts
+        // the complete window as one runtime parcel before exposing it to the operating system.
         const MIN_FLOOR: u64 = 2 << 20;
-        if pre_alloc < MIN_FLOOR {
+        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+        let allows_zero_floor = self.purpose == MemoryRegionPurpose::Edk2PreloadPool;
+        #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+        let allows_zero_floor = false;
+        if !allows_zero_floor && pre_alloc < MIN_FLOOR {
             return Some(format!(
                 "pre_alloc_size {:#x} is below the {:#x} minimum for a growable pool; the                  reserved-memory node has to describe a memparcel that really exists",
                 pre_alloc, MIN_FLOOR
@@ -1056,6 +1064,11 @@ impl GuestMemory {
             // step_size == 0 and answers yes everywhere.
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
             MemoryRegionPurpose::DynamicTestPool => {
+                self.check_pool_backed_range(region, guest_addr, 1)
+            }
+            // EDK2 may access this range only after its complete runtime grant is live.
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::Edk2PreloadPool => {
                 self.check_pool_backed_range(region, guest_addr, 1)
             }
             // The window of a pseudo-unprotected VM, and the page the shim is told about it
@@ -1780,6 +1793,35 @@ unsafe impl BackingMemory for GuestMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    #[test]
+    fn pool_steps_require_2m_multiples_not_powers_of_two() {
+        const MIB: u64 = 1 << 20;
+        let edk2 = MemoryRegionOptions::new()
+            .purpose(MemoryRegionPurpose::Edk2PreloadPool)
+            .growable_pool(0, 6 * MIB);
+        assert_eq!(edk2.pool_param_error(6 * MIB), None);
+
+        let gpu = MemoryRegionOptions::new()
+            .purpose(MemoryRegionPurpose::GpuPoolGuest)
+            .growable_pool(6 * MIB, 6 * MIB);
+        assert_eq!(gpu.pool_param_error(6 * MIB), None);
+
+        let zero_floor_gpu = MemoryRegionOptions::new()
+            .purpose(MemoryRegionPurpose::GpuPoolGuest)
+            .growable_pool(0, 6 * MIB);
+        assert!(zero_floor_gpu
+            .pool_param_error(6 * MIB)
+            .is_some_and(|error| error.contains("below the")));
+
+        let unaligned_edk2 = MemoryRegionOptions::new()
+            .purpose(MemoryRegionPurpose::Edk2PreloadPool)
+            .growable_pool(0, 3 * MIB);
+        assert!(unaligned_edk2
+            .pool_param_error(3 * MIB)
+            .is_some_and(|error| error.contains("not a multiple")));
+    }
 
     #[test]
     fn test_alignment() {

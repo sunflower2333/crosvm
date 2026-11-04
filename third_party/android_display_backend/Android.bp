@@ -1,0 +1,109 @@
+aidl_interface {
+    name: "libcrosvm_android_display_service",
+    srcs: [
+        "aidl/android/crosvm/DisplayConfig.aidl",
+        "aidl/android/crosvm/ICrosvmAndroidDisplayService.aidl",
+    ],
+    include_dirs: [
+        "frameworks/native/aidl/gui",
+    ],
+    local_include_dir: "aidl",
+    unstable: true,
+    backend: {
+        java: {
+            enabled: true,
+            apex_available: [
+                "com.android.virt",
+            ],
+        },
+        cpp: {
+            enabled: false,
+        },
+        rust: {
+            enabled: false,
+        },
+        ndk: {
+            enabled: true,
+            // To use Surface
+            additional_shared_libraries: [
+                "libnativewindow",
+            ],
+            apex_available: [
+                "//apex_available:platform",
+                "com.android.virt",
+            ],
+        },
+    },
+}
+
+// Authentic host allocation/export primitive. Kept separate from the client
+// until the virtio identity, dynamic BAR and producer/consumer gates integrate.
+cc_library_static {
+    name: "libcrosvm_shared_ahb_allocation",
+    srcs: ["shared_ahb_allocation.cpp"],
+    shared_libs: ["libbase", "libui", "libnativewindow"],
+    header_libs: ["libcutils_headers"],
+    export_include_dirs: ["."],
+}
+
+cc_binary {
+    name: "crosvm_shared_ahb_probe",
+    srcs: ["tests/shared_allocation/allocator_probe.cpp"],
+    static_libs: ["libcrosvm_shared_ahb_allocation"],
+    shared_libs: ["libbase", "libui", "libnativewindow"],
+}
+
+cc_binary {
+    name: "crosvm_native_blt_probe",
+    installable: false,
+    compile_multilib: "64",
+    srcs: ["tests/native_blt/gpu_probe.cpp"],
+    static_libs: ["libcrosvm_android_display_client", "libcrosvm_shared_ahb_allocation"],
+    shared_libs: ["libbase", "libui", "libnativewindow", "libbinder_ndk", "libcutils", "libdl"],
+}
+
+phony {
+    name: "crosvm_native_blt_probe_only",
+    required: ["crosvm_native_blt_probe"],
+}
+
+cc_library_static {
+    name: "libcrosvm_android_display_client",
+    srcs: [
+        "crosvm_android_display_client.cpp",
+        // libmediandk is dlopen'd rather than linked (see media_codec_abi.h), so the H.264
+        // encoder adds a source file and no dependency.
+        "media_codec_dl.cpp",
+        "surface_control_dl.cpp",
+        "shared_ahb_dl.cpp",
+    ],
+    whole_static_libs: [
+        "libcrosvm_android_display_service-ndk",
+    ],
+    static_libs: [
+        "libbase",
+        "libcrosvm_shared_ahb_allocation",
+    ],
+    target: {
+        apex: {
+            // The authoritative mapper is a platform-only libui API. The
+            // APEX bridge explicitly rejects Native AHB allocation; standalone
+            // platform crosvm links the real allocator above.
+            exclude_static_libs: ["libcrosvm_shared_ahb_allocation"],
+        },
+    },
+    header_libs: [
+        "libcutils_headers",
+        "libgfxstream_thirdparty_vulkan_headers",
+    ],
+    shared_libs: [
+        "libbinder_ndk",
+        "libcutils",
+        "libdl",
+        "libnativewindow",
+    ],
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.virt",
+    ],
+}

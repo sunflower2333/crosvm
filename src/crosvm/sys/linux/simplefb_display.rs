@@ -2,6 +2,7 @@
 // Copyright DroidVM contributors
 // Additional permissions apply; see ADDITIONAL-PERMISSIONS in the repository root.
 
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -36,6 +37,9 @@ use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 
 use crate::crosvm::config::TransportCap;
+use devices::virtio::ExternalScanout;
+
+const DEFAULT_FPS: u32 = crate::crosvm::config::DEFAULT_SIMPLEFB_POLL_HZ;
 
 pub struct SimplefbDisplayParams {
     pub addr: u64,
@@ -98,6 +102,11 @@ pub enum SimplefbDisplayTarget {
     /// NOT come through the display here -- it arrives on the `--input` evdev sockets, same as
     /// the virtio-gpu native-display path.
     Android { service_name: String },
+    /// The virtio-gpu device's own display. Used whenever this VM has a GPU: there is one
+    /// Surface, so there must be one writer, and the device is it -- we hand frames over and it
+    /// shows them while the guest is not displaying through virtio-gpu itself. See
+    /// `devices::virtio::ExternalScanout`.
+    GpuDevice { scanout: Arc<ExternalScanout> },
 }
 
 /// Turns the configured poll rate into the interval between ticks. The rate is validated at parse
@@ -105,6 +114,71 @@ pub enum SimplefbDisplayTarget {
 /// value means.
 fn tick_duration(poll_hz: u32) -> Duration {
     Duration::from_nanos(1_000_000_000 / poll_hz.max(1) as u64)
+}
+
+/// Feeds guest framebuffer frames to the GPU device, which owns the one display.
+///
+/// Skips the copy entirely while the guest is displaying through virtio-gpu (the device tells us
+/// so), and only submits when the framebuffer actually changed -- a frozen firmware framebuffer
+/// behind a live guest desktop must not keep waking the worker, and an unchanged frame is not a
+/// reason to take the display away from anyone.
+fn simplefb_feed_loop(
+    guest_mem: GuestMemory,
+    params: &SimplefbDisplayParams,
+    scanout: Arc<ExternalScanout>,
+) -> Result<()> {
+    let frame_duration = Duration::from_nanos(1_000_000_000 / DEFAULT_FPS as u64);
+    let guest_addr = GuestAddress(params.addr);
+    let fb_size = (params.stride as usize) * (params.height as usize);
+    let mut read_buf = vec![0u8; fb_size];
+    let mut last_buf: Vec<u8> = Vec::new();
+
+    info!(
+        "simplefb: feeding the gpu display: {}x{} stride={} addr={:#x} @ {}fps",
+        params.width, params.height, params.stride, params.addr, DEFAULT_FPS,
+    );
+
+    let mut idle_pokes: u32 = 0;
+    loop {
+        let frame_start = Instant::now();
+        if scanout.guest_owns() {
+            // Nothing to send while the guest is driving the display -- but ownership can also
+            // lapse on a clock (a guest that bound a scanout and stopped presenting), and that is
+            // only ever re-evaluated on the worker's side of this event. Poke it about once a
+            // second so a lapse is noticed without copying a frame nobody will look at.
+            idle_pokes += 1;
+            if idle_pokes >= DEFAULT_FPS {
+                idle_pokes = 0;
+                scanout.poke();
+            }
+        } else {
+            if idle_pokes != 0 {
+                // Just took the display back. The framebuffer may not have changed a byte since
+                // we last looked at it (a Windows guest that has been sitting on the same picture
+                // since the firmware handed over), and "unchanged" must not mean "not shown" on
+                // the frame where the display became ours.
+                idle_pokes = 0;
+                last_buf.clear();
+            }
+            if guest_mem
+                .read_exact_at_addr(&mut read_buf, guest_addr)
+                .is_err()
+            {
+                info!("simplefb: guest memory no longer readable, exiting");
+                break;
+            }
+            if last_buf != read_buf {
+                last_buf.clear();
+                last_buf.extend_from_slice(&read_buf);
+                scanout.submit(&read_buf);
+            }
+        }
+        let elapsed = frame_start.elapsed();
+        if elapsed < frame_duration {
+            thread::sleep(frame_duration - elapsed);
+        }
+    }
+    Ok(())
 }
 
 /// Spawns the bridge.
@@ -125,8 +199,15 @@ pub fn start_simplefb_display_thread(
     thread::Builder::new()
         .name("simplefb_display".into())
         .spawn(move || {
-            // `target` is consumed rather than borrowed: the VNC arm's input devices are moved into
-            // the sink, and a device cannot be handed over through a `&`.
+            // Handing frames to the GPU device needs no display of our own -- it owns the one
+            // Surface, so this thread is a producer, not a presenter.
+            if let SimplefbDisplayTarget::GpuDevice { scanout } = &target {
+                if let Err(e) = simplefb_feed_loop(guest_mem, &params, scanout.clone()) {
+                    error!("simplefb feed thread exited with error: {:?}", e);
+                }
+                return;
+            }
+
             let display_result = match target {
                 SimplefbDisplayTarget::Vnc {
                     addr,
@@ -145,6 +226,8 @@ pub fn start_simplefb_display_thread(
                 SimplefbDisplayTarget::Android { service_name } => {
                     GpuDisplay::open_android(&service_name)
                 }
+                // Handled above; it never opens a display.
+                SimplefbDisplayTarget::GpuDevice { .. } => unreachable!(),
             };
             let mut display = match display_result {
                 Ok(d) => d,
@@ -706,6 +789,12 @@ fn simplefb_display_loop(
         .create_surface(None, None, &display_params, SurfaceType::Scanout)
         .context("failed to create display surface")?;
 
+    let frame_duration = Duration::from_nanos(1_000_000_000 / DEFAULT_FPS as u64);
+    let guest_addr = GuestAddress(params.addr);
+    let fb_size = (params.stride as usize) * (params.height as usize);
+    let mut read_buf = vec![0u8; fb_size];
+    let mut no_framebuffer: u64 = 0;
+
     info!(
         "simplefb display bridge: {}x{} stride={} bpp={} addr={:#x} @ {}fps",
         params.width, params.height, params.stride, params.bpp, params.addr, params.poll_hz,
@@ -815,105 +904,24 @@ fn simplefb_display_loop(
             continue;
         }
 
-        if watcher.sync(fb, &mut read_buf, &mut scratch) {
-            watcher.pending_present = true;
-        }
-        if !watcher.pending_present {
-            // Nothing moved. No read of guest memory beyond the hashes, no write to read_buf, and
-            // nothing handed to the sink -- which is the part that matters, because a sink that is
-            // not called does not wake a compositor, encode anything or touch a GPU.
-            let elapsed = frame_start.elapsed();
-            if elapsed < frame_duration {
-                thread::sleep(frame_duration - elapsed);
+        if let Some(fb) = display.framebuffer(surface_id) {
+            let dst = fb.as_volatile_slice();
+            let copy_len = dst.size().min(read_buf.len());
+            dst.copy_from(&read_buf[..copy_len]);
+            no_framebuffer = 0;
+        } else {
+            // No framebuffer to write into: the sink never gave us one (an Android display whose
+            // service lost the name race hands out a surface with no window behind it) or it is
+            // transiently locked. Silence here cost a whole debugging session -- the bridge looked
+            // perfectly healthy while presenting nothing -- so say it, backing off so a permanent
+            // condition does not fill the log.
+            no_framebuffer += 1;
+            if no_framebuffer == 1 || no_framebuffer % 300 == 0 {
+                warn!(
+                    "simplefb: no framebuffer from the display sink ({} frame(s) dropped)",
+                    no_framebuffer
+                );
             }
-            continue;
-        }
-
-        // Which transport carries it is settled; what counts as a frame is not affected by it. Both
-        // arms clear `pending_present` only on a present that landed, so the attach edge's forced
-        // full pass and the `NoFramebuffer` re-offer behave identically either way.
-        let mut blit_failed: Option<u32> = None;
-        match &mut transport {
-            Transport::Gpu(gpu) => {
-                // Pace against the previous blit before handing the sink the same pages again.
-                gpu.await_previous_flip();
-                match display.flip_to(surface_id, gpu.import_id, None, None, None) {
-                    Ok(_waitable) => {
-                        watcher.pending_present = false;
-                        no_framebuffer = 0;
-                        // A backend whose blit is asynchronous hands back a sync_file here; one
-                        // whose flip is synchronous hands back nothing and the wait above is a
-                        // no-op. Collect it either way -- an uncollected fence is closed on the
-                        // sink's next flip, which is a leak of exactly one fd per frame.
-                        gpu.pending_fence = display.take_flip_completion_fence(surface_id);
-                    }
-                    Err(e) => {
-                        // The blit is the sink's, and a sink that cannot do it now will not be able
-                        // to on the next tick either (a lost Vulkan device, a torn-down surface).
-                        // Say so once and spend the rest of this VM on the CPU path, which needs no
-                        // cooperation from anything: `read_buf` already holds this exact frame, and
-                        // `pending_present` is still set, so the very next tick presents it.
-                        warn!(
-                            "simplefb: gpu blit failed, falling back to cpu copy for the rest of \
-                             this VM: {e:#}"
-                        );
-                        blit_failed = Some(gpu.import_id);
-                    }
-                }
-            }
-            Transport::Cpu => {
-                // The whole buffer, with full damage, however few bands were copied into it. The
-                // narrower present that suggests itself here -- copy only the changed rows into the
-                // sink -- is a trap: the destination rotates between buffers and nothing tracks
-                // their age, so the rows this frame does not write are whatever some earlier frame
-                // left in that particular buffer, not what is currently on screen. `read_buf` is
-                // what makes the skip safe, and the skip is where the saving is; narrowing the copy
-                // as well would give back a memcpy of host memory in exchange for a class of
-                // stale-region bug that reports nothing when it happens.
-                let frame = ScanoutFrame {
-                    bytes: &read_buf,
-                    stride: params.stride,
-                    width: params.width,
-                    height: params.height,
-                    fourcc: params.fourcc,
-                    damage: Damage::Full,
-                };
-                match display.present_frame(surface_id, &frame) {
-                    PresentOutcome::Flipped => {
-                        watcher.pending_present = false;
-                        no_framebuffer = 0;
-                    }
-                    PresentOutcome::NoFramebuffer => {
-                        // No framebuffer to write into: the sink never gave us one (an Android
-                        // display whose service lost the name race hands out a surface with no
-                        // window behind it) or it is transiently locked. Silence here cost a whole
-                        // debugging session -- the bridge looked perfectly healthy while presenting
-                        // nothing -- so say it, backing off so a permanent condition does not fill
-                        // the log.
-                        //
-                        // `pending_present` stays set. It has to: the content is in read_buf and
-                        // its hash is recorded, so nothing later would call this frame new, and a
-                        // dropped frame that never comes back is the failure this producer is
-                        // supposed to be immune to.
-                        no_framebuffer += 1;
-                        if no_framebuffer == 1 || no_framebuffer % 300 == 0 {
-                            warn!(
-                                "simplefb: no framebuffer from the display sink ({} frame(s) \
-                                 dropped)",
-                                no_framebuffer
-                            );
-                        }
-                        // The flip on this path is not presenting anything -- it is what releases a
-                        // sink that handed back nothing, and it has been here since before the copy
-                        // moved out.
-                        display.flip(surface_id);
-                    }
-                }
-            }
-        }
-        if let Some(import_id) = blit_failed {
-            display.release_import(import_id, surface_id);
-            transport = Transport::Cpu;
         }
 
         let elapsed = frame_start.elapsed();

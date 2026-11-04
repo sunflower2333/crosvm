@@ -7,7 +7,6 @@
 //! ## Feature flags
 #![cfg_attr(feature = "document-features", doc = document_features::document_features!())]
 
-#[cfg(any(feature = "composite-disk", feature = "qcow"))]
 use std::ffi::c_int;
 use std::fs::OpenOptions;
 use std::path::Path;
