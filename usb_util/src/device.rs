@@ -48,9 +48,6 @@ use crate::StandardControlRequest;
 // This is the maximum block size observed during storage performance test
 const MMAP_SIZE: usize = 1024 * 1024;
 
-// usbfs rejects an isochronous URB that does not carry between 1 and 128 packet descriptors.
-const MAX_ISO_PACKETS: usize = 128;
-
 /// ManagedDmaBuffer represents the entire DMA buffer allocated by a device
 struct ManagedDmaBuffer {
     /// The entire DMA buffer
@@ -116,10 +113,6 @@ pub struct Device {
     fd: Arc<File>,
     device_descriptor_tree: DeviceDescriptorTree,
     dma_buffer: Option<ManagedDmaBuffer>,
-    /// Largest request already reported as too big for `dma_buffer`. A device whose transfers
-    /// never fit asks again for every frame, so only a new maximum is worth a line: the log then
-    /// carries the size the device settles on instead of thousands of identical warnings.
-    reported_oversized: usize,
 }
 
 /// Transfer contains the information necessary to submit a USB request
@@ -164,7 +157,6 @@ impl Device {
             fd: Arc::new(fd),
             device_descriptor_tree,
             dma_buffer: None,
-            reported_oversized: 0,
         };
 
         let map = MemoryMappingBuilder::new(MMAP_SIZE)
@@ -227,16 +219,7 @@ impl Device {
 
     pub fn reserve_dma_buffer(&mut self, size: usize) -> Result<Weak<Mutex<DmaBuffer>>> {
         if let Some(managed) = &mut self.dma_buffer {
-            // The mapping is a fixed MMAP_SIZE window while `size` comes from the guest's
-            // transfer descriptor, so a longer request cannot be served from it. Every caller
-            // trusts DmaBuffer::size() to describe the mapping: as_mut_slice() would hand out a
-            // slice that runs off the end of it, and that slice's length is the only bound
-            // ScatterGatherBuffer::read() has -- a DisplayLink adapter's 1 MB+ bulk transfer
-            // wrote 64 KB past the mapping and killed crosvm. Ask the mapping rather than
-            // MMAP_SIZE, so the check still holds if the window ever stops being that constant.
-            // The caller falls back to a Vec of the requested size, which costs a copy into the
-            // kernel's own DMA buffer but is bounded.
-            if size <= managed.buf.size() && managed.used.is_none() {
+            if managed.used.is_none() {
                 let buf = Arc::new(Mutex::new(DmaBuffer {
                     addr: managed.buf.as_ptr() as u64,
                     size,
@@ -244,15 +227,6 @@ impl Device {
                 let ret = Ok(Arc::downgrade(&buf));
                 managed.used = Some(buf);
                 return ret;
-            }
-            if size > managed.buf.size() && size > self.reported_oversized {
-                warn!(
-                    "usb: a transfer of {} bytes does not fit the {} byte DMA window; \
-                     it goes through a plain buffer instead",
-                    size,
-                    managed.buf.size()
-                );
-                self.reported_oversized = size;
             }
         }
         Err(Error::GetDmaBufferFailed(size))
@@ -631,13 +605,6 @@ impl Transfer {
             .try_into()
             .map_err(Error::InvalidBufferLength)?;
 
-        if transfer_type == usb_sys::USBDEVFS_URB_TYPE_ISO {
-            transfer.urb_mut().number_of_packets_or_stream_id = iso_packets.len() as u32;
-            // Without ISO_ASAP the kernel demands a valid, near-future start_frame; letting it
-            // pick the next available frame is the only thing we can do from here.
-            transfer.urb_mut().flags = usb_sys::USBDEVFS_URB_ISO_ASAP;
-        }
-
         // SAFETY:
         // Safe because we ensured there is enough space in transfer.urb to hold the number of
         // isochronous frames required.
@@ -676,35 +643,10 @@ impl Transfer {
         Ok(transfer)
     }
 
-    /// Create an isochronous transfer. Each entry of `packet_lengths` describes one isochronous
-    /// packet; usbfs derives the transfer length from the descriptors rather than from
-    /// `buffer_length`, so their sum has to cover the whole buffer.
-    pub fn new_isochronous(
-        endpoint: u8,
-        buffer: TransferBuffer,
-        packet_lengths: &[u32],
-    ) -> Result<Transfer> {
-        if packet_lengths.is_empty() || packet_lengths.len() > MAX_ISO_PACKETS {
-            return Err(Error::InvalidIsoPackets);
-        }
-        let total: u64 = packet_lengths.iter().map(|len| *len as u64).sum();
-        if total != buffer.size().ok_or(Error::InvalidBuffer)? as u64 {
-            return Err(Error::InvalidIsoPackets);
-        }
-        let iso_packets: Vec<usb_sys::usbdevfs_iso_packet_desc> = packet_lengths
-            .iter()
-            .map(|len| usb_sys::usbdevfs_iso_packet_desc {
-                length: *len,
-                actual_length: 0,
-                status: 0,
-            })
-            .collect();
-        Self::new(
-            usb_sys::USBDEVFS_URB_TYPE_ISO,
-            endpoint,
-            buffer,
-            &iso_packets,
-        )
+    /// Create an isochronous transfer.
+    pub fn new_isochronous(endpoint: u8, buffer: TransferBuffer) -> Result<Transfer> {
+        // TODO(dverkamp): allow user to specify iso descriptors
+        Self::new(usb_sys::USBDEVFS_URB_TYPE_ISO, endpoint, buffer, &[])
     }
 
     /// Get the status of a completed transfer.
@@ -727,34 +669,6 @@ impl Transfer {
     /// the original length.
     pub fn actual_length(&self) -> usize {
         self.urb().actual_length as usize
-    }
-
-    /// Get the number of isochronous packets in this transfer, or 0 if it is not isochronous.
-    pub fn iso_packet_count(&self) -> usize {
-        if self.urb().urb_type != usb_sys::USBDEVFS_URB_TYPE_ISO {
-            return 0;
-        }
-        self.urb().number_of_packets_or_stream_id as usize
-    }
-
-    /// Get the descriptor of the `i`th isochronous packet, which the kernel fills in with that
-    /// packet's own length and status when the transfer completes. Returns `None` if this is not
-    /// an isochronous transfer or `i` is out of range.
-    pub fn iso_packet(&self, i: usize) -> Option<usb_sys::usbdevfs_iso_packet_desc> {
-        let count = self.iso_packet_count();
-        if i >= count {
-            return None;
-        }
-        // SAFETY:
-        // Safe because self.urb was allocated by `vec_with_array_field` with room for `count`
-        // trailing descriptors - the very array the constructor wrote - and i < count.
-        let iso_frame_desc = unsafe { self.urb().iso_frame_desc.as_slice(count) };
-        Some(iso_frame_desc[i])
-    }
-
-    /// Get the number of isochronous packets of this transfer that failed.
-    pub fn error_count(&self) -> i32 {
-        self.urb().error_count
     }
 
     /// Set callback function for transfer completion.
@@ -790,71 +704,12 @@ impl TransferHandle {
             ))
         } < 0
         {
-            let err = base::Error::last();
-            // usbfs answers EINVAL when the URB is not pending any more: it completed and was
-            // reaped between the caller's decision to cancel and this ioctl. A guest tearing
-            // down an isochronous stream cancels hundreds of descriptors at once and most have
-            // already landed, so this is the ordinary outcome, not a failure.
-            if err.errno() == libc::EINVAL {
-                return Err(Error::TransferAlreadyCompleted);
-            }
-            return Err(Error::IoctlFailed(usb_sys::USBDEVFS_DISCARDURB, err));
+            return Err(Error::IoctlFailed(
+                usb_sys::USBDEVFS_DISCARDURB,
+                base::Error::last(),
+            ));
         }
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn isochronous_transfer_packets() {
-        let transfer =
-            Transfer::new_isochronous(0x81, TransferBuffer::Vector(vec![0u8; 384]), &[192, 192])
-                .expect("new_isochronous failed");
-
-        assert_eq!(transfer.urb().number_of_packets_or_stream_id, 2);
-        assert_ne!(transfer.urb().flags & usb_sys::USBDEVFS_URB_ISO_ASAP, 0);
-        assert_eq!(transfer.urb().start_frame, 0);
-        assert_eq!(transfer.iso_packet_count(), 2);
-        assert_eq!(transfer.iso_packet(0).unwrap().length, 192);
-        assert_eq!(transfer.iso_packet(1).unwrap().length, 192);
-        assert_eq!(transfer.iso_packet(1).unwrap().actual_length, 0);
-        assert_eq!(transfer.iso_packet(1).unwrap().status, 0);
-        assert!(transfer.iso_packet(2).is_none());
-    }
-
-    #[test]
-    fn isochronous_transfer_bad_packet_lengths() {
-        // No packets at all: usbfs would reject the URB with EINVAL.
-        assert!(
-            Transfer::new_isochronous(0x81, TransferBuffer::Vector(vec![0u8; 384]), &[]).is_err()
-        );
-        // More packets than usbfs accepts.
-        assert!(Transfer::new_isochronous(
-            0x81,
-            TransferBuffer::Vector(vec![0u8; MAX_ISO_PACKETS + 1]),
-            &[1u32; MAX_ISO_PACKETS + 1]
-        )
-        .is_err());
-        // Packet lengths that do not add up to the buffer size.
-        assert!(Transfer::new_isochronous(
-            0x81,
-            TransferBuffer::Vector(vec![0u8; 384]),
-            &[192, 100]
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn non_isochronous_transfer_has_no_packets() {
-        let transfer = Transfer::new_bulk(0x81, TransferBuffer::Vector(vec![0u8; 64]), None)
-            .expect("new_bulk failed");
-
-        assert_eq!(transfer.urb().flags, 0);
-        assert_eq!(transfer.iso_packet_count(), 0);
-        assert!(transfer.iso_packet(0).is_none());
     }
 }

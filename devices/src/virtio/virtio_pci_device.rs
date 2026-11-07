@@ -24,9 +24,9 @@ use base::SharedMemory;
 use base::Tube;
 use base::WorkerThread;
 use data_model::Le32;
-use base::SafeDescriptor;
 use hypervisor::Datamatch;
 use hypervisor::MemCacheType;
+use hypervisor::Vm;
 use hypervisor::VmAccept;
 use libc::ERANGE;
 #[cfg(target_arch = "x86_64")]
@@ -862,6 +862,7 @@ impl PciDevice for VirtioPciDevice {
             pre_start.cache,
             pre_start.guest_offset,
             Some(region),
+            true,
         )
         .context("failed to install pre-start shared memory region")
         .map_err(PciDeviceError::MmioSetup)?;
@@ -904,12 +905,27 @@ impl PciDevice for VirtioPciDevice {
     }
 
     fn write_config_register(&mut self, reg_idx: usize, offset: u64, data: &[u8]) {
+        // The drm2kgsl pre-backed BAR is already mapped in Gunyah stage-2. The PCI
+        // configuration object locks only the address bits, so firmware can still write all
+        // ones and read the normal size mask during BAR probing. Do not short-circuit this
+        // call: doing so would make the probe read back the live address and can prevent UEFI
+        // from registering a bootable device.
+        let prebacked_bar = std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some()
+            && (reg_idx == 4 + SHMEM_BAR_NUM || reg_idx == 4 + SHMEM_BAR_NUM + 1);
         if let Some(res) = self.config_regs.write_reg(reg_idx, offset, data) {
             if let Some(msix_behavior) = res.downcast_ref::<MsixStatus>() {
                 self.device.control_notify(*msix_behavior);
             } else if let Some(status) = res.downcast_ref::<PmStatusChange>() {
                 self.handle_pm_status_change(status);
             }
+        }
+        if prebacked_bar {
+            info!(
+                "GPU-BAR-CONFIG: applied masked prebacked BAR2 write reg={} offset={:#x} len={}",
+                reg_idx,
+                offset,
+                data.len(),
+            );
         }
     }
 
@@ -1662,16 +1678,8 @@ impl SharedMemoryMapper for VmRequester {
         cache: MemCacheType,
         vm_accept: VmAccept,
     ) -> anyhow::Result<Option<u32>> {
-        if !self.prepared {
-            if let SharedMemoryPrepareType::SingleMappingOnFirst(prepare_cache_type) =
-                self.prepare_type
-            {
-                self.vm_memory_client
-                    .prepare_shared_memory_region(self.alloc, prepare_cache_type)
-                    .context("lazy prepare_shared_memory_region failed")?;
-            }
-            self.prepared = true;
-        }
+        self.prepare_lazy()?;
+        self.validate_cache(cache)?;
 
         let (id, gunyah_handle) = self
             .vm_memory_client

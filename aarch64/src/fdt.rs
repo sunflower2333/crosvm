@@ -107,6 +107,7 @@ fn create_memory_node(fdt: &mut Fdt, guest_mem: &GuestMemory) -> Result<()> {
     // been handed to the hypervisor for it yet, and the guest is not told it exists until the
     // shim has accepted it and pointed `/memory` here itself. The handoff page is not the guest's
     // RAM either -- it is the one place the host can still write once the boot region is lent.
+    let drm2kgsl_bar_backing = std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some();
     let hidden: HashSet<u64> = guest_mem
         .regions()
         .filter(|r| {
@@ -115,6 +116,7 @@ fn create_memory_node(fdt: &mut Fdt, guest_mem: &GuestMemory) -> Result<()> {
                     r.options.purpose,
                     MemoryRegionPurpose::SharedGuestRam | MemoryRegionPurpose::ShimHandoff
                 )
+                || (drm2kgsl_bar_backing && r.options.purpose == MemoryRegionPurpose::Drm2KgslPool)
         })
         .map(|r| r.guest_addr.offset())
         .collect();
@@ -218,26 +220,11 @@ struct GrowablePool {
 ///
 /// 1. `vm_memory::MemoryRegionPurpose`: give it its own variant. Sharing an existing variant means
 ///    sharing that pool's region, which is exactly what the separate variants exist to prevent.
-/// 2. `aarch64/src/lib.rs`: add a `PoolSpec` to `pool_specs()` and collect the region's
-///    `(gpa, size)` in the layout loop.
+/// 2. `aarch64/src/lib.rs`: carve the region out after guest RAM and collect its `(gpa, size)`.
 /// 3. Here: one more `create_pool_node()` call, named `<consumer>_<side>`.
 /// 4. The consuming driver: find the node by that name prefix.
 ///
-/// # The two that fail silently
-///
-/// Most of the matches a new purpose has to appear in are exhaustive, so the compiler names them
-/// one at a time. Two are not, and a pool that skips them builds, boots, and is wrong:
-///
-/// * `vm_memory::GuestMemory::check_host_access` ends in `other => Err(ProtectedMemoryAccess)`.
-///   A purpose missing from it is unreachable *from the host* in every protected VM -- every
-///   `get_slice_at_addr` into the pool fails, which surfaces as EFAULT from whatever ioctl was
-///   being served and reads like a guest bug.
-/// * `hypervisor::gunyah`'s `is_pool` is a `matches!`. A purpose missing from it is SHARE'd at
-///   `full_size` instead of its boot-share length **and skips the folio preparation and the
-///   mlock entirely** -- so the pool is unpinned memory under a stage-2 mapping the resource
-///   manager will never update, which is the failure the mlock check exists to refuse.
-///
-/// Everything else about the node is generic, because both of the things that read it are:
+/// Nothing else needs touching, because both of the things that read this node are generic:
 ///
 /// * The Gunyah RM blesses the range by matching this node's `reg` against the lend=false
 ///   memparcel registered before VM start (`vm_creation.c
@@ -304,7 +291,9 @@ fn create_pool_node(
     }
     // See "`reg` is the FLOOR" above: the node describes the pre-shared floor, and the window's
     // size rides along beside it when the two differ.
-    let floor = growable.as_ref().map_or(size, |g| g.pre_alloc_size.min(size));
+    let floor = growable
+        .as_ref()
+        .map_or(size, |g| g.pre_alloc_size.min(size));
     node.set_prop("reg", &[gpa, floor])?;
     if floor != size {
         node.set_prop("droidvm,pool-size", size)?;
@@ -1015,9 +1004,8 @@ pub fn create_fdt(
     swiotlb: Option<(Option<GuestAddress>, u64)>,
     gpu_resv: Option<(u64, u64)>,
     gpu_guest_resv: Option<(u64, u64, u64, u64)>,
+    edk2_preload_resv: Option<(u64, u64, u64, u64)>,
     venus_resv: Option<(u64, u64)>,
-    media_resv: Option<(u64, u64)>,
-    media_guest_resv: Option<(u64, u64)>,
     test_pool_resv: Vec<(u64, u64, u64, u64)>,
     shim_handoff_resv: Option<(u64, u64)>,
     drm2kgsl_resv: Option<(u64, u64)>,
@@ -1034,6 +1022,7 @@ pub fn create_fdt(
     smbios: &SmbiosOptions,
     pflash_cfg: Option<PflashDtConfig>,
     sbsa_uart_cfg: Option<(u64, u32, bool)>,
+    firmware_boot: bool,
 ) -> Result<()> {
     let mut fdt = Fdt::new(&[]);
     let mut phandles_key_cache = Vec::new();
@@ -1151,7 +1140,11 @@ pub fn create_fdt(
         };
         // First pool keeps the historical node name; a second gets a distinct one so both
         // droidvm,dynamic-pool nodes are present and the guest can drive each by pool-id.
-        let name = if idx == 0 { "test_guest".to_string() } else { format!("test_guest{}", idx + 1) };
+        let name = if idx == 0 {
+            "test_guest".to_string()
+        } else {
+            format!("test_guest{}", idx + 1)
+        };
         // DROIDVM_POOL_HIDE=dt|shm|both (diagnostic): omit the reserved-memory node for the test
         // pools. The sm8650-era RM refuses a `/reserved-memory` child whose `reg` does not match
         // an accepted memparcel exactly, which is one of three tangled explanations for why a
@@ -1168,34 +1161,40 @@ pub fn create_fdt(
         create_pool_node(&mut fdt, &name, gpa, size, None, growable)?;
     }
 
+    // EDK2 is laid out after the test pools, so assign its ID after theirs as well. PoolGrants
+    // indexes growable pools in GPA order and the FDT IDs must describe the same ordering.
+    if let Some((gpa, size, prealloc, step)) = edk2_preload_resv {
+        let growable = if step != 0 {
+            let pool_id = next_growable_pool_id;
+            Some(GrowablePool {
+                pre_alloc_size: prealloc,
+                step_size: step,
+                pool_id,
+            })
+        } else {
+            None
+        };
+        create_pool_node(&mut fdt, "edk2_preload", gpa, size, None, growable)?;
+    }
+
     // drm2kgsl's native-context arena: the guest allocates nothing from it -- it holds the host's
-    // own msm shmem rings -- so nothing in the guest matches this name. It is announced anyway so
-    // the RM blesses the range.
+    // own msm shmem rings. In the pre-backed BAR path this reserved node hides the host-only arena
+    // from guest RAM while its `reg` describes the eagerly mapped BAR suffix. The complete BAR
+    // aperture remains in the PCI shared-memory capability; its guard and any unbacked tail are
+    // intentionally not part of the RM memparcel.
     if let Some((gpa, size)) = drm2kgsl_resv {
-        create_pool_node(&mut fdt, "drm2kgsl_host", gpa, size, None, None)?;
+        let name = if std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some() {
+            "gpu_blob_reserved"
+        } else {
+            "drm2kgsl_host"
+        };
+        create_pool_node(&mut fdt, name, gpa, size, None, None)?;
     }
 
     // venus's host-alloc transport pool: the guest maps ring blobs by pool-relative offset
     // (MAP_INFO_POOL), same contract as gfx_host.
     if let Some((gpa, size)) = venus_resv {
         create_pool_node(&mut fdt, "venus_host", gpa, size, None, None)?;
-    }
-
-    // virtio-media's host-alloc buffer pool: the host media device sub-allocates every host-owned
-    // V4L2 buffer from it and the guest driver maps them at this base plus the pool-relative
-    // offset QUERYBUF answered with -- the same contract as gfx_host, one layer up. On Gunyah
-    // this node is also what makes the 4 GiB shared-memory BAR unnecessary; the 64-bit MMIO
-    // window has room for exactly one of those and the GPU has it.
-    if let Some((gpa, size)) = media_resv {
-        create_pool_node(&mut fdt, "media_host", gpa, size, None, None)?;
-    }
-
-    // virtio-media's guest-alloc buffer pool: the guest driver owns a drm_buddy allocator over
-    // this range and cuts the buffers it produces out of it -- bitstreams to decode, raw frames
-    // to encode -- handing the host bare guest-physical scatter-gather lists that resolve into
-    // these pages. Same shape as gpu_guest, and like it the host allocates nothing here.
-    if let Some((gpa, size)) = media_guest_resv {
-        create_pool_node(&mut fdt, "media_guest", gpa, size, None, None)?;
     }
 
     create_cpu_nodes(
@@ -1229,6 +1228,9 @@ pub fn create_fdt(
     }
     if let Some(ref pflash_cfg) = pflash_cfg {
         create_pflash_node(&mut fdt, pflash_cfg)?;
+    }
+    if firmware_boot {
+        create_firmware_pci_options_node(&mut fdt)?;
     }
     create_vmwdt_node(&mut fdt, vmwdt_cfg, num_cpus)?;
     if is_kvm {
@@ -1312,10 +1314,26 @@ mod tests {
 
         let node = fdt.get_node("/pflash@90000000").unwrap();
         assert_eq!(node.get_prop::<String>("compatible").unwrap(), "cfi-flash");
-        assert_eq!(node.get_prop::<Vec<u64>>("reg").unwrap(), [config.base, config.size]);
-        assert_eq!(node.get_prop::<u32>("erase-size").unwrap(), config.block_size);
+        assert_eq!(
+            node.get_prop::<Vec<u64>>("reg").unwrap(),
+            [config.base, config.size]
+        );
+        assert_eq!(
+            node.get_prop::<u32>("erase-size").unwrap(),
+            config.block_size
+        );
         assert!(node.get_prop::<()>("no-unaligned-direct-access").is_some());
         assert_eq!(node.get_prop::<String>("status").unwrap(), "okay");
+    }
+
+    #[test]
+    fn firmware_pci_options_mark_resources_assigned() {
+        let mut fdt = Fdt::new(&[]);
+
+        create_firmware_pci_options_node(&mut fdt).unwrap();
+
+        let node = fdt.get_node("/options/upl-params").unwrap();
+        assert_eq!(node.get_prop::<u32>("pci-enum-done"), Some(1));
     }
 
     #[test]

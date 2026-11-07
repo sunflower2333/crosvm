@@ -25,6 +25,7 @@ mod virgl_renderer;
 
 pub use crate::rutabaga_core::calculate_capset_mask;
 pub use crate::rutabaga_core::calculate_capset_names;
+pub use crate::rutabaga_core::NativeResourceAttachment;
 pub use crate::rutabaga_core::Rutabaga;
 pub use crate::rutabaga_core::RutabagaBuilder;
 pub use crate::rutabaga_gralloc::DrmFormat;

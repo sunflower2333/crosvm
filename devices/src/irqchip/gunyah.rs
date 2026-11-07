@@ -34,6 +34,12 @@ impl GunyahIrqChip {
 }
 
 impl IrqChip for GunyahIrqChip {
+    fn new_level_irq_event(&self) -> Result<IrqLevelEvent> {
+        // GH_IRQFD_LEVEL uses bell_set_mask(capid, 1, 1): reception clears the bell.
+        // The kernel has no resample fd and cannot reassert a still-pending device ISR.
+        IrqLevelEvent::new_with_auto_ack()
+    }
+
     // GunyahIrqChip doesn't need to track VCPUs.
     fn add_vcpu(&mut self, _vcpu_id: usize, _vcpu: &dyn Vcpu) -> Result<()> {
         Ok(())

@@ -158,6 +158,12 @@ impl IrqEventSource {
 /// This trait is generic over a Vcpu type because some IrqChip implementations can support
 /// multiple hypervisors with a single implementation.
 pub trait IrqChip: Send {
+    /// Create a level event with this IRQ chip's acknowledgement semantics. The device's
+    /// clone must retain these semantics when it decides whether to coalesce notifications.
+    fn new_level_irq_event(&self) -> Result<IrqLevelEvent> {
+        IrqLevelEvent::new()
+    }
+
     /// Add a vcpu to the irq chip.
     fn add_vcpu(&mut self, vcpu_id: usize, vcpu: &dyn Vcpu) -> Result<()>;
 

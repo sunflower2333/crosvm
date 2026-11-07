@@ -68,24 +68,6 @@ pub const PORTSC_PORT_RESET: u32 = 1u32 << 4;
 /// Bitmask for portsc register, see spec 5.4.8.
 pub const PORTSC_PORT_LINK_STATE_MASK: u32 = 0x000001E0;
 /// Bitmask for portsc register, see spec 5.4.8.
-pub const PORTSC_PORT_LINK_STATE_SHIFT: u32 = 5;
-/// Bitmask for portsc register, see spec 5.4.8.
-pub const PORTSC_PORT_LINK_STATE_WRITE_STROBE: u32 = 1u32 << 16;
-/// Bitmask for portsc register, see spec 5.4.8.
-pub const PORTSC_WARM_RESET_CHANGE: u32 = 1u32 << 19;
-/// PLS value for a link in U0, see spec 4.19.1.
-pub const PORTSC_PLS_U0: u32 = 0;
-/// PLS value for RxDetect, what a port with nothing attached reports, see spec 4.19.1.
-pub const PORTSC_PLS_RXDETECT: u32 = 5;
-/// Port link state U3 (suspended), see spec 5.4.8.
-pub const PORTSC_PLS_U3: u32 = 3;
-/// Port link state Resume (USB2 resume signalling in progress), see spec 5.4.8.
-pub const PORTSC_PLS_RESUME: u32 = 15;
-/// Bitmask for portsc register, see spec 5.4.8.
-pub const PORTSC_PORT_LINK_STATE_CHANGE: u32 = 1u32 << 22;
-/// The portsc reset value: PP set, PLS = RxDetect, see spec 5.4.8.
-pub const PORTSC_RESET_VALUE: u32 = 0x000002A0;
-/// Bitmask for portsc register, see spec 5.4.8.
 pub const PORTSC_PORT_POWER: u32 = 1u32 << 9;
 /// Bitmask for portsc register, see spec 5.4.8.
 pub const PORTSC_PORT_SPEED_MASK: u32 = 0x00003C00;
@@ -181,7 +163,6 @@ pub struct XhciRegs {
     pub erstsz: Register<u32>,
     pub erstba: Register<u64>,
     pub erdp: Register<u64>,
-    pub mfindex: Register<u32>,
 }
 
 /// This function returns mmio space definition for xhci. See Xhci spec chapter 5
@@ -319,15 +300,11 @@ pub fn init_xhci_mmio_space_and_regs() -> (RegisterSpace, XhciRegs) {
     );
     mmio.add_register(dnctrl.clone());
 
-    // CRCR resets to 0 (spec 5.4.5): pointer 0, RCS 0 and, above all, CRR 0. It used to reset
-    // to 9 = RCS | CRR, so the command ring read as running from power-on and the guest's very
-    // first CRCR write was refused; only USBCMD R/S=0 ever cleared it. CRR is not guest-writeable
-    // (bit 3 is out of the mask): the controller alone sets it, from doorbell 0.
     let crcr = register!(
         name: "crcr",
         ty: u64,
         offset: 0x38,
-        reset_value: 0,
+        reset_value: 9,
         guest_writeable_mask: 0xFFFFFFFFFFFFFFC7,
         guest_write_1_to_clear_mask: 0,
     );
@@ -359,7 +336,7 @@ pub fn init_xhci_mmio_space_and_regs() -> (RegisterSpace, XhciRegs) {
         cnt: MAX_PORTS,
         base_offset: 0x420,
         stride: 16,
-        reset_value: PORTSC_RESET_VALUE,
+        reset_value: 0x000002A0,
         guest_writeable_mask: 0x8EFFC3F2,
         guest_write_1_to_clear_mask: 0x00FE0002,);
     mmio.add_register_array(&portsc);
@@ -410,18 +387,14 @@ pub fn init_xhci_mmio_space_and_regs() -> (RegisterSpace, XhciRegs) {
 
     /* Runtime Registers */
 
-    // MFINDEX: the microframe counter (spec 5.5.1), 14 bits, one tick per 125 us while the
-    // controller runs. Read-only; the controller supplies its value from a clock through a read
-    // callback. Guests schedule isochronous work against it: a counter that never moves lets
-    // Windows' USBXHCI queue about 1024 frames of audio and then wait forever for time to pass.
-    let mfindex = register!(
-        name: "mfindex",
+    mmio.add_register(
+        // mfindex
+        static_register!(
         ty: u32,
         offset: 0x3000,
-        reset_value: 0,
-        guest_writeable_mask: 0,
-        guest_write_1_to_clear_mask: 0,);
-    mmio.add_register(mfindex.clone());
+        value: 0, // 4 ports starting at port 5
+        ),
+    );
 
     /* Reg Array for interrupters */
     // Although the following should be register arrays, we only have one interrupter.
@@ -486,7 +459,6 @@ pub fn init_xhci_mmio_space_and_regs() -> (RegisterSpace, XhciRegs) {
         erstsz,
         erstba,
         erdp,
-        mfindex,
     };
 
     /* End of Host Controller Operational Registers */

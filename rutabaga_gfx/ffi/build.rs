@@ -8,6 +8,13 @@ use std::io::Write;
 
 fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
+    // This cdylib is packaged independently by Android hosts. Align LOAD and
+    // RELRO for both 4 KB and 16 KB kernels, without changing other targets.
+    if target_os == "android" {
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-z,max-page-size=16384");
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-z,common-page-size=16384");
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,librutabaga_gfx_ffi.so");
+    }
 
     // Override prefix from environment variable (with a default)
     let prefix = format!(

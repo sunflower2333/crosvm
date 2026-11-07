@@ -48,13 +48,14 @@ type UdmabufCreateList = FlexibleArrayWrapper<udmabuf_create_list, udmabuf_creat
 /// this, the only bound on a single call is whatever the host's udmabuf driver happens to enforce,
 /// and a VMM should not be relying on the kernel to sanity-check a number a guest chose.
 ///
-/// 65536 matches the guest driver's own `guest_pool_max_nents` and our udmabuf module's
-/// `list_limit`, so this rejects nothing that is expected to work; it exists to make the refusal
-/// happen here, with a legible error, rather than as an ENOMEM out of an ioctl.
+/// 262144 supports a 1 GiB Windows allocation of fully fragmented 4 KiB pages.
+/// Deployment must set the host udmabuf module's `list_limit` to the same bound
+/// (and retain its 1024 MiB size limit). Refuse larger guest lists here before
+/// allocating the ioctl payload, with a legible error.
 ///
 /// This is a PER-CALL bound and deliberately not presented as more than that. It does not limit
 /// the total across concurrent dma-bufs, which is a separate gap.
-const MAX_UDMABUF_ENTRIES: usize = 65536;
+const MAX_UDMABUF_ENTRIES: usize = 1 << 18;
 
 // Returns absolute offset within the memory corresponding to a particular guest address.
 // This offset is not relative to a particular mapping.
@@ -158,6 +159,30 @@ impl UdmabufDriverTrait for UnixUdmabufDriver {
 mod tests {
     use super::*;
     use crate::GuestAddress;
+
+    #[test]
+    fn large_backing_reaches_ioctl_but_oversized_list_is_refused_first() {
+        // /dev/null makes the ioctl observably fail after real guest-address
+        // validation and payload construction, without requiring udmabuf.
+        let driver = UnixUdmabufDriver {
+            driver_fd: File::open("/dev/null").unwrap(),
+        };
+        let pgsize = pagesize();
+        let mem = GuestMemory::new(&[(GuestAddress(0), pgsize as u64)]).unwrap();
+        for count in [140070usize, 262144] {
+            let entries = vec![(GuestAddress(0), pgsize); count];
+            match driver.create_udmabuf(&mem, &entries) {
+                Err(UdmabufError::DmabufCreationFail(error)) => {
+                    assert_eq!(error.raw_os_error(), Some(libc::ENOTTY));
+                }
+                result => panic!("valid large backing must reach ioctl: {result:?}"),
+            }
+        }
+        let entries = vec![(GuestAddress(u64::MAX), pgsize); MAX_UDMABUF_ENTRIES + 1];
+        assert!(matches!(driver.create_udmabuf(&mem, &entries),
+            Err(UdmabufError::TooManyEntries(count, limit))
+                if count == MAX_UDMABUF_ENTRIES + 1 && limit == MAX_UDMABUF_ENTRIES));
+    }
 
     #[test]
     fn test_memory_offsets() {

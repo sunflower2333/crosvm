@@ -141,6 +141,9 @@ pub fn create_gpu_device(
     has_vfio_gfx_device: bool,
     event_devices: Vec<EventDevice>,
     #[cfg(feature = "vnc")] vnc_input: gpu_display::VncBindingInput,
+    // Frames from the VMM's simplefb bridge, presented through this device's display whenever
+    // the guest is not driving it itself. See `ExternalScanout`.
+    external_scanout: Option<Arc<virtio::ExternalScanout>>,
 ) -> DeviceResult {
     let is_sandboxed = cfg.jail_config.is_some();
     let mut gpu_params = cfg.gpu_parameters.clone().unwrap();
@@ -289,6 +292,12 @@ pub fn create_gpu_device(
 
     #[cfg(feature = "android_display")]
     if let Some(service) = cfg.android_display_service_for(DisplayScreen::Gpu0) {
+        // The GPU device owns this sink even when `--simplefb` is also configured: it registers
+        // the one ICrosvmAndroidDisplayService the app hands its Surface to, and the simplefb
+        // bridge feeds its frames through the same device (ExternalScanout) instead of opening a
+        // second display under the same name. Two registrations under one name is what made the
+        // app's Surface go to whichever producer won the race, with the loser drawing into
+        // nothing for the rest of the VM's life.
         display_backends.insert(0, virtio::DisplayBackend::Android(service.name.clone()));
         transport_cap = service.transport_cap;
     }
@@ -309,13 +318,7 @@ pub fn create_gpu_device(
                 width: w,
                 height: h,
                 password: vnc_cfg.password.clone(),
-                // Resolved from the ceiling here rather than inside the sink, because the ceiling
-                // belongs to the binding and one sink serves several of them. A binding capped
-                // below `gpu-hw` builds no broker at all, so a client that asks for encoding 50
-                // there is served pixels and told nothing -- which is what an old server looks
-                // like, and what the app is written to fall back from.
                 hw_encode: vnc_cfg.h264_enabled(),
-                // This screen's own devices, parked for whichever `build` call opens the sink.
                 vnc_input: std::sync::Arc::new(sync::Mutex::new(vnc_input)),
             },
         );
@@ -344,6 +347,7 @@ pub fn create_gpu_device(
         virtio::base_features(cfg.protection_type),
         &cfg.wayland_socket_paths,
         cfg.gpu_cgroup_path.as_ref(),
+        external_scanout,
     );
     #[cfg(any(feature = "vnc", feature = "android_display"))]
     if !transport_cap.allows_gpu_copy() {

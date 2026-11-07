@@ -287,12 +287,25 @@ impl VfioMsixCap {
         *data = self.config.read_msix_capability(*data);
     }
 
-    fn write_msix_control(&mut self, data: &[u8]) -> Option<VfioMsiChange> {
+    fn write_msix_control(&mut self, offset: u32, data: &[u8]) -> Option<VfioMsiChange> {
         let old_enabled = self.config.enabled();
         let old_masked = self.config.masked();
 
-        self.config
-            .write_msix_capability(PCI_MSIX_FLAGS.into(), data);
+        let write_start = u64::from(offset);
+        let write_end = write_start.saturating_add(data.len() as u64);
+        let capability_start = u64::from(self.offset);
+        let control_start = capability_start + u64::from(PCI_MSIX_FLAGS);
+        let control_end = control_start + 2;
+        let overlap_start = write_start.max(capability_start);
+        let overlap_end = write_end.min(control_end);
+        if overlap_start < overlap_end {
+            let data_start = (overlap_start - write_start) as usize;
+            let data_end = data_start + (overlap_end - overlap_start) as usize;
+            self.config.write_msix_capability(
+                overlap_start - capability_start,
+                &data[data_start..data_end],
+            );
+        }
 
         let new_enabled = self.config.enabled();
         let new_masked = self.config.masked();
@@ -1874,7 +1887,7 @@ impl PciDevice for VfioPciDevice {
         if let Some(msix_cap) = &self.msix_cap {
             let mut msix_cap = msix_cap.lock();
             if msix_cap.is_msix_control_reg(start as u32, data.len() as u32) {
-                msi_change = msix_cap.write_msix_control(data);
+                msi_change = msix_cap.write_msix_control(start as u32, data);
             }
         }
 
@@ -2127,9 +2140,38 @@ impl Suspendable for VfioPciDevice {
 
 #[cfg(test)]
 mod tests {
+    use base::Tube;
     use resources::AddressRange;
 
+    use super::MsixConfig;
+    use super::VfioMsixCap;
     use super::VfioResourceAllocator;
+    use super::MSIX_PBA_ENTRIES_MODULO;
+    use super::MSIX_TABLE_ENTRIES_MODULO;
+
+    #[test]
+    fn msix_control_forwards_header_spanning_write() {
+        let (_irqchip, config_tube) = Tube::pair().unwrap();
+        let mut cap = VfioMsixCap {
+            config: MsixConfig::new(2, config_tube, 0, "test_device".to_owned()),
+            offset: 0x50,
+            table_size: 2,
+            table_pci_bar: 0,
+            table_offset: 0,
+            table_size_bytes: 2 * MSIX_TABLE_ENTRIES_MODULO,
+            pba_pci_bar: 0,
+            pba_offset: 0,
+            pba_size_bytes: MSIX_PBA_ENTRIES_MODULO,
+            msix_interrupt_evt: Vec::new(),
+        };
+
+        assert!(cap.is_msix_control_reg(0x50, 4));
+        assert!(cap.write_msix_control(0x50, &[0, 0, 0, 0x40]).is_none());
+        assert!(cap.config.masked());
+
+        assert!(cap.write_msix_control(0x53, &[0]).is_none());
+        assert!(!cap.config.masked());
+    }
 
     #[test]
     fn no_overlap() {

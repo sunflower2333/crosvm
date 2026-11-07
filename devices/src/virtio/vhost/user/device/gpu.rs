@@ -17,6 +17,7 @@ use base::Tube;
 use cros_async::EventAsync;
 use cros_async::Executor;
 use cros_async::TaskHandle;
+use cros_async::TimerAsync;
 use futures::FutureExt;
 use futures::StreamExt;
 use snapshot::AnySnapshot;
@@ -66,15 +67,41 @@ async fn run_ctrl_queue(
     reader: SharedReader,
     mem: GuestMemory,
     kick_evt: EventAsync,
+    retirement_evt: EventAsync,
+    ex: Executor,
     state: Rc<RefCell<gpu::Frontend>>,
 ) {
     loop {
-        if let Err(e) = kick_evt.next_val().await {
-            error!("Failed to read kick event for ctrl queue: {}", e);
+        let deadline = state.borrow().context_retirement_deadline();
+        let timeout = async {
+            if let Some(deadline) = deadline {
+                TimerAsync::sleep(
+                    &ex,
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                )
+                .await
+                .context("waiting for GPU context teardown")
+            } else {
+                futures::future::pending::<anyhow::Result<()>>().await
+            }
+        };
+        let wake = futures::select! {
+            result = kick_evt.next_val().fuse() => result.map(|_| ()).map_err(anyhow::Error::from),
+            result = retirement_evt.next_val().fuse() => result.map(|_| ()).map_err(anyhow::Error::from),
+            result = timeout.fuse() => result,
+        };
+        if let Err(e) = wake {
+            error!("Failed to wait for GPU queue/context event: {}", e);
             break;
         }
 
         let mut state = state.borrow_mut();
+        if let Err(e) = state.process_context_retirement(&mem, &reader, None) {
+            // The backend retains its Frontend after this task stops. Do not
+            // reset/drop outstanding ownership or acknowledge failed teardown.
+            error!("GPU context retirement failed; retaining frontend: {:#}", e);
+            break;
+        }
         let needs_interrupt = state.process_queue(&mem, &reader);
 
         if needs_interrupt {
@@ -176,6 +203,7 @@ impl VhostUserDevice for GpuBackend {
                         Arc::new(Mutex::new(Some(gpu::FenceHandlerActivationResources {
                             mem: mem.clone(),
                             ctrl_queue: reader.clone(),
+                            cursor_queue: None,
                         })));
                     let fence_handler = gpu::create_fence_handler(
                         fence_handler_resources,
@@ -200,8 +228,17 @@ impl VhostUserDevice for GpuBackend {
                 self.start_platform_workers(doorbell)?;
 
                 // Start handling the control queue.
-                self.ex
-                    .spawn_local(run_ctrl_queue(reader, mem, kick_evt, state))
+                let retirement_evt =
+                    EventAsync::new(state.borrow().context_retirement_event()?, &self.ex)
+                        .context("failed to create context retirement event")?;
+                self.ex.spawn_local(run_ctrl_queue(
+                    reader,
+                    mem,
+                    kick_evt,
+                    retirement_evt,
+                    self.ex.clone(),
+                    state,
+                ))
             }
             1 => {
                 // For the cursor queue, spawn an empty worker, as we don't process it at all.
@@ -217,6 +254,9 @@ impl VhostUserDevice for GpuBackend {
     }
 
     fn stop_queue(&mut self, idx: usize) -> anyhow::Result<Queue> {
+        if let Some(state) = &self.state {
+            state.borrow().check_quiescent()?;
+        }
         if let Some(worker) = self.queue_workers.get_mut(idx).and_then(Option::take) {
             // Wait for queue_task to be aborted.
             let _ = self.ex.run_until(worker.queue_task.cancel());
@@ -244,11 +284,20 @@ impl VhostUserDevice for GpuBackend {
     }
 
     fn enter_suspended_state(&mut self) -> anyhow::Result<()> {
+        if let Some(state) = &self.state {
+            state.borrow().check_quiescent()?;
+        }
         self.stop_non_queue_workers()?;
         Ok(())
     }
 
     fn reset(&mut self) {
+        if let Some(state) = &self.state {
+            if let Err(e) = state.borrow().check_quiescent() {
+                error!("Refusing GPU reset while retaining work: {}", e);
+                return;
+            }
+        }
         self.stop_non_queue_workers()
             .expect("Failed to stop platform workers.");
 
@@ -279,12 +328,18 @@ impl VhostUserDevice for GpuBackend {
     }
 
     fn snapshot(&mut self) -> anyhow::Result<AnySnapshot> {
+        if let Some(state) = &self.state {
+            state.borrow().check_quiescent()?;
+        }
         // TODO(b/289431114): Snapshot more fields if needed. Right now we just need a bare bones
         // snapshot of the GPU to create a POC.
         AnySnapshot::to_any(())
     }
 
     fn restore(&mut self, data: AnySnapshot) -> anyhow::Result<()> {
+        if let Some(state) = &self.state {
+            state.borrow().check_quiescent()?;
+        }
         let () = AnySnapshot::from_any(data)?;
         Ok(())
     }

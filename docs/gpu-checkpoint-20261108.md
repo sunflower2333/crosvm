@@ -1,0 +1,3 @@
+# GPU source checkpoint, 2026-11-08
+
+Checkpoint the exact 1850-file crosvm source portion used by the installed native AHB padding build. This branch is a reproducible source checkpoint of that installed build lineage, rather than a merge of other haptics or camera experiments from the workspace. The linked Android display backend is provided separately by the companion integration repository. Candidate crosvm SHA256 070fbc619b011b50a1c40e1486658e8dc17605c683f683f7f473bfe41d24050c was built and installed after a normal shutdown, and the sole original VM started once with unchanged 6656 MiB and 8 vCPU. Windows fresh passive reset0 is established; texture, Native Blt and Edge WebGL qualification remain pending.

@@ -17,7 +17,6 @@ use usb_util::DescriptorHeader;
 use usb_util::Device;
 use usb_util::DeviceDescriptorTree;
 use usb_util::DeviceSpeed;
-use usb_util::Error as UsbUtilError;
 use usb_util::InterfaceDescriptor;
 use usb_util::Transfer;
 use usb_util::TransferBuffer;
@@ -175,10 +174,7 @@ impl AsRawDescriptor for HostDevice {
 
 impl GenericTransferHandle for TransferHandle {
     fn cancel(&self) -> Result<()> {
-        TransferHandle::cancel(self).map_err(|e| match e {
-            UsbUtilError::TransferAlreadyCompleted => Error::TransferHandleAlreadyComplete,
-            e => Error::TransferHandle(e),
-        })
+        TransferHandle::cancel(self).map_err(Error::TransferHandle)
     }
 }
 
@@ -230,18 +226,6 @@ impl BackendDevice for HostDevice {
     ) -> Result<BackendTransferType> {
         Ok(BackendTransferType::HostDevice(
             Transfer::new_interrupt(ep_addr, transfer_buffer).map_err(Error::CreateTransfer)?,
-        ))
-    }
-
-    fn build_isochronous_transfer(
-        &mut self,
-        ep_addr: u8,
-        transfer_buffer: TransferBuffer,
-        packet_lengths: &[u32],
-    ) -> Result<BackendTransferType> {
-        Ok(BackendTransferType::HostDevice(
-            Transfer::new_isochronous(ep_addr, transfer_buffer, packet_lengths)
-                .map_err(Error::CreateTransfer)?,
         ))
     }
 
@@ -416,10 +400,6 @@ impl BackendTransfer for Transfer {
 
     fn buffer(&self) -> &TransferBuffer {
         &self.buffer
-    }
-
-    fn iso_packet(&self, i: usize) -> Option<(usize, i32)> {
-        Transfer::iso_packet(self, i).map(|d| (d.actual_length as usize, d.status as i32))
     }
 
     fn set_callback<C: 'static + Fn(BackendTransferType) + Send + Sync>(&mut self, cb: C) {

@@ -192,13 +192,15 @@ pub fn prepare_shared_memory_region(
     cache: MemCacheType,
     source: Option<Box<dyn MappedRegion>>,
 ) -> Result<VmMappedMemoryRegion, SysError> {
-    prepare_shared_memory_region_at_offset(vm, allocator, alloc, cache, 0, source)
+    prepare_shared_memory_region_at_offset(vm, allocator, alloc, cache, 0, source, false)
 }
 
 /// Prepare a fixed mapping for a subrange of an allocated PCI BAR. The allocation remains the
 /// BAR-sized address range, while only `[guest_offset, guest_offset + source.size())` is installed
 /// in the hypervisor. This is used for the drm2kgsl BAR guard, whose first 2 MiB are intentionally
 /// left unmapped.
+/// `immutable` protects boot backing from later fixed remaps while permitting
+/// independent mappings in the unused portion of the same BAR.
 pub fn prepare_shared_memory_region_at_offset(
     vm: &mut dyn Vm,
     allocator: &mut SystemAllocator,
@@ -206,6 +208,7 @@ pub fn prepare_shared_memory_region_at_offset(
     cache: MemCacheType,
     guest_offset: u64,
     source: Option<Box<dyn MappedRegion>>,
+    immutable: bool,
 ) -> Result<VmMappedMemoryRegion, SysError> {
     if !matches!(alloc, Alloc::PciBar { .. }) {
         return Err(SysError::new(EINVAL));
@@ -273,6 +276,7 @@ pub fn prepare_shared_memory_region_at_offset(
                         slot,
                         allocation_offset: guest_offset,
                         size,
+                        immutable,
                     })
                 }
                 Err(e) => Err(e),

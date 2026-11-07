@@ -6,9 +6,10 @@
 mod aarch64;
 
 mod gunyah_sys;
+mod ioeventfd;
 mod mthp;
-pub mod shim_abi;
 mod pin;
+pub mod shim_abi;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BinaryHeap;
@@ -27,11 +28,9 @@ use base::debug;
 use base::errno_result;
 use base::error;
 use base::info;
-use base::AsRawDescriptor;
 use base::ioctl;
 use base::ioctl_with_mut_ref;
 use base::ioctl_with_ref;
-use base::debug;
 use base::ioctl_with_val;
 use base::pagesize;
 use base::warn;
@@ -45,7 +44,6 @@ use base::MemoryMappingBuilder;
 use base::MmapError;
 use base::Protection;
 use base::RawDescriptor;
-use base::Protection;
 use base::SharedMemory;
 use gunyah_sys::*;
 use libc::open;
@@ -272,7 +270,10 @@ unsafe fn android_lend_user_memory_region(
     if ret == 0 {
         Ok(())
     } else {
-        { base::error!("GH-DIAG: GH_VM_ANDROID_LEND_USER_MEM failed"); errno_result() }
+        {
+            base::error!("GH-DIAG: GH_VM_ANDROID_LEND_USER_MEM failed");
+            errno_result()
+        }
     }
 }
 
@@ -292,7 +293,7 @@ unsafe fn set_user_memory_region(
 ) -> Result<()> {
     let mut flags = 0;
 
-    // In protected VMs, SHARE'd memory (GH_VM_SET_USER_MEM_REGION) cannot be made executable —
+    // In protected VMs, SHARE'd memory (GH_VM_SET_USER_MEM_REGION) cannot be made executable -
     // requesting GH_MEM_ALLOW_EXEC prevents Gunyah from creating valid stage-2 mappings, so the
     // guest faults (SIGBUS) on access. Only LEND'd memory gets exec at stage-2. Host-visible
     // virtio-gpu blobs (gfxstream ASG rings) are data-only and must be SHARE'd without exec.
@@ -316,7 +317,10 @@ unsafe fn set_user_memory_region(
     if ret == 0 {
         Ok(())
     } else {
-        { base::error!("GH-DIAG: GH_VM_SET_USER_MEM_REGION failed"); errno_result() }
+        {
+            base::error!("GH-DIAG: GH_VM_SET_USER_MEM_REGION failed");
+            errno_result()
+        }
     }
 }
 
@@ -353,7 +357,10 @@ fn map_cma_region(
     if ret == 0 {
         Ok(())
     } else {
-        { base::error!("GH-DIAG: GH_VM_ANDROID_MAP_CMA_MEM failed"); errno_result() }
+        {
+            base::error!("GH-DIAG: GH_VM_ANDROID_MAP_CMA_MEM failed");
+            errno_result()
+        }
     }
 }
 
@@ -465,22 +472,18 @@ impl GunyahVm {
                     // mem-entries into it), never lent.
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                     MemoryRegionPurpose::GpuPoolGuest => false,
-                    // drm2kgsl arena: SHARE'd like the gfx pools; that backend runs in this
-                    // process and must keep reaching it.
+                    // drm2kgsl arena: never LEND because the host renderer must retain access.
+                    // The normal route SHAREs its pool GPA; the prebacked-BAR route below skips
+                    // that alias and SHAREs only the PCI BAR mapping.
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                     MemoryRegionPurpose::Drm2KgslPool => false,
+                    // EDK2 preload pool: no boot-time prefix; firmware accepts one runtime SHARE.
+                    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                    MemoryRegionPurpose::Edk2PreloadPool => false,
                     // venus transport pool: SHARE'd like the gfx pools; vkr runs in this
                     // process and must keep reaching it.
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                     MemoryRegionPurpose::VenusPool => false,
-                    // virtio-media host pool: SHARE'd like the gfx pools; the media device fills
-                    // every host-owned buffer in it and must keep reaching it after boot.
-                    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-                    MemoryRegionPurpose::MediaPool => false,
-                    // virtio-media guest pool: SHARE'd like GpuPoolGuest -- the guest driver
-                    // allocates from it and the host resolves its scatter-gather lists into it.
-                    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-                    MemoryRegionPurpose::MediaPoolGuest => false,
                     // Growable test pool: SHARE'd like the others. Only its pre_alloc prefix is
                     // shared at boot; the remainder is granted at runtime.
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
@@ -652,37 +655,44 @@ impl GunyahVm {
                     MemoryRegionPurpose::GpuPool
                         | MemoryRegionPurpose::GpuPoolGuest
                         | MemoryRegionPurpose::Drm2KgslPool
+                        | MemoryRegionPurpose::Edk2PreloadPool
                         | MemoryRegionPurpose::VenusPool
-                        | MemoryRegionPurpose::MediaPool
-                        | MemoryRegionPurpose::MediaPoolGuest
                         | MemoryRegionPurpose::DynamicTestPool
                         | MemoryRegionPurpose::ShimHandoff
                 );
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                 let full_size: u64 = region.size.try_into().unwrap();
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-                let boot_share_len = if is_pool {
+                let drm2kgsl_bar_backing = region.options.purpose
+                    == MemoryRegionPurpose::Drm2KgslPool
+                    && std::env::var_os("CROSVM_DRM2KGSL_BAR_PREBACKED").is_some();
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                let boot_share_len = if drm2kgsl_bar_backing {
+                    0
+                } else if is_pool {
                     region.options.boot_share_len(full_size)
                 } else {
                     full_size
                 };
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                let backing_prepare_len = if drm2kgsl_bar_backing {
+                    full_size
+                } else {
+                    boot_share_len
+                };
 
                 // GPU pre-alloc pool: force order-9 backing (MADV_HUGEPAGE + populate +
-                // cascading COLLAPSE + mlock) BEFORE the SHARE so the gh_hugepage_reserve
-                // supply hook serves the pool from reserved 2MB folios, exactly like the
-                // mTHP-prepared LEND'd guest RAM.
+                // cascading COLLAPSE + mlock) before its guest mapping is installed. For the
+                // drm2kgsl prebacked path this pins the host arena before the BAR alias is
+                // SHARE'd; the original pool GPA itself remains unmapped.
                 // Same gate as the guest-RAM LEND path below: this whole mechanism only
                 // exists for the Qualcomm reserve-pool hook, so it's opt-in via
                 // --prepare-lend-mthp-mode, not unconditional for every arm/aarch64 host.
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-                if cfg.prepare_lend_mthp.is_some() && is_pool && boot_share_len != 0
-                {
+                if cfg.prepare_lend_mthp.is_some() && is_pool && backing_prepare_len != 0 {
                     // SAFETY: host_addr is a valid mapping of region.size bytes.
                     let prep = unsafe {
-                        mthp::prepare_lend_region(
-                            region.host_addr as *mut u8,
-                            boot_share_len,
-                        )
+                        mthp::prepare_lend_region(region.host_addr as *mut u8, backing_prepare_len)
                     };
                     if !prep.populated {
                         // Host-alloc must fail loudly: proceeding to SHARE an unbacked
@@ -694,7 +704,7 @@ impl GunyahVm {
                              (reserve pool exhausted?) -- refusing to share unbacked memory",
                             region.options.purpose,
                             region.guest_addr.offset(),
-                            boot_share_len
+                            backing_prepare_len
                         );
                         return Err(Error::new(libc::ENOMEM));
                     }
@@ -708,7 +718,7 @@ impl GunyahVm {
                              refusing to share memory the kernel may still migrate",
                             region.options.purpose,
                             region.guest_addr.offset(),
-                            boot_share_len
+                            backing_prepare_len
                         );
                         return Err(Error::new(libc::ENOMEM));
                     }
@@ -748,6 +758,16 @@ impl GunyahVm {
                     continue;
                 }
 
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                if drm2kgsl_bar_backing {
+                    base::info!(
+                        "GH: Drm2KgslPool gpa={:#x} size={:#x} is host-only BAR backing; skipping the original SHARE",
+                        region.guest_addr.offset(),
+                        full_size,
+                    );
+                    continue;
+                }
+
                 // The framebuffer, prepared at the same early-boot moment as everything else that
                 // has to come out of the reserve pool: after the LEND phases, before the pin probe
                 // that follows (so it measures prepared memory rather than faulting the region in
@@ -756,10 +776,13 @@ impl GunyahVm {
                 // wherever they landed -- so the outcome is recorded rather than returned, and the
                 // one thing that reads it is the GPU transport that cannot survive being wrong.
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-                if region.options.purpose == MemoryRegionPurpose::SharedFramebuffer {
-                    let prep =
-                        prepare_shared_framebuffer(&region, cfg.prepare_lend_mthp.is_some());
-                    guest_mem.set_framebuffer_prep(prep);
+                if drm2kgsl_bar_backing {
+                    base::info!(
+                        "GH: Drm2KgslPool gpa={:#x} size={:#x} is host-only BAR backing; skipping the original SHARE",
+                        region.guest_addr.offset(),
+                        full_size,
+                    );
+                    continue;
                 }
 
                 // A growable pool is declared to the guest whole but SHARE'd only in part: the
@@ -856,9 +879,6 @@ impl GunyahVm {
                             &vm_descriptor,
                             region.index as MemSlot,
                             false,
-                            // SHARE'd memory is executable only in non-protected VMs (where
-                            // guest RAM itself is SHARE'd). In protected VMs these are
-                            // data-only regions.
                             !cfg.protection_type.isolates_memory(),
                             region.guest_addr.offset(),
                             share_len,
@@ -908,7 +928,10 @@ impl GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            { base::error!("GH-DIAG: GH_VM_ANDROID_SET_AUTH_TYPE failed"); errno_result() }
+            {
+                base::error!("GH-DIAG: GH_VM_ANDROID_SET_AUTH_TYPE failed");
+                errno_result()
+            }
         }
     }
 
@@ -939,7 +962,6 @@ impl GunyahVm {
         // SAFETY:
         // Safe because we know this is a Gunyah VCPU
         let res = unsafe { ioctl(&vcpu, GH_VCPU_MMAP_SIZE) };
-        if res < 0 { base::error!("GH-DIAG: GH_VCPU_MMAP_SIZE failed"); }
         if res < 0 {
             base::error!("GH-DIAG: GH_VCPU_MMAP_SIZE failed");
         }
@@ -985,7 +1007,10 @@ impl GunyahVm {
                 .insert(GunyahIrqRoute { irq: label, level });
             Ok(())
         } else {
-            { base::error!("GH-DIAG: GH_VM_ADD_FUNCTION failed"); errno_result() }
+            {
+                base::error!("GH-DIAG: GH_VM_ADD_FUNCTION failed");
+                errno_result()
+            }
         }
     }
 
@@ -1007,7 +1032,10 @@ impl GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            { base::error!("GH-DIAG: GH_VM_REMOVE_FUNCTION failed"); errno_result() }
+            {
+                base::error!("GH-DIAG: GH_VM_REMOVE_FUNCTION failed");
+                errno_result()
+            }
         }
     }
 
@@ -1044,7 +1072,10 @@ impl GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            { base::error!("GH-DIAG: GH_VM_SET_DTB_CONFIG failed"); errno_result() }
+            {
+                base::error!("GH-DIAG: GH_VM_SET_DTB_CONFIG failed");
+                errno_result()
+            }
         }
     }
 
@@ -1060,7 +1091,10 @@ impl GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            { base::error!("GH-DIAG: GH_VM_ANDROID_SET_FW_CONFIG failed"); errno_result() }
+            {
+                base::error!("GH-DIAG: GH_VM_ANDROID_SET_FW_CONFIG failed");
+                errno_result()
+            }
         }
     }
 
@@ -1088,7 +1122,10 @@ impl GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            { base::error!("GH-DIAG: GH_VM_SET_BOOT_CONTEXT failed"); errno_result() }
+            {
+                base::error!("GH-DIAG: GH_VM_SET_BOOT_CONTEXT failed");
+                errno_result()
+            }
         }
     }
 
@@ -1203,9 +1240,7 @@ impl GunyahVm {
                 };
                 let dst = ho
                     .checked_add(core::mem::offset_of!(abi::ShimHandoff, parcel) as u64)
-                    .and_then(|a| {
-                        a.checked_add(i * core::mem::size_of::<abi::ShimParcel>() as u64)
-                    })
+                    .and_then(|a| a.checked_add(i * core::mem::size_of::<abi::ShimParcel>() as u64))
                     .ok_or_else(|| Error::new(EINVAL))?;
                 // SAFETY: ShimParcel is repr(C) and made of integers; every byte pattern is valid.
                 let bytes = unsafe {
@@ -1282,8 +1317,10 @@ fn watch_shim(mem: GuestMemory, handoff: GuestAddress) {
     std::thread::Builder::new()
         .name("gh_shim_watch".into())
         .spawn(move || {
-            let status_at = handoff.unchecked_add(core::mem::offset_of!(abi::ShimHandoff, status) as u64);
-            let error_at = handoff.unchecked_add(core::mem::offset_of!(abi::ShimHandoff, error) as u64);
+            let status_at =
+                handoff.unchecked_add(core::mem::offset_of!(abi::ShimHandoff, status) as u64);
+            let error_at =
+                handoff.unchecked_add(core::mem::offset_of!(abi::ShimHandoff, error) as u64);
             let probe_at =
                 handoff.unchecked_add(core::mem::offset_of!(abi::ShimHandoff, exec_probe) as u64);
             let msg_at = handoff.unchecked_add(core::mem::offset_of!(abi::ShimHandoff, msg) as u64);
@@ -1310,7 +1347,9 @@ fn watch_shim(mem: GuestMemory, handoff: GuestAddress) {
                                 base::info!("GH-SHIM: window accepted");
                             }
                         }
-                        abi::SHIM_STATUS_DT_DONE => base::info!("GH-SHIM: /memory now names the window"),
+                        abi::SHIM_STATUS_DT_DONE => {
+                            base::info!("GH-SHIM: /memory now names the window")
+                        }
                         abi::SHIM_STATUS_JUMPING => {
                             base::info!("GH-SHIM: handing over to the payload");
                             return;
@@ -1371,7 +1410,10 @@ impl GunyahVm {
                 .next()
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .unwrap_or(2048);
-            let gpa = match gpa_str.strip_prefix("0x").or_else(|| gpa_str.strip_prefix("0X")) {
+            let gpa = match gpa_str
+                .strip_prefix("0x")
+                .or_else(|| gpa_str.strip_prefix("0X"))
+            {
                 Some(hex) => u64::from_str_radix(hex, 16).ok(),
                 None => gpa_str.parse::<u64>().ok(),
             };
@@ -1384,7 +1426,11 @@ impl GunyahVm {
             let region = match MemoryMappingBuilder::new(size as usize).build() {
                 Ok(m) => m,
                 Err(e) => {
-                    base::error!("GH-SHARE-PROBE: gpa={:#x} scratch mmap failed: {:?}", gpa, e);
+                    base::error!(
+                        "GH-SHARE-PROBE: gpa={:#x} scratch mmap failed: {:?}",
+                        gpa,
+                        e
+                    );
                     continue;
                 }
             };
@@ -1444,7 +1490,8 @@ impl GunyahVm {
             (guest_addr.offset() >> 12) as u32
         };
 
-        // Host-visible blobs are data-only: READ|WRITE, never EXEC.
+        // Host-visible blobs are data-only by default. The pseudo-unprotected guest-RAM window
+        // explicitly requests EXEC below because the payload runs from it.
         let mut flags = GH_MEM_ALLOW_READ;
         if !read_only {
             flags |= GH_MEM_ALLOW_WRITE;
@@ -1579,10 +1626,11 @@ impl GunyahVm {
         let old = self.blob_regions.lock().insert(label, mem_region);
         drop(old);
         debug!(
-            "GUNYAH-SHARE-BLOB: gpa=0x{:x} size=0x{:x} label={} handle=0x{:x}",
+            "GUNYAH-SHARE-BLOB: gpa=0x{:x} size=0x{:x} label={} flags=0x{:x} handle=0x{:x}",
             guest_addr.offset(),
             size,
             label,
+            flags,
             blob.mem_handle,
         );
         Ok(blob.mem_handle)
@@ -1596,7 +1644,10 @@ impl GunyahVm {
         // test-only); share_blob uses monotonic labels under this flag so BAR-offset reuse
         // cannot EBUSY against the leaked parcels. Keep the backing region alive too.
         if std::env::var_os("GH_NO_UNSHARE").is_some() {
-            warn!("GUNYAH-UNSHARE-BLOB: label={} SKIPPED (GH_NO_UNSHARE leak-test)", label);
+            warn!(
+                "GUNYAH-UNSHARE-BLOB: label={} SKIPPED (GH_NO_UNSHARE leak-test)",
+                label
+            );
             return Ok(());
         }
         // The guest has unmapped this host-visible blob and (per the virtio-gpu guest driver)
@@ -1710,14 +1761,25 @@ impl Vm for GunyahVm {
         // (the SHARE is reclaimed by label = gpa>>12, not a slot). `vm_accept` selects WHO drives
         // the guest accept (Off -> caller/virtio-gpu; Sync/Async -> in-VM module via transport);
         // that routing happens above this layer, so nothing to branch on here.
-        // Host-visible blobs are data: rings, buffers, framebuffers. Nothing executes from them.
+        // Host-visible GPU blobs are data-only. EDK2 preload is promoted to ordinary OS RAM after
+        // firmware accepts it, so its stage-2 mapping must permit executable stage-1 mappings.
+        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+        let exec = self.guest_mem.regions().any(|region| {
+            region.options.purpose == MemoryRegionPurpose::Edk2PreloadPool
+                && guest_addr
+                    .offset()
+                    .checked_sub(region.guest_addr.offset())
+                    .is_some_and(|offset| offset < region.size as u64)
+        });
+        #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+        let exec = false;
         let handle = self.share_blob(
             guest_addr,
             mem_region,
             source_descriptor,
             source_offset,
             read_only,
-            false,
+            exec,
         )?;
         Ok((0, Some(handle)))
     }
@@ -1925,45 +1987,8 @@ impl Vm for GunyahVm {
         addr: IoEventAddress,
         datamatch: Datamatch,
     ) -> Result<()> {
-        let (do_datamatch, datamatch_value, datamatch_len) = match datamatch {
-            Datamatch::AnyLength => (false, 0, 0),
-            Datamatch::U8(v) => match v {
-                Some(u) => (true, u as u64, 1),
-                None => (false, 0, 1),
-            },
-            Datamatch::U16(v) => match v {
-                Some(u) => (true, u as u64, 2),
-                None => (false, 0, 2),
-            },
-            Datamatch::U32(v) => match v {
-                Some(u) => (true, u as u64, 4),
-                None => (false, 0, 4),
-            },
-            Datamatch::U64(v) => match v {
-                Some(u) => (true, u, 8),
-                None => (false, 0, 8),
-            },
-        };
-
-        let mut flags = 0;
-        if do_datamatch {
-            flags |= 1 << GH_IOEVENTFD_DATAMATCH;
-        }
-
-        let maddr = if let IoEventAddress::Mmio(maddr) = addr {
-            maddr
-        } else {
-            todo!()
-        };
-
-        let gh_fn_ioeventfd_arg = gh_fn_ioeventfd_arg {
-            fd: evt.as_raw_descriptor(),
-            datamatch: datamatch_value,
-            len: datamatch_len,
-            addr: maddr,
-            flags,
-            ..Default::default()
-        };
+        let gh_fn_ioeventfd_arg =
+            ioeventfd::args(evt.as_raw_descriptor(), addr, datamatch)?;
 
         let function_desc = gh_fn_desc {
             type_: GH_FN_IOEVENTFD,
@@ -1976,26 +2001,21 @@ impl Vm for GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            { base::error!("GH-DIAG: GH_VM_ADD_FUNCTION failed"); errno_result() }
+            {
+                base::error!("GH-DIAG: GH_VM_ADD_FUNCTION failed");
+                errno_result()
+            }
         }
     }
 
     fn unregister_ioevent(
         &mut self,
-        _evt: &Event,
+        evt: &Event,
         addr: IoEventAddress,
-        _datamatch: Datamatch,
+        datamatch: Datamatch,
     ) -> Result<()> {
-        let maddr = if let IoEventAddress::Mmio(maddr) = addr {
-            maddr
-        } else {
-            todo!()
-        };
-
-        let gh_fn_ioeventfd_arg = gh_fn_ioeventfd_arg {
-            addr: maddr,
-            ..Default::default()
-        };
+        let gh_fn_ioeventfd_arg =
+            ioeventfd::args(evt.as_raw_descriptor(), addr, datamatch)?;
 
         let function_desc = gh_fn_desc {
             type_: GH_FN_IOEVENTFD,
@@ -2008,7 +2028,10 @@ impl Vm for GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            { base::error!("GH-DIAG: GH_VM_REMOVE_FUNCTION failed"); errno_result() }
+            {
+                base::error!("GH-DIAG: GH_VM_REMOVE_FUNCTION failed");
+                errno_result()
+            }
         }
     }
 

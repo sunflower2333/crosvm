@@ -1546,6 +1546,8 @@ mod tests {
         .expect("add_pci_bar failed");
         cfg.lock_bar_address(2).expect("lock_bar_address failed");
 
+        // Firmware's all-ones probe must see the normal size mask, while the
+        // stage-2-backed address remains unchanged.
         cfg.write_reg(BAR0_REG + 2, 0, &u32::MAX.to_le_bytes());
         assert_eq!(cfg.read_reg(BAR0_REG + 2), 0xff80_000c);
         assert_eq!(cfg.read_reg(BAR0_REG + 3), 0xffff_ffff);

@@ -58,22 +58,12 @@ extern "C" {
     fn vnc_server_start(server: *mut std::ffi::c_void);
     fn vnc_server_has_input_events(server: *mut std::ffi::c_void) -> c_int;
     fn vnc_server_has_clients(server: *mut std::ffi::c_void) -> c_int;
-    fn vnc_server_resize(
-        server: *mut std::ffi::c_void,
-        width: c_int,
-        height: c_int,
-    ) -> c_int;
-    fn vnc_server_update_framebuffer(
-        server: *mut std::ffi::c_void,
-        data: *const u8,
-        size: u32,
-    );
+    fn vnc_server_resize(server: *mut std::ffi::c_void, width: c_int, height: c_int) -> c_int;
+    fn vnc_server_update_framebuffer(server: *mut std::ffi::c_void, data: *const u8, size: u32);
     fn vnc_server_destroy(server: *mut std::ffi::c_void);
     fn vnc_server_set_input_event_fd(server: *mut std::ffi::c_void, fd: c_int);
-    fn vnc_server_poll_input_event(
-        server: *mut std::ffi::c_void,
-        out: *mut VncInputEvent,
-    ) -> c_int;
+    fn vnc_server_poll_input_event(server: *mut std::ffi::c_void, out: *mut VncInputEvent)
+        -> c_int;
     fn vnc_server_set_cursor(
         server: *mut std::ffi::c_void,
         argb: *const u8,
@@ -211,7 +201,11 @@ impl SharedFramebuffer {
                 self.server.ptr,
                 pixels,
                 size,
-                if has_img { c.pixels.as_ptr() } else { std::ptr::null() },
+                if has_img {
+                    c.pixels.as_ptr()
+                } else {
+                    std::ptr::null()
+                },
                 c.width as c_int,
                 c.height as c_int,
                 c.x as c_int,
@@ -328,7 +322,9 @@ impl VncSurface {
         fb.gpu_frame = None;
 
         if !import.ctx.blit(import.handle, import.width, import.height) {
-            return Err(anyhow::anyhow!("Vulkan blit into the readback target failed"));
+            return Err(anyhow::anyhow!(
+                "Vulkan blit into the readback target failed"
+            ));
         }
         let mapping = import
             .ctx
@@ -401,7 +397,10 @@ impl GpuDisplaySurface for VncSurface {
         if buf_len != expected {
             base::error!(
                 "VNC: framebuffer size mismatch! buf={} expected={} ({}x{})",
-                buf_len, expected, self.width, self.height
+                buf_len,
+                expected,
+                self.width,
+                self.height
             );
         }
         Some(GpuDisplayFramebuffer::new(
@@ -436,7 +435,9 @@ impl GpuDisplaySurface for VncSurface {
             if fb.data.len() != self.local_buffer.len() {
                 base::error!(
                     "VNC: flip size mismatch! shared_fb={} local={} copy_len={}",
-                    fb.data.len(), self.local_buffer.len(), copy_len
+                    fb.data.len(),
+                    self.local_buffer.len(),
+                    copy_len
                 );
             }
             fb.data[..copy_len].copy_from_slice(&self.local_buffer[..copy_len]);
@@ -475,7 +476,7 @@ impl GpuDisplaySurface for VncSurface {
     /// made -- the guest's dmabuf is not referenced by anything any more. The flip really is
     /// finished when the producer is told it is, so `None` is not a promise being dodged, it is the
     /// truth about a transport that reads its source synchronously.
-    fn take_flip_completion_fence(&mut self) -> Option<base::SafeDescriptor> {
+    fn take_flip_completion_fence(&mut self) -> Option<crate::FlipCompletionFence> {
         None
     }
 }
@@ -581,7 +582,6 @@ impl GpuDisplaySurface for VncCursorSurface {
             unsafe { vnc_server_set_cursor(self.server.ptr, std::ptr::null(), 0, 0, 0, 0) }
         }
     }
-
 }
 
 pub struct DisplayVnc {
@@ -693,8 +693,8 @@ impl DisplayVnc {
         let c_password;
         let password_ptr = match &password {
             Some(pwd) => {
-                c_password = std::ffi::CString::new(pwd.as_str())
-                    .map_err(|_| GpuDisplayError::Allocate)?;
+                c_password =
+                    std::ffi::CString::new(pwd.as_str()).map_err(|_| GpuDisplayError::Allocate)?;
                 c_password.as_ptr()
             }
             None => std::ptr::null(),
@@ -854,7 +854,11 @@ impl DisplayVnc {
                 let Some(keyboard) = &mut self.keyboard else {
                     return;
                 };
-                let events = [virtio_input_event::key(ev.linux_keycode, ev.down != 0, false)];
+                let events = [virtio_input_event::key(
+                    ev.linux_keycode,
+                    ev.down != 0,
+                    false,
+                )];
                 // One `send_report` call per RFB event, so the SYN_REPORT it appends closes exactly
                 // the events that arrived together -- which is what a guest reads as one keystroke.
                 if let Err(e) = keyboard.send_report(events.into_iter()) {
@@ -929,8 +933,7 @@ impl DisplayT for DisplayVnc {
     }
 
     fn pending_events(&self) -> bool {
-        !self.input_queue.is_empty()
-            || unsafe { vnc_server_has_input_events(self.server.ptr) != 0 }
+        !self.input_queue.is_empty() || unsafe { vnc_server_has_input_events(self.server.ptr) != 0 }
     }
 
     fn next_event(&mut self) -> GpuDisplayResult<u64> {
@@ -977,10 +980,7 @@ impl DisplayT for DisplayVnc {
             // allocated to match.
             let (width, height) = (64u32, 64u32);
             base::info!("VNC: created cursor surface {}x{}", width, height);
-            let shared_fb = self
-                .shared_fb
-                .clone()
-                .ok_or(GpuDisplayError::Unsupported)?;
+            let shared_fb = self.shared_fb.clone().ok_or(GpuDisplayError::Unsupported)?;
             return Ok(Box::new(VncCursorSurface {
                 width,
                 height,
@@ -1000,15 +1000,13 @@ impl DisplayT for DisplayVnc {
         if width != self.width || height != self.height {
             base::info!(
                 "VNC: resizing from {}x{} to {}x{}",
-                self.width, self.height, width, height
+                self.width,
+                self.height,
+                width,
+                height
             );
-            let ret = unsafe {
-                vnc_server_resize(
-                    self.server.ptr,
-                    width as c_int,
-                    height as c_int,
-                )
-            };
+            let ret =
+                unsafe { vnc_server_resize(self.server.ptr, width as c_int, height as c_int) };
             if ret != 0 {
                 base::error!("VNC: failed to resize server");
                 return Err(GpuDisplayError::Allocate);

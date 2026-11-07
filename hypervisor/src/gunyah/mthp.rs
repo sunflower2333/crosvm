@@ -27,7 +27,7 @@ use base::warn;
 // ── constants ────────────────────────────────────────────────────────────────
 
 const THP_SIZE: u64 = 2 * 1024 * 1024; // 2 MB
-const MAP_UNIT: u64 = 64 * 1024; // 64 KB – smallest collapse unit
+const MAP_UNIT: u64 = 64 * 1024; // 64 KB – coverage accounting unit
 const BATCH_SIZE: u64 = 64 * 1024 * 1024; // 64 MB populate batch
 const COMPACT_INTERVAL: usize = 4; // compact every N batches (256 MB)
 
@@ -44,7 +44,7 @@ const MADV_POPULATE_READ: i32 = 22;
 
 static MTHP_SIZES: &[&str] = &["16kB", "32kB", "64kB", "128kB", "256kB", "512kB", "1024kB"];
 
-// ── collapse cascade table ──────────────────────────────────────────────────
+// ── synchronous collapse sizes ──────────────────────────────────────────────
 
 struct CollapseLevel {
     size: u64,
@@ -52,38 +52,15 @@ struct CollapseLevel {
     name: &'static str,
 }
 
-static COLLAPSE_LEVELS: &[CollapseLevel] = &[
-    CollapseLevel {
-        size: 2 * 1024 * 1024,
-        order: 9,
-        name: "2MB",
-    },
-    CollapseLevel {
-        size: 1024 * 1024,
-        order: 8,
-        name: "1MB",
-    },
-    CollapseLevel {
-        size: 512 * 1024,
-        order: 7,
-        name: "512KB",
-    },
-    CollapseLevel {
-        size: 256 * 1024,
-        order: 6,
-        name: "256KB",
-    },
-    CollapseLevel {
-        size: 128 * 1024,
-        order: 5,
-        name: "128KB",
-    },
-    CollapseLevel {
-        size: 64 * 1024,
-        order: 4,
-        name: "64KB",
-    },
-];
+// MADV_COLLAPSE processes only complete PMD-sized windows. A smaller request
+// can return success after processing no windows, so it cannot establish mTHP
+// coverage. Intermediate mTHP sizes may still be allocated during population;
+// leave them unverified here when the 2 MB collapse fails.
+static COLLAPSE_LEVELS: &[CollapseLevel] = &[CollapseLevel {
+    size: THP_SIZE,
+    order: 9,
+    name: "2MB",
+}];
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -101,6 +78,49 @@ fn trigger_compact() {
     write_file("/proc/sys/vm/compact_memory", "1\n");
 }
 
+/// Try complete, aligned PMD windows before population faults in small pages.
+///
+/// Seed one page per window so kernels that reject entirely empty PTE tables can collapse
+/// the remaining shmem holes. Once all small pages are populated, collapse needs another folio
+/// before it can release those old pages.
+/// This is opportunistic: failures keep the existing populate path and final collapse pass.
+///
+/// # Safety
+/// `host_addr` must point to a valid mapping of `size` bytes.
+unsafe fn collapse_before_populate(host_addr: *mut u8, size: usize) -> (u64, u64) {
+    let thp = THP_SIZE as usize;
+    let page_size = base::pagesize();
+    // This helper uses the 4 KiB kernel's 2 MiB PMD geometry. Larger base-page
+    // kernels use a different PMD size; preserve the existing populate path there.
+    if page_size != 4096 {
+        return (0, 0);
+    }
+    let Some(end) = (host_addr as usize).checked_add(size) else {
+        return (0, 0);
+    };
+    let Some(aligned) = (host_addr as usize).checked_add(thp - 1) else {
+        return (0, 0);
+    };
+    let mut addr = aligned & !(thp - 1);
+    let mut attempted = 0;
+    let mut succeeded = 0;
+    while let Some(next) = addr.checked_add(thp) {
+        if next > end {
+            break;
+        }
+        attempted += 1;
+        // Populate through the syscall: allocation failure must not become a fatal
+        // userspace write fault. The ordinary batch fallback still runs afterward.
+        if libc::madvise(addr as *mut libc::c_void, page_size, MADV_POPULATE_WRITE) == 0
+            && libc::madvise(addr as *mut libc::c_void, thp, MADV_COLLAPSE) == 0
+        {
+            succeeded += 1;
+        }
+        addr = next;
+    }
+    (attempted, succeeded)
+}
+
 // ── public API ──────────────────────────────────────────────────────────────
 
 /// Result of [`prepare_lend_region`]: carries a per-2MB bitmap indicating
@@ -108,7 +128,7 @@ fn trigger_compact() {
 pub struct LendPrepResult {
     /// Per-2MB-chunk: `true` means NOT a 2MB THP (i.e. needs small-page LEND).
     pub need_small: Vec<bool>,
-    /// Total bytes that were successfully collapsed to ≥ 64 KB folios.
+    /// Total bytes in complete 2 MB windows whose MADV_COLLAPSE succeeded.
     pub large_page_bytes: u64,
     /// Hard verification that every page in the region is genuinely resolvable
     /// (`MADV_POPULATE_READ` over the whole range succeeded). Phase 2's
@@ -131,7 +151,7 @@ pub struct LendPrepResult {
 /// Implements the four-phase strategy from QEMU's `gunyah_add_mem`:
 ///   Phase 1 – drop caches, compact, enable mTHP intermediate sizes
 ///   Phase 2 – populate in 64 MB batches (MADV_POPULATE_WRITE)
-///   Phase 3 – cascading MADV_COLLAPSE (2 MB → 64 KB)
+///   Phase 3 – MADV_COLLAPSE over complete 2 MB windows
 ///   Phase 4 – mlock
 ///
 /// # Safety
@@ -197,10 +217,15 @@ pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResu
 
         let mut batch_idx: usize = 0;
         let mut offset: u64 = 0;
+        let mut early_attempted = 0;
+        let mut early_succeeded = 0;
         while offset < size {
             let len = std::cmp::min(size - offset, BATCH_SIZE) as usize;
             let ptr = host_addr.add(offset as usize);
 
+            let (attempted, succeeded) = collapse_before_populate(ptr, len);
+            early_attempted += attempted;
+            early_succeeded += succeeded;
             let ret = libc::madvise(ptr as *mut libc::c_void, len, MADV_POPULATE_WRITE);
             if ret != 0 {
                 // Fallback: touch each page manually
@@ -218,17 +243,21 @@ pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResu
             }
             offset += BATCH_SIZE;
         }
+        info!(
+            "GH: Phase 2: early 2MB collapse: {} / {} attempts succeeded",
+            early_succeeded, early_attempted
+        );
         info!("GH: Phase 2: population complete");
     }
 
-    // ── Phase 3: cascading MADV_COLLAPSE (2 MB → 64 KB) ────────────
+    // ── Phase 3: MADV_COLLAPSE over complete 2 MB windows ──────────
 
     let map_count = (size / MAP_UNIT) as usize;
     let mut order_map = vec![0u8; map_count];
     let mut large_page_bytes: u64 = 0;
 
     {
-        info!("GH: Phase 3: cascading MADV_COLLAPSE (2MB -> 64KB) ...");
+        info!("GH: Phase 3: MADV_COLLAPSE over complete 2MB windows ...");
 
         for level in COLLAPSE_LEVELS {
             let csize = level.size;
@@ -289,7 +318,7 @@ pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResu
             }
         }
         info!(
-            "GH:   uncollapsed (4KB): {} units = {} MB",
+            "GH:   not verified as 2MB: {} units = {} MB",
             uncollapsed,
             (uncollapsed * 64) / 1024
         );
@@ -318,7 +347,7 @@ pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResu
     }
 
     info!(
-        "GH: === large-page coverage: {} / {} MB ({:.1}%) ===",
+        "GH: === verified 2MB collapse coverage: {} / {} MB ({:.1}%) ===",
         large_page_bytes >> 20,
         size >> 20,
         large_page_bytes as f64 * 100.0 / size as f64
@@ -357,8 +386,11 @@ pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResu
     // cannot serve a page returns an error here instead of silently leaving a hole
     // that only surfaces as a SIGBUS on first guest/host touch. Safe (no crash risk)
     // unlike a manual read/write touch of memory that might not be backed.
-    let verify_ret =
-        libc::madvise(host_addr as *mut libc::c_void, size as usize, MADV_POPULATE_READ);
+    let verify_ret = libc::madvise(
+        host_addr as *mut libc::c_void,
+        size as usize,
+        MADV_POPULATE_READ,
+    );
     let populated = verify_ret == 0;
     if populated {
         info!("GH: verify (MADV_POPULATE_READ): OK, region fully backed");

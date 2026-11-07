@@ -83,6 +83,9 @@ pub const RUTABAGA_BLOB_MEM_HOST3D_GUEST: u32 = 0x0003;
 pub const RUTABAGA_BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;
 pub const RUTABAGA_BLOB_FLAG_USE_SHAREABLE: u32 = 0x0002;
 pub const RUTABAGA_BLOB_FLAG_USE_CROSS_DEVICE: u32 = 0x0004;
+/// Private crosvm flag: the blob's descriptor is an authenticated native AHB
+/// DMA-BUF and the display may present the same allocation directly.
+pub const RUTABAGA_BLOB_FLAG_USE_NATIVE_AHB: u32 = 0x0010;
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct ResourceCreateBlob {
@@ -173,6 +176,16 @@ pub struct RutabagaFence {
     pub fence_id: u64,
     pub ctx_id: u32,
     pub ring_idx: u8,
+}
+
+/// A failed fence is not a completion. Ownership remains with the renderer
+/// until its consumer has explicitly recovered/quiesced the backend.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RutabagaFenceError {
+    pub ctx_id: u32,
+    pub ring_idx: u32,
+    pub fence_id: u64,
+    pub error: i32,
 }
 
 /// Rutabaga debug types
@@ -770,5 +783,6 @@ impl<S> fmt::Debug for RutabagaHandler<S> {
 }
 
 pub type RutabagaFenceHandler = RutabagaHandler<RutabagaFence>;
+pub type RutabagaFenceErrorHandler = RutabagaHandler<RutabagaFenceError>;
 
 pub type RutabagaDebugHandler = RutabagaHandler<RutabagaDebug>;

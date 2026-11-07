@@ -120,6 +120,14 @@ pub mod gpu {
     /* The following capabilities are not upstreamed. */
     pub const VIRTIO_GPU_F_FENCE_PASSING: u32 = 5;
     pub const VIRTIO_GPU_F_CREATE_GUEST_HANDLE: u32 = 6;
+    /// Private explicit-layout Native AHB allocation command/response.
+    pub const VIRTIO_GPU_F_NATIVE_AHB_V2: u32 = 7;
+    /// Separate native transaction acceptance from buffer release observation.
+    pub const VIRTIO_GPU_F_NATIVE_AHB_RELEASE: u32 = 8;
+    /// Explicit preservation for non-CPU-visible native AHB memory.
+    pub const VIRTIO_GPU_F_NATIVE_AHB_PAGING: u32 = 9;
+    /// Optional actual display-transaction timing, with explicit unknown fields.
+    pub const VIRTIO_GPU_F_DISPLAY_TIMING: u32 = 10;
 
     pub const VIRTIO_GPU_SHM_ID_HOST_VISIBLE: u8 = 0x0001;
 

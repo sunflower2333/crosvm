@@ -323,7 +323,10 @@ impl Encoder {
         if ok {
             return Ok(());
         }
-        let end = message.iter().position(|b| *b == 0).unwrap_or(message.len());
+        let end = message
+            .iter()
+            .position(|b| *b == 0)
+            .unwrap_or(message.len());
         Err(String::from_utf8_lossy(&message[..end]).into_owned())
     }
 
@@ -389,7 +392,9 @@ impl Drop for Encoder {
 
 enum PollOutput {
     /// A compressed frame is in the buffer.
-    Frame { flags: u32 },
+    Frame {
+        flags: u32,
+    },
     /// Nothing was ready before the timeout.
     Idle,
     /// The frame is bigger than the buffer; it is still queued, and this is how big it is.

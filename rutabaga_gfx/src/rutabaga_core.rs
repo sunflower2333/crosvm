@@ -65,6 +65,18 @@ pub struct RutabagaResource {
     pub pool_offset: Option<u64>,
 }
 
+/// Actual native attachment observations returned by a checked backend.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeResourceAttachment {
+    pub ctx_id: u32,
+    pub resource_id: u32,
+    pub allocation_size: u64,
+    pub dma_device: u64,
+    pub dma_inode: u64,
+    pub kernel_flags: u64,
+    pub map_info: u32,
+}
+
 /// The preserved fields of `RutabagaResource` that are saved and loaded across snapshot and
 /// restore.
 #[derive(Deserialize, Serialize)]
@@ -217,6 +229,13 @@ pub trait RutabagaComponent {
         Err(RutabagaError::Unsupported)
     }
 
+    /// Register exactly an externally allocated DMA-BUF. This must not invoke
+    /// a guest GEM_NEW/get_blob path that creates a different backing.
+    fn import_host_dmabuf(&mut self, _resource_id: u32, _size: u64,
+        _handle: RutabagaHandle) -> RutabagaResult<RutabagaResource> {
+        Err(RutabagaError::Unsupported)
+    }
+
     /// Implementations must attach `vecs` to the resource.
     fn attach_backing(
         &self,
@@ -361,6 +380,23 @@ pub trait RutabagaContext {
     /// Implementations may use `resource` in this context's command stream.
     fn attach(&mut self, _resource: &mut RutabagaResource);
 
+    fn attach_host_dmabuf(&mut self, _resource: &mut RutabagaResource)
+        -> RutabagaResult<NativeResourceAttachment> {
+        Err(RutabagaError::Unsupported)
+    }
+
+    /// A Native AHB attachment must report real backend retirement, including
+    /// failure after a partial import. The legacy void detach is insufficient.
+    fn detach_host_dmabuf(&mut self, _resource: &RutabagaResource) -> RutabagaResult<()> {
+        Err(RutabagaError::Unsupported)
+    }
+
+    /// Reset-only retirement of every native GPUVA alias after callers stop
+    /// commands and drain genuine GPU/display use. Failure retains owners.
+    fn prepare_native_reset(&mut self) -> RutabagaResult<()> {
+        Err(RutabagaError::Unsupported)
+    }
+
     /// Implementations must stop using `resource` in this context's command stream.
     fn detach(&mut self, _resource: &RutabagaResource);
 
@@ -495,6 +531,16 @@ fn calculate_component(component_mask: u8) -> RutabagaResult<RutabagaComponentTy
 /// thread-safe is more difficult.
 pub struct Rutabaga {
     resources: Map<u32, RutabagaResource>,
+    // Host-imported allocations are not ordinary guest-owned resources. Until
+    // the producer/consumer lease bridge exists, the owner context cannot
+    // submit or disappear, and generic resource APIs cannot mutate ownership.
+    // Some(ctx) includes failed checked attaches: the backend may have imported
+    // before discovering unsupported cache metadata.
+    host_dmabuf_resources: Map<u32, Option<u32>>,
+    // Native AHBs created by the explicit guest protocol retain every context
+    // import. False means the backend may have imported before returning an
+    // error; that context cannot submit until checked detach or destruction.
+    native_ahb_attachments: Map<(u32, u32), bool>,
     #[cfg(fence_passing_option1)]
     shareable_fences: Map<u64, RutabagaHandle>,
     contexts: Map<u32, Box<dyn RutabagaContext>>,
@@ -514,13 +560,152 @@ struct RutabagaSnapshot {
 }
 
 impl Rutabaga {
+    fn require_guest_resource(&self, resource_id: u32) -> RutabagaResult<()> {
+        if self.host_dmabuf_resources.contains_key(&resource_id) {
+            return Err(RutabagaError::Unsupported);
+        }
+        Ok(())
+    }
+
+    /// Native AHB backing is authenticated at allocation/import time. Legacy
+    /// backing replacement and transfer operations must not change or copy it.
+    fn require_transfer_resource(&self, resource_id: u32) -> RutabagaResult<()> {
+        self.require_guest_resource(resource_id)?;
+        if self.resources.get(&resource_id).is_some_and(|resource| {
+            resource.blob_flags & RUTABAGA_BLOB_FLAG_USE_NATIVE_AHB != 0
+        }) {
+            return Err(RutabagaError::Unsupported);
+        }
+        Ok(())
+    }
+
+    fn require_guest_context(&self, ctx_id: u32) -> RutabagaResult<()> {
+        if self.host_dmabuf_resources.values().any(|owner| *owner == Some(ctx_id)) {
+            return Err(RutabagaError::Unsupported);
+        }
+        Ok(())
+    }
+
+    fn require_no_host_dmabufs(&self) -> RutabagaResult<()> {
+        if !self.host_dmabuf_resources.is_empty()
+            || self.resources.values().any(|resource|
+                resource.blob_flags & RUTABAGA_BLOB_FLAG_USE_NATIVE_AHB != 0)
+        {
+            return Err(RutabagaError::Unsupported);
+        }
+        Ok(())
+    }
+
+    /// The actual component after capset selection and initialization fallback.
+    pub fn default_component_type(&self) -> RutabagaComponentType {
+        self.default_component
+    }
+
     pub fn suspend(&self) -> RutabagaResult<()> {
+        self.require_no_host_dmabufs()?;
         let component = self
             .components
             .get(&self.default_component)
             .ok_or(RutabagaError::InvalidComponent)?;
 
         component.suspend()
+    }
+
+    /// Preflight reset without dropping owners. An unbound native allocation
+    /// is an ordinary renderer resource to unref, not a serialization request.
+    /// Checked (including partial) imports must retire explicitly first; a
+    /// context destructor with no error result cannot prove that retirement.
+    /// The caller must separately exclude all display readers and GPU fences.
+    pub fn check_reset(&self) -> RutabagaResult<()> {
+        if !self.host_dmabuf_resources.is_empty() || !self.native_ahb_attachments.is_empty() {
+            return Err(RutabagaError::SpecViolation(
+                "GPU reset requires checked native imports to retire first",
+            ));
+        }
+        for resource_id in self.resources.keys() {
+            self.reset_component_of(*resource_id)?;
+        }
+        Ok(())
+    }
+
+    /// Retire checked native imports after the caller has drained genuine
+    /// renderer fences and display readers. A destructor is not a substitute
+    /// for checked detach: partial imports and failed detaches retain owners.
+    pub fn retire_native_imports_for_reset(&mut self) -> RutabagaResult<()> {
+        if !self.host_dmabuf_resources.is_empty() {
+            return Err(RutabagaError::SpecViolation(
+                "GPU reset cannot retire private host DMA-BUF resources",
+            ));
+        }
+        // Validate the complete owner graph before the first backend mutation.
+        // context_detach_resource historically accepts an absent resource, so
+        // it cannot by itself serve as this reset preflight.
+        for resource_id in self.resources.keys() {
+            self.reset_component_of(*resource_id)?;
+        }
+        let mut attachments: Vec<_> = self.native_ahb_attachments.keys().copied().collect();
+        attachments.sort_unstable();
+        for &(ctx_id, resource_id) in &attachments {
+            self.require_guest_context(ctx_id)?;
+            self.require_guest_resource(resource_id)?;
+            let context = self.contexts.get(&ctx_id)
+                .ok_or(RutabagaError::InvalidContextId)?;
+            let resource = self.resources.get(&resource_id)
+                .ok_or(RutabagaError::InvalidResourceId)?;
+            if context.capset_id() != Some(RUTABAGA_CAPSET_DRM)
+                || resource.blob_flags & RUTABAGA_BLOB_FLAG_USE_NATIVE_AHB == 0
+            {
+                return Err(RutabagaError::SpecViolation("invalid native reset import owner"));
+            }
+        }
+        // Retire each importer's complete VA slice before detaching any import.
+        // Old aliases survive GEM_SET_IOVA(0), so resource-local iova metadata
+        // cannot prove that an allocation has no remaining GPU mappings.
+        let mut previous_context = None;
+        for &(ctx_id, _) in &attachments {
+            if previous_context == Some(ctx_id) {
+                continue;
+            }
+            if let Err(error) = self.contexts.get_mut(&ctx_id)
+                .ok_or(RutabagaError::InvalidContextId)?.prepare_native_reset()
+            {
+                log::error!("native reset context retirement failed: ctx={} error={}", ctx_id, error);
+                return Err(error);
+            }
+            previous_context = Some(ctx_id);
+        }
+        for (ctx_id, resource_id) in attachments {
+            // Removes exactly this map entry only after checked backend success.
+            // On error retain every context/resource and all unresolved imports.
+            let confirmed = self.native_ahb_attachments.get(&(ctx_id, resource_id)).copied();
+            if let Err(error) = self.context_detach_resource(ctx_id, resource_id) {
+                let resource = &self.resources[&resource_id]; // Complete graph validated above.
+                log::error!(
+                    "native reset checked detach failed: ctx={} resource={} confirmed={:?} size={} blob_flags={:#x} owner_mask={:#x} unresolved={} error={}",
+                    ctx_id, resource_id, confirmed, resource.size, resource.blob_flags,
+                    resource.component_mask, self.native_ahb_attachments.len(), error
+                );
+                return Err(error);
+            }
+        }
+        self.check_reset()
+    }
+
+    fn reset_component_of(&self, resource_id: u32) -> RutabagaResult<RutabagaComponentType> {
+        let resource = self.resources.get(&resource_id)
+            .ok_or(RutabagaError::InvalidResourceId)?;
+        // Never silently send a native object's unref to the default backend
+        // when its declared owner is missing or ambiguous. Keep legacy
+        // non-native resource routing unchanged.
+        let component = if resource.blob_flags & RUTABAGA_BLOB_FLAG_USE_NATIVE_AHB != 0 {
+            calculate_component(resource.component_mask)?
+        } else {
+            self.component_of(resource_id)
+        };
+        if !self.components.contains_key(&component) {
+            return Err(RutabagaError::InvalidComponent);
+        }
+        Ok(component)
     }
 
     /// Drops all resources and contexts, releasing them against the still-live components (and
@@ -530,6 +715,7 @@ impl Rutabaga {
     /// (`RutabagaError::InvalidResourceId`), so leftover resources would otherwise break it.
     /// Keeping the components avoids paying to re-initialize the renderer.
     pub fn reset(&mut self) -> RutabagaResult<()> {
+        self.check_reset()?;
         // Destroy contexts first: dropping each runs its Drop (for gfxstream,
         // stream_renderer_context_destroy), which detaches the context's resources host-side so
         // the resource refcounts can reach zero when we unref below.
@@ -539,10 +725,11 @@ impl Rutabaga {
         // backend keeps it and aborts (createColorBufferWithResourceHandle) when the next guest
         // re-creates the same resource id.
         let resource_ids: Vec<u32> = self.resources.keys().copied().collect();
-        if let Some(component) = self.components.get_mut(&self.default_component) {
-            for resource_id in resource_ids {
-                component.unref_resource(resource_id);
-            }
+        for resource_id in resource_ids {
+            let component_type = self.reset_component_of(resource_id)?;
+            let component = self.components.get(&component_type)
+                .ok_or(RutabagaError::InvalidComponent)?;
+            component.unref_resource(resource_id);
         }
         self.resources.clear();
         Ok(())
@@ -551,6 +738,7 @@ impl Rutabaga {
     /// Take a snapshot of Rutabaga's current state. The snapshot is serialized into an opaque byte
     /// stream and written to `w`.
     pub fn snapshot(&self, directory: &Path) -> RutabagaResult<()> {
+        self.require_no_host_dmabufs()?;
         let snapshot_writer = RutabagaSnapshotWriter::from_existing(directory);
 
         let component = self
@@ -578,6 +766,7 @@ impl Rutabaga {
     }
 
     fn destroy_objects(&mut self) -> RutabagaResult<()> {
+        self.require_no_host_dmabufs()?;
         let resource_ids: Vec<_> = self.resources.keys().cloned().collect();
         resource_ids
             .into_iter()
@@ -823,6 +1012,7 @@ impl Rutabaga {
         import_handle: RutabagaHandle,
         import_data: RutabagaImportData,
     ) -> RutabagaResult<()> {
+        self.require_transfer_resource(resource_id)?;
         let component = self
             .components
             .get_mut(&self.default_component)
@@ -848,6 +1038,7 @@ impl Rutabaga {
         resource_id: u32,
         mut vecs: Vec<RutabagaIovec>,
     ) -> RutabagaResult<()> {
+        self.require_transfer_resource(resource_id)?;
         let component_type = self.component_of(resource_id);
         let component = self
             .components
@@ -866,6 +1057,7 @@ impl Rutabaga {
 
     /// Detaches any previously attached iovecs from the resource.
     pub fn detach_backing(&mut self, resource_id: u32) -> RutabagaResult<()> {
+        self.require_transfer_resource(resource_id)?;
         let component_type = self.component_of(resource_id);
         let component = self
             .components
@@ -884,6 +1076,14 @@ impl Rutabaga {
 
     /// Releases guest kernel reference on the resource.
     pub fn unref_resource(&mut self, resource_id: u32) -> RutabagaResult<()> {
+        self.require_guest_resource(resource_id)?;
+        if self.native_ahb_attachments.keys().any(|&(_, id)| id == resource_id) {
+            return Err(RutabagaError::Unsupported);
+        }
+        self.unref_resource_internal(resource_id)
+    }
+
+    fn unref_resource_internal(&mut self, resource_id: u32) -> RutabagaResult<()> {
         let component_type = self.component_of(resource_id);
         let component = self
             .components
@@ -906,6 +1106,7 @@ impl Rutabaga {
         resource_id: u32,
         transfer: Transfer3D,
     ) -> RutabagaResult<()> {
+        self.require_transfer_resource(resource_id)?;
         let component_type = self.component_of(resource_id);
         let component = self
             .components
@@ -931,6 +1132,7 @@ impl Rutabaga {
         transfer: Transfer3D,
         buf: Option<IoSliceMut>,
     ) -> RutabagaResult<()> {
+        self.require_transfer_resource(resource_id)?;
         let component_type = self.component_of(resource_id);
         let component = self
             .components
@@ -946,6 +1148,7 @@ impl Rutabaga {
     }
 
     pub fn resource_flush(&mut self, resource_id: u32) -> RutabagaResult<()> {
+        self.require_guest_resource(resource_id)?;
         let component_type = self.component_of(resource_id);
         let component = self
             .components
@@ -1006,8 +1209,64 @@ impl Rutabaga {
         Ok(())
     }
 
+    /// Imports a host-owned allocation. Generic guest mutation is forbidden;
+    /// only checked attach, descriptor query/export, and host cleanup apply.
+    pub fn resource_import_host_dmabuf(&mut self, resource_id: u32, size: u64,
+        handle: RutabagaHandle) -> RutabagaResult<()> {
+        if resource_id == 0 || size == 0 || self.resources.contains_key(&resource_id) {
+            return Err(RutabagaError::InvalidResourceId);
+        }
+        if self.default_component != RutabagaComponentType::VirglRenderer {
+            return Err(RutabagaError::Unsupported);
+        }
+        let component = self.components.get_mut(&self.default_component)
+            .ok_or(RutabagaError::InvalidComponent)?;
+        let resource = component.import_host_dmabuf(resource_id, size, handle)?;
+        self.resources.insert(resource_id, resource);
+        self.host_dmabuf_resources.insert(resource_id, None);
+        Ok(())
+    }
+
+    /// Only a backend with checked real DMA import can acknowledge this attach.
+    pub fn context_attach_host_dmabuf(&mut self, ctx_id: u32, resource_id: u32)
+        -> RutabagaResult<NativeResourceAttachment> {
+        if ctx_id == 0 { return Err(RutabagaError::InvalidContextId); }
+        let owner = self.host_dmabuf_resources.get_mut(&resource_id)
+            .ok_or(RutabagaError::InvalidResourceId)?;
+        if owner.is_some_and(|previous| previous != ctx_id) {
+            return Err(RutabagaError::Unsupported);
+        }
+        let ctx = self.contexts.get_mut(&ctx_id).ok_or(RutabagaError::InvalidContextId)?;
+        if ctx.capset_id() != Some(RUTABAGA_CAPSET_DRM) {
+            return Err(RutabagaError::Unsupported);
+        }
+        let resource = self.resources.get_mut(&resource_id)
+            .ok_or(RutabagaError::InvalidResourceId)?;
+        // Burn ownership before a backend with possibly partial side effects.
+        // Failure never restores ordinary submission or frees the allocation.
+        *owner = Some(ctx_id);
+        let result = ctx.attach_host_dmabuf(resource)?;
+        resource.map_info = Some(result.map_info);
+        Ok(result)
+    }
+
+    /// Host-only cleanup for the current no-submission allocation phase.
+    /// The owner must first release external guest mappings and all native
+    /// references. No ordinary SUBMIT is admitted from attachment until this
+    /// cleanup, including when attachment failed after a partial import.
+    /// Future producer admission must replace this contract with exact fences.
+    pub fn unref_host_dmabuf(&mut self, resource_id: u32) -> RutabagaResult<()> {
+        if !self.host_dmabuf_resources.contains_key(&resource_id) {
+            return Err(RutabagaError::InvalidResourceId);
+        }
+        self.unref_resource_internal(resource_id)?;
+        self.host_dmabuf_resources.remove(&resource_id);
+        Ok(())
+    }
+
     /// Returns a memory mapping of the blob resource.
     pub fn map(&mut self, resource_id: u32) -> RutabagaResult<RutabagaMapping> {
+        self.require_guest_resource(resource_id)?;
         let resource = self
             .resources
             .get_mut(&resource_id)
@@ -1056,6 +1315,7 @@ impl Rutabaga {
 
     /// Unmaps the blob resource from the default component
     pub fn unmap(&mut self, resource_id: u32) -> RutabagaResult<()> {
+        self.require_guest_resource(resource_id)?;
         let resource = self
             .resources
             .get_mut(&resource_id)
@@ -1129,15 +1389,20 @@ impl Rutabaga {
         let share_mask = RUTABAGA_BLOB_FLAG_USE_SHAREABLE | RUTABAGA_BLOB_FLAG_USE_CROSS_DEVICE;
         let shareable = (resource.blob_flags & share_mask != 0) || !resource.blob;
 
+        // Preserve the owner's descriptor even when duplication fails (for
+        // example under fd pressure). A failed export must not invalidate the
+        // Native AHB identity used by later imports and scanout.
+        if shareable {
+            return resource
+                .handle
+                .as_ref()
+                .ok_or(RutabagaError::InvalidRutabagaHandle)?
+                .try_clone();
+        }
         let opt = resource.handle.take();
 
-        match (opt, shareable) {
-            (Some(handle), true) => {
-                let clone = handle.try_clone()?;
-                resource.handle = Some(handle);
-                Ok(clone)
-            }
-            (Some(handle), false) => {
+        match opt {
+            Some(handle) => {
                 // Exactly one strong reference in this case.
                 let hnd =
                     Arc::try_unwrap(handle).map_err(|_| RutabagaError::InvalidRutabagaHandle)?;
@@ -1149,6 +1414,7 @@ impl Rutabaga {
 
     /// Exports a display-only DMA-BUF view when the active component supports it.
     pub fn export_display_blob(&mut self, resource_id: u32) -> RutabagaResult<RutabagaHandle> {
+        self.require_guest_resource(resource_id)?;
         let component = self
             .components
             .get(&self.default_component)
@@ -1207,14 +1473,24 @@ impl Rutabaga {
 
     /// Destroys the context given by `ctx_id`.
     pub fn destroy_context(&mut self, ctx_id: u32) -> RutabagaResult<()> {
-        self.contexts
+        self.require_guest_context(ctx_id)?;
+        let context = self
+            .contexts
             .remove(&ctx_id)
             .ok_or(RutabagaError::InvalidContextId)?;
+        log::info!("rutabaga context destroy begin: ctx_id={ctx_id}");
+        drop(context);
+        // The backend context destructor has retired all of its imports.
+        // Other importing contexts still retain their own resource references.
+        self.native_ahb_attachments.retain(|&(owner, _), _| owner != ctx_id);
+        log::info!("rutabaga context destroy complete: ctx_id={ctx_id}");
         Ok(())
     }
 
     /// Attaches the resource given by `resource_id` to the context given by `ctx_id`.
     pub fn context_attach_resource(&mut self, ctx_id: u32, resource_id: u32) -> RutabagaResult<()> {
+        self.require_guest_resource(resource_id)?;
+        self.require_guest_context(ctx_id)?;
         let ctx = self
             .contexts
             .get_mut(&ctx_id)
@@ -1225,23 +1501,74 @@ impl Rutabaga {
             .get_mut(&resource_id)
             .ok_or(RutabagaError::InvalidResourceId)?;
 
-        ctx.attach(resource);
+        if resource.blob_flags & RUTABAGA_BLOB_FLAG_USE_NATIVE_AHB != 0 {
+            if ctx.capset_id() != Some(RUTABAGA_CAPSET_DRM) {
+                return Err(RutabagaError::Unsupported);
+            }
+            let key = (ctx_id, resource_id);
+            match self.native_ahb_attachments.get(&key) {
+                Some(true) => return Ok(()),
+                Some(false) => return Err(RutabagaError::Unsupported),
+                None => {}
+            }
+            // Publish the potential owner before an import with side effects.
+            self.native_ahb_attachments.insert(key, false);
+            let info = ctx.attach_host_dmabuf(resource)?;
+            if info.ctx_id != ctx_id || info.resource_id != resource_id
+                || info.allocation_size != resource.size || info.dma_inode == 0
+                || !matches!(info.map_info,
+                    RUTABAGA_MAP_CACHE_CACHED | RUTABAGA_MAP_CACHE_WC | RUTABAGA_MAP_CACHE_UNCACHED)
+                || resource.map_info.is_some_and(|old| old != info.map_info)
+            {
+                return Err(RutabagaError::InvalidRutabagaHandle);
+            }
+            resource.map_info = Some(info.map_info);
+            self.native_ahb_attachments.insert(key, true);
+        } else {
+            ctx.attach(resource);
+        }
         Ok(())
     }
 
     /// Detaches the resource given by `resource_id` from the context given by `ctx_id`.
+    ///
+    /// Resource teardown is allowed to race the queued context-detach command.  In
+    /// particular, a guest may drop its last resource reference before the command
+    /// reaches the VMM, while the context itself is still being torn down.  Detach is
+    /// idempotent in that state: there is no Rutabaga resource left to pass to the
+    /// backend, and the context destructor will retire any backend attachment.  Keep
+    /// an invalid context an error, since that still identifies a malformed command,
+    /// but do not turn an already-completed resource detach into a guest-visible
+    /// renderer error (which can provoke a device reset).
     pub fn context_detach_resource(&mut self, ctx_id: u32, resource_id: u32) -> RutabagaResult<()> {
+        self.require_guest_resource(resource_id)?;
+        self.require_guest_context(ctx_id)?;
         let ctx = self
             .contexts
             .get_mut(&ctx_id)
             .ok_or(RutabagaError::InvalidContextId)?;
 
-        let resource = self
-            .resources
-            .get_mut(&resource_id)
-            .ok_or(RutabagaError::InvalidResourceId)?;
+        let Some(resource) = self.resources.get_mut(&resource_id) else {
+            log::debug!(
+                "rutabaga context detach ignored missing resource: ctx_id={} resource_id={}",
+                ctx_id,
+                resource_id
+            );
+            return Ok(());
+        };
 
-        ctx.detach(resource);
+        if resource.blob_flags & RUTABAGA_BLOB_FLAG_USE_NATIVE_AHB != 0 {
+            let key = (ctx_id, resource_id);
+            if self.native_ahb_attachments.contains_key(&key) {
+                // Failure keeps the reference and prevents further submits
+                // through a possibly partially detached context.
+                self.native_ahb_attachments.insert(key, false);
+                ctx.detach_host_dmabuf(resource)?;
+                self.native_ahb_attachments.remove(&key);
+            }
+        } else {
+            ctx.detach(resource);
+        }
         Ok(())
     }
 
@@ -1252,6 +1579,12 @@ impl Rutabaga {
         commands: &mut [u8],
         fence_ids: &[u64],
     ) -> RutabagaResult<()> {
+        self.require_guest_context(ctx_id)?;
+        if self.native_ahb_attachments.iter().any(|(&(owner, _), &confirmed)|
+            owner == ctx_id && !confirmed)
+        {
+            return Err(RutabagaError::Unsupported);
+        }
         let ctx = self
             .contexts
             .get_mut(&ctx_id)
@@ -1299,9 +1632,33 @@ pub struct RutabagaBuilder {
     channels: Option<Vec<RutabagaChannel>>,
     debug_handler: Option<RutabagaDebugHandler>,
     renderer_features: Option<String>,
+    fence_error_handler: Option<RutabagaFenceErrorHandler>,
 }
 
 impl RutabagaBuilder {
+    /// Resolve capset-driven selection before initialization. The renderer may
+    /// still fall back to 2D if initialization is unavailable.
+    pub fn default_component_type(&self) -> RutabagaComponentType {
+        if self.capset_mask == 0 {
+            return self.default_component;
+        }
+        let supports = |id: u32| self.capset_mask & (1 << id) != 0;
+        if supports(RUTABAGA_CAPSET_GFXSTREAM_VULKAN)
+            || supports(RUTABAGA_CAPSET_GFXSTREAM_MAGMA)
+            || supports(RUTABAGA_CAPSET_GFXSTREAM_GLES)
+            || supports(RUTABAGA_CAPSET_GFXSTREAM_COMPOSER)
+        {
+            RutabagaComponentType::Gfxstream
+        } else if supports(RUTABAGA_CAPSET_VIRGL2)
+            || supports(RUTABAGA_CAPSET_VENUS)
+            || supports(RUTABAGA_CAPSET_DRM)
+        {
+            RutabagaComponentType::VirglRenderer
+        } else {
+            RutabagaComponentType::CrossDomain
+        }
+    }
+
     /// Create new a RutabagaBuilder.
     pub fn new(default_component: RutabagaComponentType, capset_mask: u64) -> RutabagaBuilder {
         let virglrenderer_flags = VirglRendererFlags::new()
@@ -1318,7 +1675,15 @@ impl RutabagaBuilder {
             channels: None,
             debug_handler: None,
             renderer_features: None,
+            fence_error_handler: None,
         }
+    }
+
+    /// Require independent renderer failure notification when using Virgl.
+    /// Initialization must fail if the library cannot implement this contract.
+    pub fn set_fence_error_handler(mut self, handler: RutabagaFenceErrorHandler) -> Self {
+        self.fence_error_handler = Some(handler);
+        self
     }
 
     /// Set display width for the RutabagaBuilder
@@ -1454,21 +1819,11 @@ impl RutabagaBuilder {
         };
 
         if self.capset_mask != 0 {
-            let supports_gfxstream = capset_enabled(RUTABAGA_CAPSET_GFXSTREAM_VULKAN)
-                | capset_enabled(RUTABAGA_CAPSET_GFXSTREAM_MAGMA)
-                | capset_enabled(RUTABAGA_CAPSET_GFXSTREAM_GLES)
-                | capset_enabled(RUTABAGA_CAPSET_GFXSTREAM_COMPOSER);
             let supports_virglrenderer = capset_enabled(RUTABAGA_CAPSET_VIRGL2)
                 | capset_enabled(RUTABAGA_CAPSET_VENUS)
                 | capset_enabled(RUTABAGA_CAPSET_DRM);
 
-            if supports_gfxstream {
-                self.default_component = RutabagaComponentType::Gfxstream;
-            } else if supports_virglrenderer {
-                self.default_component = RutabagaComponentType::VirglRenderer;
-            } else {
-                self.default_component = RutabagaComponentType::CrossDomain;
-            }
+            self.default_component = self.default_component_type();
 
             self.virglrenderer_flags = self
                 .virglrenderer_flags
@@ -1511,11 +1866,18 @@ impl RutabagaBuilder {
         if self.default_component != RutabagaComponentType::Rutabaga2D {
             #[cfg(feature = "virgl_renderer")]
             if self.default_component == RutabagaComponentType::VirglRenderer {
-                if let Ok(virgl) = VirglRenderer::init(
+                let virgl = VirglRenderer::init(
                     self.virglrenderer_flags,
                     fence_handler.clone(),
+                    self.fence_error_handler.clone(),
                     rutabaga_server_descriptor,
-                ) {
+                );
+                if self.fence_error_handler.is_some() && virgl.is_err() {
+                    // A v5 client against a v4 library must not silently lose
+                    // its failure channel by falling back to a 2D renderer.
+                    return Err(virgl.err().unwrap());
+                }
+                if let Ok(virgl) = virgl {
                     rutabaga_components.insert(RutabagaComponentType::VirglRenderer, virgl);
 
                     push_capset(RUTABAGA_CAPSET_VIRGL);
@@ -1566,6 +1928,8 @@ impl RutabagaBuilder {
 
         Ok(Rutabaga {
             resources: Default::default(),
+            host_dmabuf_resources: Default::default(),
+            native_ahb_attachments: Default::default(),
             #[cfg(fence_passing_option1)]
             shareable_fences: Default::default(),
             contexts: Default::default(),
@@ -1579,12 +1943,504 @@ impl RutabagaBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    use super::RutabagaContext;
+    use super::RutabagaResource;
     use crate::*;
+
+    struct DropTrackedContext {
+        attached: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for DropTrackedContext {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl RutabagaContext for DropTrackedContext {
+        fn submit_cmd(
+            &mut self,
+            _commands: &mut [u8],
+            _fence_ids: &[u64],
+            _shareable_fences: Vec<RutabagaHandle>,
+        ) -> RutabagaResult<()> {
+            Ok(())
+        }
+
+        fn attach(&mut self, _resource: &mut RutabagaResource) {
+            self.attached.store(true, Ordering::SeqCst);
+        }
+
+        fn detach(&mut self, _resource: &RutabagaResource) {}
+
+        fn component_type(&self) -> RutabagaComponentType {
+            RutabagaComponentType::Rutabaga2D
+        }
+    }
 
     fn new_2d() -> Rutabaga {
         RutabagaBuilder::new(RutabagaComponentType::Rutabaga2D, 0)
             .build(RutabagaHandler::new(|_| {}), None)
             .unwrap()
+    }
+
+    struct PartialNativeContext {
+        attached: Arc<AtomicBool>,
+        submitted: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for PartialNativeContext {
+        fn drop(&mut self) { self.dropped.store(true, Ordering::SeqCst); }
+    }
+
+    impl RutabagaContext for PartialNativeContext {
+        fn component_type(&self) -> RutabagaComponentType { RutabagaComponentType::VirglRenderer }
+        fn capset_id(&self) -> Option<u32> { Some(RUTABAGA_CAPSET_DRM) }
+        fn attach(&mut self, _: &mut RutabagaResource) {
+            panic!("generic attach must not bypass host allocation ownership");
+        }
+        fn detach(&mut self, _: &RutabagaResource) {
+            panic!("generic detach must not bypass host allocation ownership");
+        }
+        fn submit_cmd(&mut self, _: &mut [u8], _: &[u64], _: Vec<RutabagaHandle>)
+            -> RutabagaResult<()> {
+            self.submitted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn attach_host_dmabuf(&mut self, _: &mut RutabagaResource)
+            -> RutabagaResult<NativeResourceAttachment> {
+            self.attached.store(true, Ordering::SeqCst);
+            // Models actual import followed by unsupported GPUOBJ_INFO cache.
+            Err(RutabagaError::Unsupported)
+        }
+    }
+
+    #[test]
+    fn host_dmabuf_partial_attach_blocks_guest_ownership_bypasses() {
+        let mut gpu = new_2d();
+        // A real resource in the actual dispatcher; the native backend side
+        // effect is injected only at its vtable boundary, without GPU hardware.
+        gpu.resource_create_3d(91, ResourceCreate3D {
+            target: RUTABAGA_PIPE_TEXTURE_2D, format: 1,
+            bind: RUTABAGA_PIPE_BIND_RENDER_TARGET, width: 1, height: 1,
+            depth: 1, array_size: 1, last_level: 0, nr_samples: 0, flags: 0,
+        }).unwrap();
+        gpu.host_dmabuf_resources.insert(91, None);
+        let attached = Arc::new(AtomicBool::new(false));
+        let submitted = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        gpu.contexts.insert(81, Box::new(PartialNativeContext {
+            attached: attached.clone(), submitted: submitted.clone(), dropped: dropped.clone(),
+        }));
+        assert!(gpu.context_attach_host_dmabuf(81, 91).is_err());
+        assert!(attached.load(Ordering::SeqCst));
+        assert_eq!(gpu.host_dmabuf_resources.get(&91), Some(&Some(81)));
+        assert!(gpu.context_attach_host_dmabuf(82, 91).is_err());
+        assert!(gpu.submit_command(81, &mut [], &[]).is_err());
+        assert!(!submitted.load(Ordering::SeqCst));
+        assert!(gpu.context_attach_resource(81, 91).is_err());
+        assert!(gpu.context_detach_resource(81, 91).is_err());
+        assert!(gpu.context_attach_resource(82, 91).is_err());
+        assert!(gpu.attach_backing(91, vec![]).is_err());
+        assert!(gpu.detach_backing(91).is_err());
+        assert!(gpu.map(91).is_err());
+        assert!(gpu.unmap(91).is_err());
+        assert!(gpu.resource_flush(91).is_err());
+        assert!(gpu.export_display_blob(91).is_err());
+        assert!(gpu.unref_resource(91).is_err());
+        assert!(gpu.destroy_context(81).is_err());
+        assert!(gpu.retire_native_imports_for_reset().is_err());
+        assert!(gpu.reset().is_err());
+        let directory = tempfile::tempdir().unwrap();
+        assert!(gpu.snapshot(directory.path()).is_err());
+        assert!(gpu.restore(directory.path()).is_err());
+        assert!(gpu.resources.contains_key(&91));
+        assert!(!dropped.load(Ordering::SeqCst));
+        // Cleanup runs through the actual owning component before unlocking.
+        gpu.unref_host_dmabuf(91).unwrap();
+        assert!(!gpu.resources.contains_key(&91));
+        assert!(!gpu.host_dmabuf_resources.contains_key(&91));
+        assert!(gpu.unref_host_dmabuf(91).is_err());
+        gpu.submit_command(81, &mut [], &[]).unwrap();
+        assert!(submitted.load(Ordering::SeqCst));
+        gpu.destroy_context(81).unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[derive(Default)]
+    struct NativeAhbSignals {
+        attaches: std::sync::atomic::AtomicU32,
+        detaches: std::sync::atomic::AtomicU32,
+        submitted: AtomicBool,
+        fail_attach: AtomicBool,
+        fail_detach: AtomicBool,
+        bad_identity: AtomicBool,
+        dropped: AtomicBool,
+        reset_prepared: AtomicBool,
+        fail_reset: AtomicBool,
+    }
+
+    struct NativeAhbTestContext {
+        id: u32,
+        signals: Arc<NativeAhbSignals>,
+    }
+
+    impl Drop for NativeAhbTestContext {
+        fn drop(&mut self) { self.signals.dropped.store(true, Ordering::SeqCst); }
+    }
+
+    impl RutabagaContext for NativeAhbTestContext {
+        fn component_type(&self) -> RutabagaComponentType { RutabagaComponentType::VirglRenderer }
+        fn capset_id(&self) -> Option<u32> { Some(RUTABAGA_CAPSET_DRM) }
+        fn attach(&mut self, _: &mut RutabagaResource) { panic!("unchecked AHB attach"); }
+        fn detach(&mut self, _: &RutabagaResource) { panic!("unchecked AHB detach"); }
+        fn prepare_native_reset(&mut self) -> RutabagaResult<()> {
+            if self.signals.fail_reset.load(Ordering::SeqCst) {
+                return Err(RutabagaError::Unsupported);
+            }
+            self.signals.reset_prepared.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn submit_cmd(&mut self, _: &mut [u8], _: &[u64], _: Vec<RutabagaHandle>)
+            -> RutabagaResult<()> {
+            self.signals.submitted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn attach_host_dmabuf(&mut self, resource: &mut RutabagaResource)
+            -> RutabagaResult<NativeResourceAttachment> {
+            self.signals.attaches.fetch_add(1, Ordering::SeqCst);
+            if self.signals.fail_attach.load(Ordering::SeqCst) {
+                return Err(RutabagaError::Unsupported);
+            }
+            Ok(NativeResourceAttachment {
+                ctx_id: self.id,
+                resource_id: resource.resource_id,
+                allocation_size: resource.size,
+                dma_device: 1,
+                dma_inode: if self.signals.bad_identity.load(Ordering::SeqCst) { 0 } else { 5 },
+                kernel_flags: 0,
+                map_info: RUTABAGA_MAP_CACHE_CACHED,
+            })
+        }
+        fn detach_host_dmabuf(&mut self, _: &RutabagaResource) -> RutabagaResult<()> {
+            self.signals.detaches.fetch_add(1, Ordering::SeqCst);
+            if self.signals.fail_detach.load(Ordering::SeqCst) {
+                return Err(RutabagaError::Unsupported);
+            }
+            Ok(())
+        }
+    }
+
+    fn native_ahb_dispatch_fixture() -> (Rutabaga, Arc<NativeAhbSignals>) {
+        let mut gpu = new_2d();
+        gpu.resource_create_3d(91, ResourceCreate3D {
+            target: RUTABAGA_PIPE_TEXTURE_2D, format: 1,
+            bind: RUTABAGA_PIPE_BIND_RENDER_TARGET, width: 1, height: 1,
+            depth: 1, array_size: 1, last_level: 0, nr_samples: 0, flags: 0,
+        }).unwrap();
+        // Exercise the actual dispatcher while substituting only the GPU
+        // backend. No DMA import or rendering is claimed by this fixture.
+        let resource = gpu.resources.get_mut(&91).unwrap();
+        resource.blob = true;
+        resource.blob_mem = RUTABAGA_BLOB_MEM_HOST3D;
+        resource.blob_flags = RUTABAGA_BLOB_FLAG_USE_NATIVE_AHB;
+        resource.size = 4096;
+        resource.map_info = None;
+        let signals = Arc::new(NativeAhbSignals::default());
+        gpu.contexts.insert(81, Box::new(NativeAhbTestContext { id: 81, signals: signals.clone() }));
+        (gpu, signals)
+    }
+
+    #[test]
+    fn native_ahb_checked_attach_retains_every_importer() {
+        let (mut gpu, signals) = native_ahb_dispatch_fixture();
+        gpu.context_attach_resource(81, 91).unwrap();
+        gpu.context_attach_resource(81, 91).unwrap();
+        assert_eq!(signals.attaches.load(Ordering::SeqCst), 1);
+        assert_eq!(gpu.resources[&91].map_info, Some(RUTABAGA_MAP_CACHE_CACHED));
+        gpu.submit_command(81, &mut [], &[]).unwrap();
+        assert!(signals.submitted.load(Ordering::SeqCst));
+        let other = Arc::new(NativeAhbSignals::default());
+        gpu.contexts.insert(82, Box::new(NativeAhbTestContext { id: 82, signals: other.clone() }));
+        gpu.context_attach_resource(82, 91).unwrap();
+        assert!(gpu.unref_resource(91).is_err());
+        gpu.context_detach_resource(81, 91).unwrap();
+        gpu.context_detach_resource(81, 91).unwrap();
+        assert_eq!(signals.detaches.load(Ordering::SeqCst), 1);
+        assert!(gpu.unref_resource(91).is_err());
+        gpu.context_detach_resource(82, 91).unwrap();
+        assert_eq!(other.detaches.load(Ordering::SeqCst), 1);
+        gpu.unref_resource(91).unwrap();
+    }
+
+    #[test]
+    fn native_ahb_partial_import_blocks_submit_until_checked_retirement() {
+        let (mut gpu, signals) = native_ahb_dispatch_fixture();
+        signals.fail_attach.store(true, Ordering::SeqCst);
+        assert!(gpu.context_attach_resource(81, 91).is_err());
+        assert!(gpu.context_attach_resource(81, 91).is_err());
+        assert_eq!(signals.attaches.load(Ordering::SeqCst), 1);
+        assert!(gpu.submit_command(81, &mut [], &[]).is_err());
+        assert!(!signals.submitted.load(Ordering::SeqCst));
+        assert!(gpu.unref_resource(91).is_err());
+        signals.fail_detach.store(true, Ordering::SeqCst);
+        assert!(gpu.context_detach_resource(81, 91).is_err());
+        assert!(gpu.unref_resource(91).is_err());
+        signals.fail_detach.store(false, Ordering::SeqCst);
+        gpu.context_detach_resource(81, 91).unwrap();
+        gpu.unref_resource(91).unwrap();
+        gpu.submit_command(81, &mut [], &[]).unwrap();
+    }
+
+    #[test]
+    fn native_ahb_invalid_metadata_keeps_owner_until_context_destruction() {
+        let (mut gpu, signals) = native_ahb_dispatch_fixture();
+        signals.bad_identity.store(true, Ordering::SeqCst);
+        assert!(gpu.context_attach_resource(81, 91).is_err());
+        assert_eq!(gpu.resources[&91].map_info, None);
+        assert!(gpu.unref_resource(91).is_err());
+        assert!(gpu.submit_command(81, &mut [], &[]).is_err());
+        gpu.destroy_context(81).unwrap();
+        assert!(gpu.native_ahb_attachments.is_empty());
+        gpu.unref_resource(91).unwrap();
+    }
+
+    #[test]
+    fn native_ahb_lifecycle_cannot_serialize_native_handles() {
+        let (gpu, _) = native_ahb_dispatch_fixture();
+        assert!(gpu.require_no_host_dmabufs().is_err());
+    }
+
+    struct ResetTrackedComponent {
+        context_dropped: Arc<AtomicBool>,
+        unrefs: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl super::RutabagaComponent for ResetTrackedComponent {
+        fn unref_resource(&self, resource_id: u32) {
+            assert_eq!(resource_id, 91);
+            assert!(self.context_dropped.load(Ordering::SeqCst));
+            self.unrefs.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn native_ahb_reset_unbound_resource_releases_actual_component() {
+        let (mut gpu, _) = native_ahb_dispatch_fixture();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let unrefs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        gpu.contexts.insert(81, Box::new(DropTrackedContext {
+            attached: Arc::new(AtomicBool::new(false)), dropped: dropped.clone(),
+        }));
+        // Default is 2D: reset must use this resource's component, not silently
+        // clear the Rust map while leaving the renderer's resource alive.
+        gpu.resources.get_mut(&91).unwrap().component_mask =
+            1 << (RutabagaComponentType::VirglRenderer as u8);
+        gpu.components.insert(RutabagaComponentType::VirglRenderer, Box::new(ResetTrackedComponent {
+            context_dropped: dropped.clone(), unrefs: unrefs.clone(),
+        }));
+        gpu.check_reset().unwrap();
+        assert!(!dropped.load(Ordering::SeqCst));
+        assert_eq!(unrefs.load(Ordering::SeqCst), 0);
+        // Native handle serialization remains forbidden; reset is real unref.
+        assert!(gpu.require_no_host_dmabufs().is_err());
+        gpu.reset().unwrap();
+        assert!(gpu.contexts.is_empty());
+        assert!(gpu.resources.is_empty());
+        assert_eq!(unrefs.load(Ordering::SeqCst), 1);
+        gpu.reset().unwrap();
+        assert_eq!(unrefs.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn native_ahb_reset_retains_confirmed_and_partial_imports_until_checked_detach() {
+        for partial in [false, true] {
+            let (mut gpu, signals) = native_ahb_dispatch_fixture();
+            signals.fail_attach.store(partial, Ordering::SeqCst);
+            assert_eq!(gpu.context_attach_resource(81, 91).is_err(), partial);
+            assert!(gpu.check_reset().is_err());
+            assert!(gpu.reset().is_err());
+            assert!(gpu.resources.contains_key(&91));
+            assert!(gpu.contexts.contains_key(&81));
+            assert_eq!(signals.detaches.load(Ordering::SeqCst), 0);
+            signals.fail_detach.store(true, Ordering::SeqCst);
+            assert!(gpu.context_detach_resource(81, 91).is_err());
+            assert!(gpu.reset().is_err());
+            signals.fail_detach.store(false, Ordering::SeqCst);
+            gpu.context_detach_resource(81, 91).unwrap();
+            gpu.reset().unwrap();
+            assert!(gpu.resources.is_empty());
+            assert!(gpu.contexts.is_empty());
+        }
+    }
+
+    struct NativeResetComponent {
+        contexts: Vec<Arc<NativeAhbSignals>>,
+        unrefs: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl super::RutabagaComponent for NativeResetComponent {
+        fn unref_resource(&self, resource_id: u32) {
+            assert_eq!(resource_id, 91);
+            for context in &self.contexts {
+                assert!(context.reset_prepared.load(Ordering::SeqCst));
+                assert!(context.detaches.load(Ordering::SeqCst) > 0);
+                assert!(context.dropped.load(Ordering::SeqCst));
+            }
+            self.unrefs.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn native_reset_fixture(partial: bool) -> (Rutabaga, [Arc<NativeAhbSignals>; 2], Arc<std::sync::atomic::AtomicU32>) {
+        let (mut gpu, first) = native_ahb_dispatch_fixture();
+        let second = Arc::new(NativeAhbSignals::default());
+        gpu.contexts.insert(82, Box::new(NativeAhbTestContext { id: 82, signals: second.clone() }));
+        gpu.context_attach_resource(81, 91).unwrap();
+        second.fail_attach.store(partial, Ordering::SeqCst);
+        assert_eq!(gpu.context_attach_resource(82, 91).is_err(), partial);
+        let unrefs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        gpu.resources.get_mut(&91).unwrap().component_mask =
+            1 << (RutabagaComponentType::VirglRenderer as u8);
+        gpu.components.insert(RutabagaComponentType::VirglRenderer, Box::new(NativeResetComponent {
+            contexts: vec![first.clone(), second.clone()], unrefs: unrefs.clone(),
+        }));
+        (gpu, [first, second], unrefs)
+    }
+
+    #[test]
+    fn native_reset_retires_confirmed_and_partial_imports_before_destruction() {
+        for partial in [false, true] {
+            let (mut gpu, contexts, unrefs) = native_reset_fixture(partial);
+            assert!(gpu.reset().is_err()); // Guard remains mandatory.
+            gpu.retire_native_imports_for_reset().unwrap();
+            assert!(gpu.native_ahb_attachments.is_empty());
+            assert_eq!(gpu.contexts.len(), 2);
+            assert_eq!(gpu.resources.len(), 1);
+            for context in &contexts {
+                assert_eq!(context.detaches.load(Ordering::SeqCst), 1);
+                assert!(!context.dropped.load(Ordering::SeqCst));
+            }
+            assert_eq!(unrefs.load(Ordering::SeqCst), 0);
+            gpu.retire_native_imports_for_reset().unwrap(); // Idempotent before destruction.
+            gpu.reset().unwrap();
+            gpu.retire_native_imports_for_reset().unwrap();
+            gpu.reset().unwrap(); // Idempotent across the reset boundary.
+            assert!(gpu.resources.is_empty() && gpu.contexts.is_empty());
+            assert_eq!(unrefs.load(Ordering::SeqCst), 1);
+            for context in &contexts {
+                assert_eq!(context.detaches.load(Ordering::SeqCst), 1);
+                assert!(context.dropped.load(Ordering::SeqCst));
+            }
+        }
+    }
+
+    #[test]
+    fn native_reset_failed_detach_retains_unresolved_imports_and_all_owners() {
+        for partial in [false, true] {
+            let (mut gpu, contexts, unrefs) = native_reset_fixture(partial);
+            contexts[1].fail_detach.store(true, Ordering::SeqCst);
+            assert!(gpu.retire_native_imports_for_reset().is_err());
+            assert_eq!(contexts[0].detaches.load(Ordering::SeqCst), 1);
+            assert_eq!(contexts[1].detaches.load(Ordering::SeqCst), 1);
+            assert_eq!(gpu.native_ahb_attachments.len(), 1);
+            assert_eq!(gpu.native_ahb_attachments.get(&(82, 91)), Some(&false));
+            assert!(gpu.check_reset().is_err() && gpu.reset().is_err());
+            assert_eq!(gpu.contexts.len(), 2);
+            assert_eq!(gpu.resources.len(), 1);
+            assert!(contexts.iter().all(|context| !context.dropped.load(Ordering::SeqCst)));
+            assert_eq!(unrefs.load(Ordering::SeqCst), 0);
+            // The low-level API may retry only unresolved imports. Worker
+            // failure is terminal and retains its activation until VM teardown.
+            contexts[1].fail_detach.store(false, Ordering::SeqCst);
+            gpu.retire_native_imports_for_reset().unwrap();
+            assert_eq!(contexts[0].detaches.load(Ordering::SeqCst), 1);
+            assert_eq!(contexts[1].detaches.load(Ordering::SeqCst), 2);
+            gpu.reset().unwrap();
+            assert_eq!(unrefs.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn native_reset_preflights_every_owner_before_any_detach() {
+        for invalid in 0..5 {
+            let (mut gpu, contexts, unrefs) = native_reset_fixture(false);
+            match invalid {
+                0 => { gpu.native_ahb_attachments.insert((99, 91), true); }
+                1 => { gpu.native_ahb_attachments.insert((82, 99), false); }
+                2 => { gpu.resources.get_mut(&91).unwrap().blob_flags = 0; }
+                3 => { gpu.resources.get_mut(&91).unwrap().component_mask = 0; }
+                _ => { gpu.resources.get_mut(&91).unwrap().component_mask = 3; }
+            }
+            assert!(gpu.retire_native_imports_for_reset().is_err());
+            assert_eq!(gpu.contexts.len(), 2);
+            assert_eq!(gpu.resources.len(), 1);
+            for context in &contexts {
+                assert_eq!(context.detaches.load(Ordering::SeqCst), 0);
+                assert!(!context.dropped.load(Ordering::SeqCst));
+            }
+            assert_eq!(unrefs.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn native_reset_failed_context_retirement_keeps_all_imports_and_owners() {
+        let (mut gpu, contexts, unrefs) = native_reset_fixture(true);
+        contexts[1].fail_reset.store(true, Ordering::SeqCst);
+        assert!(gpu.retire_native_imports_for_reset().is_err());
+        assert!(contexts[0].reset_prepared.load(Ordering::SeqCst));
+        assert!(!contexts[1].reset_prepared.load(Ordering::SeqCst));
+        assert_eq!(gpu.native_ahb_attachments.len(), 2);
+        assert_eq!(gpu.contexts.len(), 2);
+        assert_eq!(gpu.resources.len(), 1);
+        assert_eq!(unrefs.load(Ordering::SeqCst), 0);
+        for context in &contexts {
+            assert_eq!(context.detaches.load(Ordering::SeqCst), 0);
+            assert!(!context.dropped.load(Ordering::SeqCst));
+        }
+        assert!(gpu.check_reset().is_err());
+    }
+
+    #[test]
+    fn native_ahb_reset_rejects_missing_or_ambiguous_owner_without_dropping_resources() {
+        for mask in [0, 1 << (RutabagaComponentType::VirglRenderer as u8), 3] {
+            let (mut gpu, _) = native_ahb_dispatch_fixture();
+            gpu.resources.get_mut(&91).unwrap().component_mask = mask;
+            assert!(gpu.reset().is_err());
+            assert!(gpu.resources.contains_key(&91));
+            assert!(gpu.contexts.contains_key(&81));
+        }
+    }
+
+    #[test]
+    fn native_ahb_rejects_backing_replacement_and_pixel_transfers() {
+        let (mut gpu, signals) = native_ahb_dispatch_fixture();
+        gpu.context_attach_resource(81, 91).unwrap();
+        assert!(matches!(gpu.attach_backing(91, Vec::new()), Err(RutabagaError::Unsupported)));
+        assert!(matches!(gpu.detach_backing(91), Err(RutabagaError::Unsupported)));
+        let transfer = Transfer3D::new_2d(0, 0, 1, 1, 0);
+        assert!(matches!(gpu.transfer_write(81, 91, transfer), Err(RutabagaError::Unsupported)));
+        assert!(matches!(gpu.transfer_read(81, 91, transfer, None), Err(RutabagaError::Unsupported)));
+        let replacement = RutabagaHandle {
+            os_handle: tempfile::tempfile().unwrap().into(),
+            handle_type: RUTABAGA_HANDLE_TYPE_MEM_DMABUF,
+        };
+        let import_data = RutabagaImportData {
+            flags: RUTABAGA_IMPORT_FLAG_RESOURCE_EXISTS,
+            info_3d: Resource3DInfo::default(),
+        };
+        assert!(matches!(gpu.resource_import(91, replacement, import_data), Err(RutabagaError::Unsupported)));
+        assert!(gpu.resources[&91].backing_iovecs.is_none());
+        assert_ne!(gpu.resources[&91].blob_flags & RUTABAGA_BLOB_FLAG_USE_NATIVE_AHB, 0);
+        gpu.submit_command(81, &mut [], &[]).unwrap();
+        assert!(signals.submitted.load(Ordering::SeqCst));
+        gpu.context_detach_resource(81, 91).unwrap();
+        gpu.unref_resource(91).unwrap();
     }
 
     #[test]
@@ -1647,5 +2503,90 @@ mod tests {
         );
         // NOTE: We attached an backing iovec, but it should be gone post-restore.
         assert!(rutabaga_resource.backing_iovecs.is_none());
+    }
+
+    #[test]
+    fn destroy_context_drops_context_with_attached_resource() {
+        const CONTEXT_ID: u32 = 41;
+        const RESOURCE_ID: u32 = 42;
+
+        let attached = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut rutabaga = new_2d();
+        rutabaga
+            .resource_create_3d(
+                RESOURCE_ID,
+                ResourceCreate3D {
+                    target: RUTABAGA_PIPE_TEXTURE_2D,
+                    format: 1,
+                    bind: RUTABAGA_PIPE_BIND_RENDER_TARGET,
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                    array_size: 1,
+                    last_level: 0,
+                    nr_samples: 0,
+                    flags: 0,
+                },
+            )
+            .unwrap();
+        rutabaga.contexts.insert(
+            CONTEXT_ID,
+            Box::new(DropTrackedContext {
+                attached: Arc::clone(&attached),
+                dropped: Arc::clone(&dropped),
+            }),
+        );
+
+        rutabaga
+            .context_attach_resource(CONTEXT_ID, RESOURCE_ID)
+            .unwrap();
+        assert!(attached.load(Ordering::SeqCst));
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        rutabaga.destroy_context(CONTEXT_ID).unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(matches!(
+            rutabaga.destroy_context(CONTEXT_ID),
+            Err(RutabagaError::InvalidContextId)
+        ));
+    }
+
+    #[test]
+    fn context_detach_missing_resource_is_idempotent() {
+        const CONTEXT_ID: u32 = 51;
+        const RESOURCE_ID: u32 = 52;
+
+        let mut rutabaga = new_2d();
+        rutabaga
+            .resource_create_3d(
+                RESOURCE_ID,
+                ResourceCreate3D {
+                    target: RUTABAGA_PIPE_TEXTURE_2D,
+                    format: 1,
+                    bind: RUTABAGA_PIPE_BIND_RENDER_TARGET,
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                    array_size: 1,
+                    last_level: 0,
+                    nr_samples: 0,
+                    flags: 0,
+                },
+            )
+            .unwrap();
+        rutabaga.contexts.insert(
+            CONTEXT_ID,
+            Box::new(DropTrackedContext {
+                attached: Arc::new(AtomicBool::new(false)),
+                dropped: Arc::new(AtomicBool::new(false)),
+            }),
+        );
+
+        // Model the guest's resource-unref arriving before its queued detach.
+        rutabaga.unref_resource(RESOURCE_ID).unwrap();
+        assert!(rutabaga
+            .context_detach_resource(CONTEXT_ID, RESOURCE_ID)
+            .is_ok());
     }
 }

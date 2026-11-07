@@ -1,0 +1,68 @@
+{
+  "schema": "native-ahb-storage-height4-source-v1",
+  "candidate": "/home/sunf/droidvm-repos/reference/codes/native-ahb-storage-height4-20261108-01",
+  "installed_parent_source": "/home/sunf/droidvm-repos/reference/codes/crosvm-boot-memaccept-fifo02-20261031-01",
+  "installed_parent_crosvm_sha256": "5a631aa747bf0838270b2045bca987b2ab682515c7eaddd7ef751371039bae7d",
+  "installed_parent_manifest_sha256": "893a429a9169c9bfae0fd997d16eb9c1ab6e0014436b58d9197d2f714e20e998",
+  "candidate_manifest_sha256": "6fd908a7aba2dc24a154d3b1d77afca7dcbc234d122a6a4d359576dbcae3bf9c",
+  "baseline_manifest_sha256": "a671e273527c15f015da5648dec7b2cc17d03e30dba839be465c2c280859e40c",
+  "source_entries": 3895,
+  "overlay_files": 71,
+  "changed_from_installed_source": {
+    "packages/modules/Virtualization/libs/android_display_backend/surface_buffer_presenter.h": {
+      "bytes": 19560,
+      "sha256": "b624e3c888a25cd4c1923d9d6a6fff7e118ffe485ed46981aa4aded4e2ab2a13"
+    },
+    "packages/modules/Virtualization/libs/android_display_backend/shared_ahb_allocation.cpp": {
+      "bytes": 19984,
+      "sha256": "17ade20497387aed9034f00750a55952fb5d1885bc2f4af04dd9b804f380b8af"
+    },
+    "packages/modules/Virtualization/libs/android_display_backend/shared_ahb_layout.h": {
+      "bytes": 3436,
+      "sha256": "8eaf1b9c2d6670d0f3b2330adddf825b5aa7108e7a7b452963c83dd1b1e0940f"
+    },
+    "packages/modules/Virtualization/libs/android_display_backend/crosvm_android_display_client.cpp": {
+      "bytes": 234853,
+      "sha256": "7275cb66e089befebcdffa070996112e56f5ede0f72371c2b618e09dc9e881b7"
+    },
+    "packages/modules/Virtualization/libs/android_display_backend/tests/shared_allocation/allocator_probe.cpp": {
+      "bytes": 6054,
+      "sha256": "30d5528be9ff75f358fe14f572d604fd069120c5c257f58e69ce903b9bdd80ce"
+    },
+    "packages/modules/Virtualization/libs/android_display_backend/tests/shared_allocation/layout_test.cpp": {
+      "bytes": 4724,
+      "sha256": "0c2d391bcbbc1a55b9ee5908546899329dfd1c31e1b30e228297f91e9420ff77"
+    },
+    "packages/modules/Virtualization/libs/android_display_backend/tests/presenter_async/run.sh": {
+      "bytes": 1916,
+      "sha256": "0dc53fa367344bcb32bf219c8eec6fdff1ff6264ef7f2fac5c05db694c62c19c"
+    },
+    "packages/modules/Virtualization/libs/android_display_backend/tests/presenter_async/presenter_geometry_test.cpp": {
+      "bytes": 9786,
+      "sha256": "ee40fff2f59643b72f694ea07d7c8c885e4f94f272c7a4b174ef8a5bf03c5999"
+    }
+  },
+  "build_helper_sha256": "aacc4c22fb6472cb0e6bebb20734ed9245a9096cee60c9cfc22cb19ce7a674b1",
+  "patch_sha256": "fb4a91a3c12c28a9c8ade2e861f2be4691d9c5fdb36acf616868a30840c7640d",
+  "device_operations": false,
+  "wire_abi_changed": false,
+  "build_helpers": {
+    "initial_combined_failed": {
+      "path": "/home/sunf/droidvm-repos/reference/codes/native-ahb-storage-height4-20261108-01/tools/build_android.py",
+      "sha256": "aacc4c22fb6472cb0e6bebb20734ed9245a9096cee60c9cfc22cb19ce7a674b1"
+    },
+    "crosvm_only_successor": {
+      "path": "/home/sunf/droidvm-repos/reference/codes/native-ahb-storage-height4-20261108-01/tools/build_android_crosvm.py",
+      "sha256": "086ba20826a3b0e8b916bd7db991a4219e9d70c3b5d76f5189acebda3ee2e0ef"
+    },
+    "standalone_allocator_probe": {
+      "path": "/home/sunf/droidvm-repos/reference/codes/native-ahb-storage-height4-20261108-01/tools/build_allocator_probe.py",
+      "sha256": "cd43ad9a006724a58fbaac7d4ed96af87f1e7be5eeac6a9669d92f2ac21ef20a"
+    }
+  },
+  "standalone_allocator_manifest": {
+    "path": "/home/sunf/droidvm-repos/artifacts/native-ahb-storage-height4-allocator-probe-20261108-01/manifest.json",
+    "sha256": "39930d589d5b81af49d03cc3914d534c806017c2e702da42b858f26e6dc4def7"
+  },
+  "review_patch_applies_to_installed_source": true
+}

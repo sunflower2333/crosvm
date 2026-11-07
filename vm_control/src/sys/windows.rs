@@ -140,6 +140,7 @@ pub fn prepare_shared_memory_region_at_offset(
     _cache: MemCacheType,
     _guest_offset: u64,
     _source: Option<Box<dyn MappedRegion>>,
+    _immutable: bool,
 ) -> std::result::Result<VmMappedMemoryRegion, Error> {
     unimplemented!()
 }

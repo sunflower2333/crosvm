@@ -697,7 +697,13 @@ mod tests {
     }
 
     fn fake_desc_chain(mem: &GuestMemory) -> DescriptorChain {
-        create_descriptor_chain(mem, GuestAddress(0), GuestAddress(0), Vec::new(), 0)
+        create_descriptor_chain(
+            mem,
+            GuestAddress(DESC_OFFSET),
+            GuestAddress(BUFFER_OFFSET),
+            vec![(crate::virtio::DescriptorType::Readable, BUFFER_LEN)],
+            0,
+        )
             .expect("failed to create descriptor chain")
     }
 
